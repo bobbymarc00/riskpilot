@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RiskPilot immutable protected LIVE intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "proposal_id",
+    "mode",
+    "product",
+    "symbol",
+    "side",
+    "order_type",
+    "quote_amount",
+    "entry_limit_price",
+    "stop_reference",
+    "take_profit_reference",
+    "approval_nonce"
+  ],
+  "properties": {
+    "proposal_id": {
+      "type": "string",
+      "pattern": "^p-[0-9a-f]{12}$"
+    },
+    "mode": {
+      "const": "live"
+    },
+    "product": {
+      "const": "SPOT"
+    },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{5,20}$"
+    },
+    "side": {
+      "const": "BUY"
+    },
+    "order_type": {
+      "enum": [
+        "LIMIT",
+        "LIMIT_MAKER"
+      ]
+    },
+    "quote_amount": {
+      "type": "string"
+    },
+    "entry_limit_price": {
+      "type": "string"
+    },
+    "stop_reference": {
+      "type": "string"
+    },
+    "take_profit_reference": {
+      "type": "string"
+    },
+    "approval_nonce": {
+      "type": "string"
+    }
+  }
+}

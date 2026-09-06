@@ -1,0 +1,33 @@
+name: offline-ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTHONPATH: src
+      NO_PROXY: "*"
+      no_proxy: "*"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Offline verification
+        run: ./scripts/verify.sh
+      - name: Deterministic demo
+        run: |
+          ./scripts/demo-track-a.sh
+          ./scripts/demo-track-a.sh
+      - name: Package and release hygiene
+        run: |
+          python3 -m pip wheel --no-build-isolation --no-deps . -w /tmp/riskpilot-wheel
+          ./scripts/release-hygiene.sh
+          git diff --check

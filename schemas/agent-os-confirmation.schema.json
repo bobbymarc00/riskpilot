@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "symbol": {"type": "string"},
+    "interval": {"type": "string"},
+    "candles": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "open_time": {"type": "integer"}, "open": {"type": "string"},
+        "high": {"type": "string"}, "low": {"type": "string"},
+        "close": {"type": "string"}, "volume": {"type": "string"},
+        "close_time": {"type": "integer"}
+      },
+      "required": ["open_time", "open", "high", "low", "close", "volume", "close_time"]
+      }
+    }
+  },
+  "required": ["symbol", "interval", "candles"]
+}

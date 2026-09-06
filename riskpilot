@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SPOTGUARD_PROJECT_ROOT="${SPOTGUARD_PROJECT_ROOT:-$project_dir}"
+export RISKPILOT_PROJECT_ROOT="${RISKPILOT_PROJECT_ROOT:-$project_dir}"
+export PYTHONPATH="$project_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m spotguard "$@"

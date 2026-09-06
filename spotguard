@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Compatibility entry point: same implementation, config, state, and ledger.
+exec "$project_dir/riskpilot" "$@"

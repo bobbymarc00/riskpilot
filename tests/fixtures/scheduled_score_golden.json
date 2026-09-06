@@ -1,0 +1,60 @@
+{
+  "fixture_version": 1,
+  "captured_before_refactor": true,
+  "base": {
+    "generator": "legacy synthetic_bullish_klines",
+    "count": 60,
+    "final_close_ms": 1800000000000
+  },
+  "cases": {
+    "up": {
+      "last_candle": "legacy",
+      "score": 95,
+      "classification": "UP",
+      "threshold_passed": true,
+      "candidate_eligible": true,
+      "contributions": [25, 10, 20, 15, 15, 10, 0]
+    },
+    "down": {
+      "close_delta": -1.0,
+      "volume_ratio": "legacy",
+      "score": 50,
+      "classification": "DOWN",
+      "threshold_passed": false,
+      "candidate_eligible": false,
+      "contributions": [25, 0, 0, 0, 15, 10, 0]
+    },
+    "flat": {
+      "close_delta": 0.0,
+      "volume_ratio": "legacy",
+      "score": 77,
+      "classification": "FLAT",
+      "threshold_passed": true,
+      "candidate_eligible": false,
+      "contributions": [25, 0, 20, 7, 15, 10, 0]
+    },
+    "threshold": {
+      "close_delta": 0.0,
+      "volume_ratio": 0.8,
+      "score": 70,
+      "classification": "FLAT",
+      "threshold_passed": true,
+      "candidate_eligible": false,
+      "contributions": [25, 0, 20, 7, 8, 10, 0]
+    },
+    "below_threshold": {
+      "close_delta": 0.0,
+      "volume_ratio": 0.79,
+      "score": 62,
+      "classification": "FLAT",
+      "threshold_passed": false,
+      "candidate_eligible": false,
+      "contributions": [25, 0, 20, 7, 0, 10, 0]
+    },
+    "tie": {
+      "symbols": ["BTCUSDT", "ETHUSDT"],
+      "score": 95,
+      "ordered_symbols": ["BTCUSDT", "ETHUSDT"]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+interface:
+  display_name: "RiskPilot"
+  short_description: "Approval-gated Binance Spot agent"
+  default_prompt: "Use $binance-spotguard to review my RiskPilot Spot candidates safely."
+
+policy:
+  allow_implicit_invocation: true

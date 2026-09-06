@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "presentation": {"default_locale": "en"},
+  "mode": "paper",
+  "workspace": "./.riskpilot-workspace",
+  "state_dir": "./.riskpilot-state",
+  "telegram": {
+    "enabled": false,
+    "chat_id": "000000000",
+    "channel": "telegram",
+    "account": null
+  },
+  "market": {
+    "base_url": "https://api.binance.com",
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "BNBUSDT",
+      "SOLUSDT",
+      "XRPUSDT"
+    ],
+    "interval": "15m",
+    "lookback": 120,
+    "request_timeout_seconds": 10,
+    "min_signal_score": 70,
+    "candidate_ttl_minutes": 30,
+    "candidate_cooldown_minutes": 60,
+    "max_entry_drift_pct": 1.0,
+    "max_spread_pct": 0.25
+  },
+  "risk": {
+    "quote_asset": "USDT",
+    "default_order_size_usdt": 6,
+    "min_quote_amount": 5.0,
+    "max_quote_per_trade": 100,
+    "max_daily_quote": 500,
+    "max_active_proposals": 1,
+    "min_stop_distance_pct": 0.5,
+    "max_stop_distance_pct": 3.0,
+    "atr_stop_multiplier": 1.5,
+    "min_reward_risk": 2.0,
+    "proposal_ttl_minutes": 15,
+    "execution_lease_seconds": 300,
+    "max_live_arm_minutes": 1440,
+    "paper_fee_pct": 0.1
+  },
+  "openclaw": {
+    "command": "openclaw",
+    "telegram_owner_id": "000000000"
+  },
+  "codex": {
+    "command": "codex",
+    "mcp_server": "binance-marketdata",
+    "endpoint": "https://agent.binance.com/mcp/agentic",
+    "timeout_seconds": 90,
+    "model": null,
+    "read_only": true,
+    "close_grace_seconds": 2,
+    "agent_os_home": null,
+    "agent_os_workspace": null
+  },
+  "live": {
+    "enabled": false,
+    "max_quote_per_entry_usdt": 100,
+    "max_active_tranches": 10,
+    "max_economic_positions": 5,
+    "max_open_exposure_usdt": 500,
+    "min_free_reserve_usdt": 8,
+    "max_risk_per_position_usdt": 2,
+    "max_aggregate_risk_usdt": 4,
+    "max_successful_entries_per_utc_day": 10,
+    "max_pending_proposals": 1,
+    "approval_ttl_seconds": 60,
+    "daily_realized_loss_cap_usdt": 5,
+    "weekly_loss_cap_usdt": 20,
+    "protective_orders_available": false,
+    "armed": false
+  },
+  "security": {
+    "require_manual_approval": true,
+    "allowed_product": "spot",
+    "allow_withdrawal": false,
+    "allow_futures": false,
+    "allow_margin": false,
+    "allow_transfer": false
+  },
+  "paper": {
+    "initial_balance_usdt": 1000,
+    "max_quote_per_entry_usdt": 100,
+    "max_active_tranches": 10,
+    "max_economic_positions": 5,
+    "max_open_exposure_usdt": 500,
+    "max_successful_entries_per_utc_day": 10,
+    "max_risk_per_position_usdt": 2,
+    "max_aggregate_risk_usdt": 4,
+    "daily_realized_loss_cap_usdt": 5,
+    "close_proposal_ttl_seconds": 300,
+    "slippage_pct": 0.05
+  },
+  "scheduled_proposal_mode": "paper",
+  "execution_ready": false
+}
