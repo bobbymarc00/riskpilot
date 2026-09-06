@@ -13,6 +13,9 @@ from decimal import Decimal
 
 from .config import Settings
 
+EXCHANGE_INFO_CACHE_SECONDS = 86_400
+_EXCHANGE_INFO_MEMORY: dict[str, dict[str, Any]] = {}
+
 
 class MarketError(RuntimeError):
     pass
@@ -50,18 +53,54 @@ def _public_json(settings: Settings, path: str, params: dict[str, str]) -> Any:
         raise MarketError(f"invalid response from Binance market API: {exc}") from exc
 
 
+def _exchange_info_cache(settings: Settings) -> dict[str, Any]:
+    """Cache one bulk exchangeInfo response for scanner and live validation."""
+    path = settings.state_dir / "binance-exchange-info-cache.json"
+    cached: dict[str, Any] | None = None
+    cache_key = str(path)
+    memory = _EXCHANGE_INFO_MEMORY.get(cache_key)
+    if memory is not None and time.time() - float(memory.get("fetched_at", 0)) < EXCHANGE_INFO_CACHE_SECONDS:
+        return memory
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict) and isinstance(value.get("symbols"), list):
+            cached = value
+            if time.time() - float(value.get("fetched_at", 0)) < EXCHANGE_INFO_CACHE_SECONDS:
+                _EXCHANGE_INFO_MEMORY[cache_key] = value
+                return value
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    try:
+        payload = _public_json(settings, "/api/v3/exchangeInfo", {})
+        if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
+            raise MarketError("Binance exchangeInfo payload is invalid")
+        value = {"fetched_at": time.time(), "symbols": payload["symbols"]}
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+        _EXCHANGE_INFO_MEMORY[cache_key] = value
+        return value
+    except MarketError:
+        if cached is not None:
+            _EXCHANGE_INFO_MEMORY[cache_key] = cached
+            return cached
+        raise
+
+
+def _exchange_symbol(settings: Settings, symbol: str) -> dict[str, Any]:
+    for item in _exchange_info_cache(settings)["symbols"]:
+        if isinstance(item, dict) and item.get("symbol") == symbol:
+            return item
+    raise KeyError("symbol")
+
 def validate_spot_symbol(settings: Settings, symbol: str) -> dict[str, Any]:
     if symbol not in settings.market.symbols:
         raise SymbolValidationError(f"symbol is not configured: {symbol}")
     try:
-        info = _public_json(settings, "/api/v3/exchangeInfo", {"symbol": symbol})
+        item = _exchange_symbol(settings, symbol)
     except MarketError as exc:
         raise SymbolValidationError(f"{symbol} exchangeInfo validation failed: {exc}") from exc
     try:
-        items = info["symbols"]
-        if len(items) != 1:
-            raise KeyError("symbols")
-        item = items[0]
         filters = {f["filterType"]: f for f in item["filters"]}
         lot = filters["LOT_SIZE"]
         market_lot = filters.get("MARKET_LOT_SIZE", lot)

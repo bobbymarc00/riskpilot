@@ -55,7 +55,9 @@ Legacy scheduled/candidate routes remain independent:
 - `/binance demo SYMBOL`: run `riskpilot --json agent-os demo --symbol SYMBOL --notify`. This invokes Codex only on demand, verifies a Binance MCP tool call, and creates a clearly labeled paper candidate.
 - `/binance help`: explain `scan`, `status`, `candidate`, and the inline-button flow. Do not offer text-based approval.
 
-Reject `/binance approve ...`, plain `APPROVE`, and natural-language approval requests. Relaxed buy/close text is accepted only through the PAPER intent normalizer above. Only a proposal button or its exact paper-only fallback command can authorize a paper fill. Never offer or accept a live text fallback.
+Reject `/binance approve ...`, plain `APPROVE`, and natural-language approval requests. Natural-language buy must always run `trade-intent`, never `paper-intent`: it creates a LIVE proposal by default, while only an explicit `paper buy ...` creates a PAPER proposal. Close text remains PAPER-only until the protected live-close workflow exists. Only a proposal button can authorize a live order; never offer or accept a typed live approval fallback.
+
+For every `/spot live-buy SYMBOL AMOUNT`, invoke the project executable at `${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}/tools/spotguard-agent-os/riskpilot` with `--json live-buy --symbol SYMBOL --quote-amount AMOUNT --notify`; do not use an older global `spotguard` executable or a paper command.
 
 ## Callback parsing
 

@@ -23,6 +23,7 @@
   "intent.amount": "Jumlah tidak valid.",
   "intent.symbol": "Simbol tidak didukung atau tidak dikonfigurasi: {symbol}.",
   "intent.live": "LIVE memerlukan perintah persis /spot live-buy SYMBOL AMOUNT; tidak dialihkan ke PAPER.",
+  "intent.live_balance": "Saldo Binance live tidak diambil oleh RiskPilot. Gunakan Binance langsung untuk saldo akun; RiskPilot hanya menampilkan kesiapan trade terlindungi.",
   "intent.close_symbol": "Sebutkan tepat satu simbol yang akan ditutup.",
   "intent.deferred": "Pembelian tidak diantrikan; minta lagi setelah penutupan selesai.",
   "intent.percentage": "Sebutkan persentase penutupan yang valid.",
@@ -72,7 +73,7 @@
   "analysis.scenario.flat": "Skenario bersyarat untuk {symbol}: candle 15m tertutup berikutnya di atas {resistance} USDT atau di bawah {support} USDT dapat menyelesaikan snapshot rentang ini. Dua candle 15m hanya snapshot jangka pendek. Tidak ada proposal dibuat.",
   "error.unavailable": "RiskPilot tidak dapat menyelesaikan permintaan. Hasil yang belum terverifikasi tidak ditampilkan.",
   "error.security": "Permintaan ditolak: pemeriksaan otorisasi atau keamanan gagal.",
-  "approval.expired": "Persetujuan PAPER kedaluwarsa atau tidak lagi tertunda. Tidak ada eksekusi baru.",
+  "approval.expired": "Persetujuan kedaluwarsa atau tidak lagi tertunda. Tidak ada eksekusi baru.",
   "approval.replay": "Tindakan PAPER ini sudah ditangani atau tidak dapat diulang. Tidak ada eksekusi baru.",
   "policy.min_order": "Permintaan ditolak: jumlah di bawah minimum setelah pembulatan bursa. Jumlah tidak dinaikkan.",
   "policy.max_order_exceeded": "Nominal {amount} USDT melebihi batas maksimum yang dikonfigurasi sebesar {maximum} USDT.",
@@ -104,10 +105,12 @@
   "proposal.mode.manual": "UJI PAPER MANUAL — BUKAN ORDER NYATA",
   "proposal.mode.paper": "MODE PAPER",
   "proposal.mode.live": "⚠️ LIVE — DANA NYATA",
-  "proposal.body": "{title}\n{mode}\nPembelian Spot MARKET {symbol}\nPengeluaran maksimum: {amount} USDT\nAcuan harga masuk: {entry}\nAcuan batas rugi: {stop}\nAcuan target: {target}\nR:R: {ratio}\nID: {identifier}\nKedaluwarsa: {expiry}\n\nPersetujuan diperlukan. Setelah pengisian simulasi PAPER, batas rugi/target disesuaikan dengan pengisian dan dipantau otomatis.",
+  "proposal.body": "{title}\n{mode}\nPembelian Spot MARKET {symbol}\nPengeluaran maksimum: {amount} USDT\nAcuan harga masuk: {entry}\nAcuan batas rugi: {stop}\nAcuan target: {target}\nR:R: {ratio}\nID: {identifier}\nKedaluwarsa: {expiry}\n\nPersetujuan diperlukan. Setelah order terisi, batas rugi/target disesuaikan dengan harga isi dan dipantau otomatis.",
   "proposal.fallback": "Perintah cadangan khusus PAPER:\n/spot paper-approve {identifier} {code}\n/spot paper-reject {identifier} {code}",
   "proposal.live.confirmation": "Pemberitahuan dana nyata: persetujuan diperlukan sebelum entry Spot terlindungi dengan TP/SL dikirim. Proposal akan kedaluwarsa otomatis.",
   "proposal.scale_in": "PROPOSAL PENAMBAHAN PAPER — BUKAN ORDER NYATA\nJumlah gabungan saat ini/proyeksi: {existing_quantity} / {quantity}\nJumlah tambahan yang diajukan: {new_proposed_tranche_quantity}\nHarga masuk rata-rata saat ini/proyeksi: {existing_average_entry} / {projected_weighted_average_entry}\nEksposur saat ini/proyeksi: {existing_exposure} / {projected_exposure} USDT\nProyeksi batas rugi/target: {projected_stop} / {projected_target}\nRisiko terburuk pada batas rugi (termasuk biaya masuk, keluar, dan selisih eksekusi): {projected_risk_at_stop} USDT\nBagian aktif/proyeksi: {active_tranche_count} / {projected_tranche_count}\nPerkiraan biaya: {fee_estimate_base} {fee_estimate_asset} (≈ {fee_estimate_usdt} USDT)",
   "proposal.close.body": "🧪 PROPOSAL PENUTUPAN PAPER — BUKAN ORDER NYATA\nSimbol: {symbol}\nPosisi ekonomi: {economic_position_id}\nPenutupan diminta: {requested_percentage}%\nPenutupan yang dapat dieksekusi setelah pembulatan LOT_SIZE: {actual_executed_percentage}%\nJumlah gabungan: {aggregate_quantity}\nJumlah penutupan diajukan: {close_quantity}\nJumlah tersisa: {remaining_quantity}\nBiaya rata-rata: {average_cost}\nAcuan harga penawaran: {reference_bid}\nPerkiraan kotor: {estimated_gross_proceeds} USDT\nPerkiraan biaya: {estimated_fee_usdt} {estimated_fee_asset} (≈ {estimated_fee_usdt} USDT)\nPerkiraan bersih: {estimated_net_proceeds} USDT\nPerkiraan laba/rugi terealisasi: {estimated_realized_pnl} USDT\nProposal penutupan: {identifier}\nKedaluwarsa: {expiry}\n\nCadangan: /spot paper-close-approve {position_id} {code}",
   "candidate.body": "🔎 KANDIDAT RISKPILOT\n{symbol} · {interval}\nSkor: {score}/100\nAcuan: {price}\nID: {identifier}\nTidak ada order. Tinjauan AI memverifikasi data terbaru melalui Binance Agent OS."
+  ,"scan.none": "Scan RiskPilot selesai: tidak ada kandidat yang memenuhi syarat. Tidak ada proposal atau order dibuat."
+  ,"scan.candidate": "Scan RiskPilot selesai: kandidat memenuhi syarat {symbol} · skor {score}/100 · ID {identifier}. Tidak ada order dibuat."
 }

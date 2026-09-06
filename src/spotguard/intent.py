@@ -20,6 +20,13 @@ def normalize_paper_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
     if not raw or raw.startswith(">") or "forwarded" in lowered or "“" in raw or '"' in raw:
         return {"action": "clarify", "message": t("intent.direct")}
     words = re.findall(r"-?\d+(?:\.\d+)?|[a-zA-Z]+|[%?]", lowered)
+    has_trade_verb = bool(set(words) & (BUY_WORDS | CLOSE_WORDS))
+    if not has_trade_verb and set(words) & {"balance", "balances", "saldo"}:
+        return {"action": "balance"}
+    if not has_trade_verb and set(words) & {"position", "positions", "posisi"}:
+        return {"action": "positions"}
+    if (set(words) & {"live", "real", "nyata"}) and (set(words) & {"balance", "saldo"}):
+        return {"action": "live_balance", "message": t("intent.live_balance")}
     if lowered.rstrip(" ?.!") in vocabulary("input.ranking"):
         return {"action": "ranking"}
     if words and words[0] in vocabulary("input.analysis"):
@@ -137,9 +144,16 @@ def normalize_trade_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
     flows.  Removing an explicit LIVE marker before reusing its strict parser
     prevents that marker from becoming an unstructured execution instruction.
     """
+    original = normalize_paper_intent(text, allowed_symbols, locale)
+    if original.get("action") == "live_balance":
+        return original
     explicit_paper = bool(re.search(r"\bpaper\b", text, re.I))
-    stripped = re.sub(r"\b(?:live|real|nyata)\b", "", text, flags=re.I)
+    stripped = re.sub(r"\b(?:live|real|nyata|paper)\b", "", text, flags=re.I)
     result = normalize_paper_intent(stripped, allowed_symbols, locale)
     if result.get("action") == "buy":
         result["mode"] = "paper" if explicit_paper else "live"
+    elif result.get("action") in {"balance", "positions"}:
+        result["action"] = f"paper_{result['action']}" if explicit_paper else f"live_{result['action']}"
+    elif result.get("action") == "status":
+        result["action"] = "paper_status" if explicit_paper else "live_status"
     return result

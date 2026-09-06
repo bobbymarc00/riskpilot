@@ -347,7 +347,7 @@ class SpotGuard:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         paper_monitor = self.monitor_paper_positions(notify=notify, dry_run=dry_run)
-        requested = symbols or list(self.settings.market.symbols)
+        requested = symbols or list(self.settings.market.symbols)[:20]
         unknown = [symbol for symbol in requested if symbol not in self.settings.market.symbols]
         if unknown:
             raise SpotGuardError(f"symbols are not configured: {', '.join(unknown)}")
@@ -406,6 +406,10 @@ class SpotGuard:
             except Exception as exc:
                 item = {"symbol": symbol, "error": str(exc), "type": type(exc).__name__}
                 errors.append(item)
+                if "HTTP 418" in str(exc) or "HTTP 429" in str(exc):
+                    self.ledger.add_event("scan.circuit_breaker", symbol,
+                        {"reason": str(exc), "scanned": len(results)})
+                    break
                 if isinstance(exc, SymbolValidationError):
                     self.ledger.add_event("symbol.validation_rejected", symbol, item)
 
@@ -826,7 +830,7 @@ class SpotGuard:
                 raise PolicyError("LIVE quote amount must be positive")
             if quote_amount > self.settings.live.max_live_trade_usdt:
                 raise PolicyError(f"requested amount {quote_amount} USDT exceeds configured maximum {self.settings.live.max_quote_per_entry_usdt} USDT")
-            readiness = self.live_status()
+            readiness = self.live_status(check_symbols=True)
             if not readiness["execution_ready"]:
                 raise SecurityError("live execution readiness checks have not all passed")
             proposal_mode, source, ttl = "live", "manual-live", self.settings.live.approval_ttl_seconds
@@ -889,16 +893,33 @@ class SpotGuard:
 
         if live:
             limit_price = floor_to_step(Decimal(values["entry_reference"]), market.price_tick_size)
+            stop_price = floor_to_step(Decimal(values["stop_reference"]), market.price_tick_size)
+            reward_risk = Decimal(values["reward_risk"])
+            target_price = limit_price + reward_risk * (limit_price - stop_price)
+            if stop_price <= 0 or not stop_price < limit_price < target_price:
+                raise PolicyError("LIVE tick-aligned bracket is invalid")
             values["entry_reference"] = str(limit_price)
+            values["stop_reference"] = str(stop_price)
+            values["take_profit_reference"] = str(target_price)
             values["canonical"]["entry_reference"] = str(limit_price)
             values["canonical"]["entry_limit_price"] = str(limit_price)
+            values["canonical"]["stop_reference"] = str(stop_price)
+            values["canonical"]["take_profit_reference"] = str(target_price)
             live_quantity = floor_to_step(quote_amount / limit_price, market.step_size)
             if live_quantity <= 0 or live_quantity * limit_price < market.min_notional:
                 raise PolicyError(f"requested {quote_amount} USDT is below Binance minimum notional after rounding; amount will not be increased")
-            risk_at_stop = live_quantity * (limit_price - Decimal(values["stop_reference"]))
+            pending_quantity = floor_to_step(
+                live_quantity * (Decimal("1") - self.settings.risk.paper_fee_pct / Decimal("100")),
+                market.step_size,
+            )
+            if pending_quantity <= 0:
+                raise PolicyError("LIVE protective quantity is zero after fee and LOT_SIZE rounding")
+            risk_at_stop = live_quantity * (limit_price - stop_price)
             if risk_at_stop > self.settings.live.max_risk_per_trade_usdt:
                 raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
             values["canonical"].update({"quantity": str(live_quantity),
+                "pending_quantity": str(pending_quantity),
+                "price_tick_size": str(market.price_tick_size),
                 "risk_at_stop": str(risk_at_stop), "projected_total_exposure": str(quote_amount),
                 "projected_free_balance": "UNVERIFIED", "fee_estimate": str(quote_amount * self.settings.risk.paper_fee_pct / Decimal("100")),
                 "protection": "OPO_WITH_PENDING_SELL_OCO_REQUIRED", "execution_ready_at_creation": readiness["execution_ready"]})
@@ -1214,7 +1235,8 @@ class SpotGuard:
         daily = self.ledger.daily_committed_quote(utcnow().date().isoformat())
         validate_claim(self.settings, proposal, daily)
         if proposal["mode"] == "live":
-            readiness = self.live_status(check_symbols=True)
+            # Re-check the exact pair at the final execution gate.
+            readiness = self.live_status(check_symbols=True, symbols=[proposal["symbol"]])
             if not readiness["execution_ready"]:
                 raise SecurityError("live approval fails closed; readiness blockers: " + ", ".join(readiness["blockers"]))
         lease, lease_hash = self.signer.new_lease()
@@ -1266,9 +1288,13 @@ class SpotGuard:
 
     @localized
     def execute_live(self, proposal_id: str, lease: str) -> dict[str, Any]:
-        if self.settings.mode != "live":
-            raise SecurityError("live executor is unavailable while mode is paper")
         proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
+        if not self.settings.live.enabled:
+            self.ledger.fail_execution(proposal_id, lease_hash, "live execution is disabled locally")
+            raise SecurityError("live executor is disabled locally")
+        if not self.live_arm.status().armed:
+            self.ledger.fail_execution(proposal_id, lease_hash, "live arm expired before executor invocation")
+            raise SecurityError("live trading is not armed on the VPS")
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
         try:
@@ -1382,8 +1408,8 @@ class SpotGuard:
         filled_quantity: str | None = None,
         average_price: str | None = None,
     ) -> dict[str, Any]:
-        if self.settings.mode != "live":
-            raise SecurityError("live completion is unavailable while mode is paper")
+        if not self.settings.live.enabled:
+            raise SecurityError("live completion is disabled locally")
         proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
         order_id = validate_simple_id(order_id, "order_id")
         normalized_status = execution_status.upper()
@@ -1413,8 +1439,8 @@ class SpotGuard:
         return self.ledger.fail_execution(proposal_id, lease_hash, sanitized)
 
     def uncertain_execution(self, proposal_id: str, lease: str, reason: str) -> dict[str, Any]:
-        if self.settings.mode != "live":
-            raise SecurityError("uncertain execution reconciliation is only used in live mode")
+        if not self.settings.live.enabled:
+            raise SecurityError("uncertain execution reconciliation is disabled locally")
         proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
         sanitized = bounded_text(reason, "reason", maximum=200)
         summary = {
@@ -1434,12 +1460,14 @@ class SpotGuard:
             summary,
         )
 
-    def live_status(self, check_symbols: bool = False) -> dict[str, Any]:
+    def live_status(self, check_symbols: bool = False,
+                    symbols: list[str] | None = None) -> dict[str, Any]:
         arm = self.live_arm.status()
         agent = self.agent_os.status()
         symbol_checks: list[dict[str, Any]] = []
         if check_symbols:
-            for symbol in self.settings.live.allowed_symbols:
+            targets = symbols if symbols is not None else self.settings.live.allowed_symbols
+            for symbol in targets:
                 try:
                     item = validate_spot_symbol(self.settings, symbol)
                     item["protected_live_supported"] = bool(item.get("oto_allowed") and item.get("opo_allowed") and item.get("oco_allowed") and Decimal(item.get("price_tick_size", "0")) > 0 and item.get("percent_price_filter") and item.get("max_num_orders", 0) > 0 and item.get("max_num_algo_orders", 0) > 0 and item.get("max_num_order_lists", 0) > 0)
@@ -1475,8 +1503,12 @@ class SpotGuard:
             raise SecurityError(
                 f"arm duration must be between 1 and {self.settings.risk.max_live_arm_minutes} minutes"
             )
-        readiness = self.live_status(check_symbols=True)
-        blockers = [item for item in readiness["blockers"] if item != "live_armed"]
+        # Arming does not submit an order. Pair-level OTO/OPO/OCO support is
+        # checked when a proposal is created and again at approval, so an
+        # unrelated scanner symbol cannot prevent the session from being armed.
+        readiness = self.live_status(check_symbols=False)
+        blockers = [item for item in readiness["blockers"]
+                    if item not in {"live_armed", "symbol_exchange_flags_verified"}]
         if blockers:
             raise SecurityError("live cannot be armed; readiness blockers: " + ", ".join(blockers))
         result = self.live_arm.arm(minutes).__dict__

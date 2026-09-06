@@ -70,7 +70,7 @@
     "max_aggregate_risk_usdt": 4,
     "max_successful_entries_per_utc_day": 10,
     "max_pending_proposals": 1,
-    "approval_ttl_seconds": 60,
+    "approval_ttl_seconds": 180,
     "daily_realized_loss_cap_usdt": 5,
     "weekly_loss_cap_usdt": 20,
     "protective_orders_available": false,

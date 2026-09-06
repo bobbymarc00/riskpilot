@@ -18,7 +18,7 @@ ${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}/tools/spotguard-agent-os/riskpi
 
 RiskPilot selects and persists the locale deterministically. Do not translate the utterance before routing, infer locale from the assistant's previous response, or call a model/tool to detect language. Display only the returned `presentation.text` verbatim; do not append an independently translated summary, raw developer errors, or JSON prose. Existing structured slash commands and callback actions retain their exact tokens and trusted metadata. Callback responses use the original proposal locale, even after a chat locale change. Scheduled proposals use the destination chat locale or the configured fallback. Multi-symbol comparisons rank the canonical scheduled-signal score, separately rank execution-eligible symbols, use deterministic symbol tie-breaking, and never create a proposal or claim a guaranteed best entry.
 
-After `/new`, a complete English or Indonesian balance, positions, or combined status phrase recognized by RiskPilot's intent vocabulary still routes directly through `paper-intent`; do not ask which platform. Explicitly named unrelated platforms remain outside this skill.
+After `/new`, a complete English or Indonesian balance, positions, or combined status phrase recognized by RiskPilot's intent vocabulary still routes directly through `trade-intent`; do not ask which platform. Explicitly named unrelated platforms remain outside this skill.
 
 Core boundaries:
 

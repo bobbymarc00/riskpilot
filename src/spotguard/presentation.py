@@ -185,6 +185,14 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
     if result.get("source") == "binance_agent_os_mcp" and "candle" in result:
         fields = _analysis_fields(result, locale)
         return t("analysis.summary", **fields) + "\n" + t(ANALYSIS_CONCLUSION_KEYS[result["signal"]], **fields)
+    if "results" in result and "ranking" in result:
+        candidates = [item.get("candidate") for item in result.get("results", [])
+                      if isinstance(item, dict) and isinstance(item.get("candidate"), dict)]
+        if not candidates:
+            return t("scan.none")
+        candidate = candidates[0]
+        return t("scan.candidate", symbol=candidate["symbol"], identifier=candidate["id"],
+                 score=number(candidate["score"], locale, 0))
     if "ranking" in result:
         rows = []
         for rank, row in enumerate(result["ranking"], start=1):
@@ -194,6 +202,8 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
         eligible = result.get("execution_eligible_ranking", [])
         eligible_symbols = ", ".join(row["symbol"] for row in eligible) or t("analysis.none")
         eligible_candidates = result.get("eligible_candidates", [])
+        if not result["ranking"]:
+            return t("scan.none")
         selected = eligible_candidates[0] if eligible_candidates else result["ranking"][0]
         scenario = _analysis_fields(selected, locale)
         winner_reason = analysis_reason(result.get("highest_market_score_ineligibility_reason"), locale)

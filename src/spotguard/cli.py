@@ -48,6 +48,26 @@ def _decimal_argument(value: str, field: str) -> Decimal:
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
+def _live_spot_view(service: SpotGuard, *, include_orders: bool) -> dict[str, Any]:
+    balance = service.live_executor.read_spot_account()
+    orders = service.live_executor.read_open_spot_orders() if include_orders else None
+    rows = balance["balances"]
+    text = ["LIVE SPOT BALANCE"]
+    text.extend(f"- {row['asset']}: free {row['free']}, locked {row['locked']}" for row in rows)
+    if not rows:
+        text.append("- No non-zero Spot balance.")
+    if include_orders:
+        text.append("OPEN SPOT ORDERS / TP-SL")
+        if orders:
+            text.extend(f"- {row.get('symbol')} {row.get('side')} {row.get('type')} qty {row.get('origQty')} price {row.get('price')} stop {row.get('stopPrice')} status {row.get('status')}" for row in orders)
+        else:
+            text.append("- No active Spot order or TP/SL.")
+    result = {"live_spot": True, "balance": balance, "presentation": {"text": "\n".join(text)}}
+    if orders is not None:
+        result["open_orders"] = orders
+    return result
+
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -229,6 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     live_parser = subparsers.add_parser("live", help="manage the short-lived live-execution arm")
     live_sub = live_parser.add_subparsers(dest="live_command", required=True)
     live_sub.add_parser("status")
+    live_sub.add_parser("balance", help="read non-zero live Spot balances")
+    live_sub.add_parser("positions", help="read live Spot balances and open TP/SL orders")
     live_buy = live_sub.add_parser("buy")
     live_buy.add_argument("--symbol", required=True)
     live_buy.add_argument("--quote-amount", required=True)
@@ -520,10 +542,18 @@ def _run(args: argparse.Namespace) -> Any:
             )}
         if intent["action"] == "reject_pending":
             return {"intent":intent,"rejected":service.ledger.reject_all_pending_paper("explicit natural-language reject pending; chained buy deferred")}
-        if intent["action"] in {"positions","status"}:
+        if intent["action"] in {"positions", "live_positions"}:
+            return {"intent": intent, **_live_spot_view(service, include_orders=True)}
+        if intent["action"] in {"paper_positions"}:
             return {"intent": intent, **service.paper_status()}
-        if intent["action"] == "balance":
-            return {"intent": intent, "balance": service.paper_balance_status()}
+        if intent["action"] in {"status", "paper_status"}:
+            return {"intent": intent, **service.paper_status()}
+        if intent["action"] == "live_status":
+            return {"intent": intent, **_live_spot_view(service, include_orders=True)}
+        if intent["action"] in {"balance", "live_balance"}:
+            return {"intent": intent, **_live_spot_view(service, include_orders=False)}
+        if intent["action"] == "paper_balance":
+            return {"intent": intent, **service.paper_balance_status()}
         return {"ok": False, "intent": intent}
     if args.command == "paper-reset":
         _require_local_admin(service, args.owner_id, "RESET RISK PILOT PAPER ACCOUNT TO 1000 USDT")
@@ -609,6 +639,10 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command == "live":
         if args.live_command == "status":
             return service.live_status(check_symbols=True)
+        if args.live_command == "balance":
+            return _live_spot_view(service, include_orders=False)
+        if args.live_command == "positions":
+            return _live_spot_view(service, include_orders=True)
         if args.live_command == "buy":
             return service.create_manual_buy_proposal(args.symbol, decimal_value(args.quote_amount, "quote_amount"), live=True, notify=args.notify, dry_run=args.dry_run)
         if args.live_command in {"pause", "disarm"}:

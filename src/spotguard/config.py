@@ -303,8 +303,8 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
     if parsed_url.scheme != "https" or parsed_url.hostname not in ALLOWED_MARKET_HOSTS:
         raise ConfigError("market.base_url must be an official HTTPS Binance API host")
     symbols_raw = market_raw.get("symbols")
-    if not isinstance(symbols_raw, list) or not 1 <= len(symbols_raw) <= 20:
-        raise ConfigError("market.symbols must contain 1 to 20 symbols")
+    if not isinstance(symbols_raw, list) or not 1 <= len(symbols_raw) <= 1000:
+        raise ConfigError("market.symbols must contain 1 to 1000 symbols")
     symbols: list[str] = []
     for item in symbols_raw:
         symbol = str(item).upper()
@@ -501,8 +501,8 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
             or live.max_aggregate_risk_usdt < live.max_risk_per_position_usdt
             or live.weekly_loss_cap_usdt < live.daily_realized_loss_cap_usdt):
         raise ConfigError("live limits are invalid")
-    if not 1 <= live.approval_ttl_seconds <= 60:
-        raise ConfigError("live approval TTL must be no more than 60 seconds")
+    if not 1 <= live.approval_ttl_seconds <= 180:
+        raise ConfigError("live approval TTL must be no more than 180 seconds")
     if live.arm:
         raise ConfigError("live.arm must remain false in config; use the VPS-local live arm command")
     if mode == "live" and not live.enabled:
