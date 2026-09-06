@@ -13,7 +13,7 @@ from .codex_bridge import CodexBridgeError
 from .config import ConfigError, default_config_path, initialize_config, load_settings
 from .db import LedgerError
 from .market import MarketError
-from .intent import normalize_paper_intent
+from .intent import normalize_paper_intent, normalize_trade_intent
 from .presentation import detect_locale, error_text, render, vocabulary
 from .policy import PolicyError
 from .security import SecurityError
@@ -94,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
     live_buy_direct.add_argument("--quote-amount", required=True)
     live_buy_direct.add_argument("--notify", action="store_true")
     live_buy_direct.add_argument("--dry-run", action="store_true")
+    live_approve = subparsers.add_parser("live-approve", help="approve one LIVE proposal from a native Telegram button")
+    live_approve.add_argument("proposal_id")
+    live_approve.add_argument("--sender-id", required=True)
+    live_approve.add_argument("--chat-id", required=True)
+    live_reject = subparsers.add_parser("live-reject", help="reject one LIVE proposal from a native Telegram button")
+    live_reject.add_argument("proposal_id")
+    live_reject.add_argument("--sender-id", required=True)
+    live_reject.add_argument("--chat-id", required=True)
 
     paper_parser = subparsers.add_parser("paper", help="inspect the virtual paper account")
     paper_sub = paper_parser.add_subparsers(dest="paper_command", required=True)
@@ -113,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     paper_intent.add_argument("--chat-id", required=True)
     paper_intent.add_argument("--notify", action="store_true")
     paper_intent.add_argument("--dry-run", action="store_true")
+    trade_intent = subparsers.add_parser("trade-intent", help="normalize a trusted Telegram trade intent; LIVE by default")
+    trade_intent.add_argument("--text", required=True)
+    trade_intent.add_argument("--sender-id", required=True)
+    trade_intent.add_argument("--chat-id", required=True)
+    trade_intent.add_argument("--notify", action="store_true")
+    trade_intent.add_argument("--dry-run", action="store_true")
 
     paper_close = subparsers.add_parser("paper-close", help="create a manual paper-close proposal")
     paper_close.add_argument("position_id")
@@ -318,11 +332,12 @@ def _dispatch_callback(service: SpotGuard, data: str, sender_id: str, chat_id: s
     try:
         if parsed["action"] == "approve":
             proposal = service.ledger.get_proposal(parsed["proposal_id"])
-            if proposal["mode"] != "paper":
-                raise SecurityError("LIVE callback execution is unavailable and remains fail-closed")
             claim = service.claim(parsed["proposal_id"], parsed["token"], sender_id, chat_id)
+            if claim["mode"] == "live":
+                result = service.execute_live(parsed["proposal_id"], claim["lease"])
+                return {"ok": result.get("status") == "EXECUTED", "message": "LIVE approval processed; inspect Binance reconciliation status", "proposal": result}
             if claim["mode"] != "paper":
-                raise SecurityError("LIVE callback execution is unavailable and remains fail-closed")
+                raise SecurityError("proposal mode is invalid")
             fill = service.execute_paper(parsed["proposal_id"], claim["lease"])
             return {"ok": True, "message": "APPROVE PAPER accepted; simulated fill completed", "proposal": fill, "presentation": fill["presentation"]}
         if parsed["action"] == "reject":
@@ -470,21 +485,28 @@ def _run(args: argparse.Namespace) -> Any:
         return service.resend_paper_proposal(args.proposal_id, args.sender_id, args.chat_id, dry_run=args.dry_run)
     if args.command == "live-buy":
         return service.create_manual_buy_proposal(args.symbol, decimal_value(args.quote_amount, "quote_amount"), live=True, notify=args.notify, dry_run=args.dry_run)
+    if args.command == "live-approve":
+        return service.approve_live_button(args.proposal_id, args.sender_id, args.chat_id)
+    if args.command == "live-reject":
+        return service.reject_live_button(args.proposal_id, args.sender_id, args.chat_id)
     if args.command == "paper":
         return service.paper_status() if args.paper_command == "positions" else service.paper_balance_status()
-    if args.command == "paper-intent":
+    if args.command in {"paper-intent", "trade-intent"}:
         service._validate_owner(args.sender_id)
         if args.chat_id != service.settings.telegram.chat_id:
             raise SecurityError("paper intent chat does not match")
         args._locale = service.select_locale(args.text, args.locale)
-        intent = normalize_paper_intent(args.text, service.settings.market.symbols, service.locale)
+        intent = (normalize_trade_intent if args.command == "trade-intent" else normalize_paper_intent)(
+            args.text, service.settings.market.symbols, service.locale)
         if intent["action"] == "analysis":
             amount = Decimal(intent["quote_amount"]) if "quote_amount" in intent else None
             return service.analyze_market(intent["symbol"], amount)
         if intent["action"] == "ranking":
             return service.compare_markets()
         if intent["action"] == "buy":
-            return {"intent": intent, **service.create_manual_buy_proposal(intent["symbol"], Decimal(intent["quote_amount"]), notify=args.notify, dry_run=args.dry_run)}
+            return {"intent": intent, **service.create_manual_buy_proposal(
+                intent["symbol"], Decimal(intent["quote_amount"]),
+                live=intent.get("mode") == "live", notify=args.notify, dry_run=args.dry_run)}
         if intent["action"] == "close":
             positions = [row for row in service.ledger.list_paper_positions(True) if row["symbol"] == intent["symbol"]]
             if not positions:

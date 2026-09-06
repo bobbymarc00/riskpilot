@@ -1,0 +1,20 @@
+# RiskPilot protected-live Codex profile template.
+#
+# This file intentionally contains no OAuth credentials and does not connect
+# the MCP server. Review the allowlist and Binance account scopes before using
+# the setup script. RiskPilot remains the policy gateway and requires a
+# separate human approval before every write.
+
+[mcp_servers.binance-execution]
+url = "https://agent.binance.com/mcp/agentic"
+enabled_tools = ["tool_execute"]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.binance-execution.tools.tool_execute]
+# The RiskPilot process supplies the approval only after its own proposal
+# approval. Never change this to an unattended mode during review.
+approval_mode = "prompt"
+
+[projects."/home/ubuntu/.codex-riskpilot-execution/workspace"]
+trust_level = "trusted"
+

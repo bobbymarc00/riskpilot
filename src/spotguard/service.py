@@ -1264,6 +1264,46 @@ class SpotGuard:
                 self.ledger.fail_execution(proposal_id, lease_hash, reason)
             raise
 
+    @localized
+    def execute_live(self, proposal_id: str, lease: str) -> dict[str, Any]:
+        if self.settings.mode != "live":
+            raise SecurityError("live executor is unavailable while mode is paper")
+        proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
+        if proposal["mode"] != "live":
+            raise SecurityError("live executor cannot execute a paper proposal")
+        try:
+            response = self.live_executor.execute(proposal)
+        except Exception as exc:
+            # After a write child has started, absence of a usable response is
+            # never proof that Binance rejected it. Preserve the lease outcome
+            # as RECONCILE and do not retry automatically.
+            return self.uncertain_execution(proposal_id, lease, str(exc))
+        order_list_id = response.get("orderListId")
+        if not isinstance(order_list_id, int):
+            return self.uncertain_execution(proposal_id, lease, "protected Spot response has no orderListId")
+        status = str(response.get("listStatusType", ""))
+        return self.ledger.finish_execution(
+            proposal_id, lease_hash, "EXECUTED", str(order_list_id), status,
+            {"simulated": False, "symbol": proposal["symbol"], "side": "BUY",
+             "protected_order_type": "OTOCO", "binance_response": dict(response)},
+        )
+
+    @localized
+    def approve_live_button(self, proposal_id: str, sender_id: str, chat_id: str) -> dict[str, Any]:
+        proposal = self.ledger.get_proposal(proposal_id)
+        if proposal["mode"] != "live":
+            raise SecurityError("native live approval can approve LIVE proposals only")
+        token = self.signer.approval_token(proposal["canonical_json"])
+        claim = self.claim(proposal_id, token, sender_id, chat_id)
+        return self.execute_live(proposal_id, claim["lease"])
+
+    @localized
+    def reject_live_button(self, proposal_id: str, sender_id: str, chat_id: str) -> dict[str, Any]:
+        proposal = self.ledger.get_proposal(proposal_id)
+        if proposal["mode"] != "live":
+            raise SecurityError("native live rejection can reject LIVE proposals only")
+        return self.reject(proposal_id, self.signer.approval_token(proposal["canonical_json"]), sender_id, chat_id)
+
     def _execute_claimed_paper(self, proposal: dict[str, Any], lease_hash: str) -> dict[str, Any]:
         proposal_id = proposal["id"]
         if proposal["mode"] != "paper" or proposal["canonical"].get("mode") != "paper":
@@ -1408,7 +1448,7 @@ class SpotGuard:
                 symbol_checks.append(item)
         flags_ok = bool(symbol_checks) and all(item["protected_live_supported"] for item in symbol_checks)
         readiness = self.live_executor.readiness(
-            connected=bool(agent.get("currently_usable")), armed=arm.armed,
+            connected=bool(agent.get("authenticated") and agent.get("mcp_configured")), armed=arm.armed,
             symbol_flags_verified=flags_ok)
         result = readiness.to_dict()
         minimum_profile_balance = self.settings.live.max_quote_per_entry_usdt + self.settings.live.min_free_reserve_usdt

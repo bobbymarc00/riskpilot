@@ -128,3 +128,18 @@ def normalize_paper_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
     if lowered in vocabulary("input.approval"):
         return {"action": "forbidden_approval", "message": t("intent.approval")}
     return {"action": "clarify", "message": t("intent.clarify")}
+
+
+def normalize_trade_intent(text: str, allowed_symbols: tuple[str, ...], locale: str | None = None) -> dict[str, Any]:
+    """Normalize the protected default route: LIVE unless `paper` is explicit.
+
+    The legacy paper normalizer remains unchanged for demos and existing button
+    flows.  Removing an explicit LIVE marker before reusing its strict parser
+    prevents that marker from becoming an unstructured execution instruction.
+    """
+    explicit_paper = bool(re.search(r"\bpaper\b", text, re.I))
+    stripped = re.sub(r"\b(?:live|real|nyata)\b", "", text, flags=re.I)
+    result = normalize_paper_intent(stripped, allowed_symbols, locale)
+    if result.get("action") == "buy":
+        result["mode"] = "paper" if explicit_paper else "live"
+    return result

@@ -182,15 +182,17 @@ class CodexAgentOSBridge:
                             "event_summary": self._event_summary(result.stdout)})
         return payload
 
-    def _legacy_tool_approval_override(self) -> list[str]:
-        """Permit only the old profile's read-only generic MCP envelope.
+    def _read_only_tool_approval_override(self) -> list[str]:
+        """Permit the generic envelope for one verified read-only child only.
 
-        This is passed with one `codex` child process and never written to the
-        broad profile's config.toml.
+        This override is never persisted.  The event validator below still
+        requires exactly one `spot.klines` call with the fixed arguments.
         """
-        if not self.settings.codex.legacy_oauth_profile:
-            return []
         return ["-c", f'mcp_servers.{self.settings.codex.mcp_server}.tools.tool_execute.approval_mode="approve"']
+
+    def _legacy_tool_approval_override(self) -> list[str]:
+        """Compatibility helper retained for callers of the old PAPER bridge."""
+        return self._read_only_tool_approval_override() if self.settings.codex.legacy_oauth_profile else []
 
     def _event_summary(self, stream: str) -> list[dict[str, str]]:
         summary: list[dict[str, str]] = []
@@ -432,8 +434,8 @@ class CodexAgentOSBridge:
             output_path = Path(directory) / "confirmation.json"
             # This exact non-interactive invocation was checkpointed against
             # the dedicated profile.  `-a never` is not an approval request.
-            command = [self.settings.codex.command, *self._legacy_tool_approval_override(), "-a", "never", "exec", "--strict-config",
-                "--ephemeral", "--skip-git-repo-check", "--json", "-s", "read-only",
+            command = [self.settings.codex.command, *self._read_only_tool_approval_override(), "exec",
+                "--ephemeral", "--skip-git-repo-check", "--json", "--sandbox", "read-only",
                 "--output-schema", str(schema_path),
                 "--output-last-message", str(output_path)]
             if self.settings.codex.model:

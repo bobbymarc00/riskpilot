@@ -230,8 +230,9 @@ class CodexBridgeTests(unittest.TestCase):
                     bridge.confirm_candle("BTCUSDT")
             argv = run.call_args.args[0]
             self.assertIn("read-only", argv)
-            self.assertIn("--strict-config", argv)
-            self.assertEqual(argv[argv.index("-a") + 1], "never")
+            self.assertIn("--ephemeral", argv)
+            self.assertIn('mcp_servers.binance-marketdata.tools.tool_execute.approval_mode="approve"', argv)
+            self.assertNotIn("-a", argv)
 
     def test_persisted_failed_probe_remains_not_usable_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

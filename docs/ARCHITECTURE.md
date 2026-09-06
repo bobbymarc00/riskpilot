@@ -18,7 +18,9 @@ flowchart LR
   B --> C[Agent OS read-only confirmation]
   C --> D[Risk engine]
   D --> E[Telegram human approval]
-  E --> F[PAPER SQLite ledger]
+  E --> F{Proposal mode}
+  F -->|PAPER| G[PAPER SQLite ledger]
+  F -->|LIVE| H[Spot OTOCO entry + TP/SL]
 ```
 
 1. The retained compatibility timer invokes the scheduled scan every five minutes.
@@ -27,10 +29,10 @@ flowchart LR
 4. At most one top candidate is confirmed through one fixed Agent OS read-only `spot.klines` request.
 5. Exact candle time/OHLC matching gates deterministic proposal logic.
 6. Telegram carries immutable proposal details and owner-bound controls.
-7. PAPER execution updates SQLite atomically; monitoring uses bounded one-minute history for exits.
+7. PAPER execution updates SQLite atomically; LIVE execution submits one owner-approved Spot OTOCO envelope and records an ambiguous outcome as RECONCILE without retry.
 
 Scoring does not use Agent OS. Agent OS is a narrow confirmation stage after the public-data prefilter.
 
 SQLite uses WAL, busy timeout, transactions, proposal leases, idempotent fills, epoch-aware accounting, and append-only audit evidence. Legacy internal identifiers keep existing ledgers readable.
 
-LIVE is isolated behind an adapter with no installed write target. It remains blocked pending exact protected Spot OPO/OCO schema, scopes, native confirmation binding, exchange flags, and reconciliation.
+LIVE is isolated behind an adapter that constructs only `spot.orderList.place.otoco`: LIMIT BUY, then pending SELL take-profit and stop-loss OCO legs. It requires a dedicated profile, local arm, native Telegram confirmation, exact MCP event matching, and reconciliation on failure.

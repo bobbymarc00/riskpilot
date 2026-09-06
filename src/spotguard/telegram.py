@@ -95,8 +95,16 @@ def proposal_message(proposal: dict[str, Any], token: str, confirmation_code: st
         fields = _display_fields(canonical, locale)
         fields["quantity"] = compact_number(Decimal(canonical["existing_quantity"]) + Decimal(canonical["new_proposed_tranche_quantity"]), locale, 8)
         text += "\n\n" + translate("proposal.scale_in", locale, **fields)
+    if proposal["mode"] == "live":
+        text += "\n\n" + translate("proposal.live.confirmation", locale)
+        return text, [
+            {"label": translate("button.approve_live", locale),
+             "command": _command(f"/binance_spotguard live-approve {proposal['id']}"), "style": "danger"},
+            {"label": translate("button.reject_live", locale),
+             "command": _command(f"/binance_spotguard live-reject {proposal['id']}"), "style": "secondary"},
+        ]
     if proposal["mode"] != "paper":
-        return text, []
+        raise TelegramError("proposal mode is invalid")
     if not confirmation_code:
         raise TelegramError("PAPER command controls require a confirmation code")
     text += "\n\n" + translate("proposal.fallback", locale, identifier=proposal["id"], code=confirmation_code)

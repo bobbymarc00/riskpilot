@@ -98,13 +98,19 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertIsNone(proposal["execution_status"])
    with self.assertRaises(SecurityError): service.execute_paper(proposal["id"],"invalid")
 
- def test_adapter_is_immutable_and_always_fail_closed(self):
+ def test_adapter_is_immutable_and_only_builds_protected_otoco(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True)); adapter=service.live_executor
-   proposal={"mode":"live","canonical":{"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"BTCUSDT","quote_amount":"6"}}
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"BTCUSDT","quote_amount":"6","quantity":"0.06","entry_limit_price":"100","stop_reference":"98","take_profit_reference":"104"}}
    frozen=adapter.freeze(proposal)
    with self.assertRaises(TypeError): frozen["symbol"]="ETHUSDT"
-   with self.assertRaisesRegex(SecurityError,"unverified"): adapter.execute(proposal)
+   request=adapter.protected_request(proposal)
+   self.assertEqual(request["toolName"],"spot.orderList.place.otoco")
+   self.assertEqual(request["arguments"]["workingSide"],"BUY")
+   self.assertEqual(request["arguments"]["pendingSide"],"SELL")
+   self.assertEqual(request["arguments"]["pendingBelowStopPrice"],"98")
+   self.assertEqual(request["arguments"]["pendingAbovePrice"],"104")
+   with self.assertRaisesRegex(SecurityError,"exact approved"): adapter.execute(proposal)
    for tool in ("futures.order","margin.order","wallet.withdraw","generic.tool_execute"):
     with self.assertRaises(SecurityError): LiveExecutionAdapter.validate_tool("binance-mcp-server",tool)
    ids=adapter.client_ids("p-1234567890ab"); self.assertEqual(ids["order_list_client_id"],"sgl-1234567890ab")

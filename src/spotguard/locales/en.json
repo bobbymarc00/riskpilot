@@ -95,6 +95,8 @@
   "result.complete": "RiskPilot · Request completed.",
   "button.approve_paper": "APPROVE PAPER",
   "button.reject_paper": "REJECT PAPER",
+  "button.approve_live": "APPROVE LIVE",
+  "button.reject_live": "REJECT LIVE",
   "button.approve_close": "APPROVE CLOSE",
   "button.reject_close": "REJECT CLOSE",
   "button.review": "AI REVIEW",
@@ -104,6 +106,7 @@
   "proposal.mode.live": "⚠️ LIVE — REAL FUNDS",
   "proposal.body": "{title}\n{mode}\nSpot MARKET BUY {symbol}\nMaximum spend: {amount} USDT\nEntry reference: {entry}\nStop reference: {stop}\nTarget reference: {target}\nR:R: {ratio}\nID: {identifier}\nExpires: {expiry}\n\nApproval is required. After a simulated paper fill, final stop/target are re-anchored to the fill and monitored automatically.",
   "proposal.fallback": "Paper-only fallback commands:\n/spot paper-approve {identifier} {code}\n/spot paper-reject {identifier} {code}",
+  "proposal.live.confirmation": "Real funds notice: approving is required before the protected Spot entry with TP/SL can be submitted. This proposal expires automatically.",
   "proposal.scale_in": "PAPER SCALE-IN PROPOSAL — NOT A REAL ORDER\nCurrent/projected aggregate quantity: {existing_quantity} / {quantity}\nNew proposed tranche quantity: {new_proposed_tranche_quantity}\nCurrent/projected average entry: {existing_average_entry} / {projected_weighted_average_entry}\nCurrent/projected exposure: {existing_exposure} / {projected_exposure} USDT\nProjected stop/target: {projected_stop} / {projected_target}\nWorst-case risk at stop (includes entry fee, exit fee, and stop slippage): {projected_risk_at_stop} USDT\nActive/projected tranches: {active_tranche_count} / {projected_tranche_count}\nFee estimate: {fee_estimate_base} {fee_estimate_asset} (≈ {fee_estimate_usdt} USDT)",
   "proposal.close.body": "🧪 PAPER CLOSE PROPOSAL — NOT A REAL ORDER\nSymbol: {symbol}\nEconomic position: {economic_position_id}\nRequested close: {requested_percentage}%\nActual executable close after LOT_SIZE rounding: {actual_executed_percentage}%\nAggregate quantity: {aggregate_quantity}\nProposed close quantity: {close_quantity}\nRemaining quantity: {remaining_quantity}\nAverage cost: {average_cost}\nReference bid: {reference_bid}\nEstimated gross: {estimated_gross_proceeds} USDT\nEstimated fee: {estimated_fee_usdt} {estimated_fee_asset} (≈ {estimated_fee_usdt} USDT)\nEstimated net: {estimated_net_proceeds} USDT\nEstimated realized P&L: {estimated_realized_pnl} USDT\nClose proposal: {identifier}\nExpires: {expiry}\n\nFallback: /spot paper-close-approve {position_id} {code}",
   "candidate.body": "🔎 RISKPILOT CANDIDATE\n{symbol} · {interval}\nScore: {score}/100\nReference: {price}\nID: {identifier}\nNo order exists. AI REVIEW verifies fresh data through Binance Agent OS."
