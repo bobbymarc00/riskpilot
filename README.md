@@ -1,211 +1,1066 @@
 # RiskPilot
 
-RiskPilot is a Binance Agent OS-powered Spot trading copilot
-with deterministic risk controls and human-approved live execution.
+> **Binance Agent OS-powered Spot trading copilot with deterministic market scoring, deterministic risk controls, and human-approved live execution.**
 
-Analyze → Rank → Propose → Approve → Execute → Protect → Exit
+**Analyze → Rank → Risk-check → Propose → Approve → Execute → Protect → Exit**
 
-🎥 Demo: [https://youtu.be/aYC23eYYUx0]
+[![Demo](https://img.shields.io/badge/YouTube-Live%20Demo-red?logo=youtube)](https://youtu.be/aYC23eYYUx0)
+[![X Submission](https://img.shields.io/badge/X-Submission-black?logo=x)](https://x.com/bobbymarc00/status/2097039814482878806)
 
-𝕏 Submission: [https://x.com/bobbymarc00/status/2097039814482878806]
+**Binance Agent OS Mini Hackathon — Track A**
 
-🏆 Binance Agent OS Mini Hackathon — Track A
+---
 
-- Live Binance Agentic Spot account integration
-- Market-score ranking across supported assets
-- Human-approved live execution
-- Automatic TP/SL protection
-- Deterministic exposure and loss limits
+## Overview
 
+RiskPilot is a Spot trading copilot built around one principle:
 
-**Agent OS-powered Spot trading copilot**
+> **AI can interact and orchestrate. Deterministic code defines the trading boundaries. Humans authorize real execution.**
 
-**Scan. Verify. Approve. Protect.**
+RiskPilot combines:
 
-RiskPilot scans Binance Spot markets, verifies qualifying signals through Agent OS, applies deterministic risk controls, and routes immutable Spot trade proposals to Telegram for explicit human approval.
+* Binance public Spot market data
+* deterministic market scoring
+* narrowly scoped Binance Agent OS / MCP verification
+* deterministic risk policy
+* owner-bound human approval
+* protected Spot execution
+* position lifecycle management
 
-> Binance Agent OS Mini Hackathon — Track A · Categories: Trading Workflows and Data & Analysis
-> Execution model: PAPER is explicit; normal buy intent creates a protected LIVE proposal, which remains disarmed until the VPS owner arms it locally.
+RiskPilot can:
 
-**Problem:** trading assistants often blur analysis, authority, and execution.
-**Solution:** RiskPilot separates deterministic scanning, narrowly scoped AI verification, risk policy, owner-bound approval, and protected Spot execution.
+* read supported account state
+* analyze supported Spot assets
+* rank assets using a deterministic market score
+* generate trade proposals
+* enforce risk limits before execution
+* require human approval for LIVE writes
+* execute protected Spot entries
+* maintain TP / SL protection
+* perform partial exits
+* re-arm protection for remaining quantity
+* perform protected full exits
+* validate Binance execution responses and protection state
 
-[Architecture](docs/ARCHITECTURE.md) · [Security](docs/SECURITY.md) · [Evaluation evidence](docs/EVALUATION.md) · [Submission](docs/HACKATHON_SUBMISSION.md) · [Contributing](CONTRIBUTING.md)
+The goal is not unrestricted autonomous trading.
 
-## Quick start
+The goal is **controlled agentic execution**.
 
-Create a private configuration from `config.example.json`, keep `mode` as `paper`, and run the deterministic offline demo:
+---
 
-```bash
-./scripts/demo-track-a.sh
-```
+## Live Demo
 
-The demo creates an isolated temporary ledger, uses fixture market data, sends no Telegram messages, and has no Binance write path. See [the reproducible demo flow](docs/DEMO.md). The externally hosted demo video will be linked here before publication: `DEMO_VIDEO_URL`.
+### YouTube
 
-RiskPilot keeps technical JSON fields and command tokens stable while presenting Telegram results in deterministic English or Indonesian. New configurations default to English; existing configurations retain the compatibility fallback until `presentation.default_locale` is set.
+https://youtu.be/aYC23eYYUx0
 
-## Thirty-second overview
+### X Submission
 
-### Dedicated Binance MCP profile
+https://x.com/bobbymarc00/status/2097039814482878806
 
-Agent OS analysis and protected execution are fail-closed until `codex.agent_os_home` and
-`codex.agent_os_workspace` name an explicit dedicated Codex profile. The
-example intentionally leaves both `null`; RiskPilot never falls back to the
-caller environment or `~/.codex`. Binance MCP read-only: Agentic account +
-market data. RiskPilot requests only `tool_execute -> spot.klines`, validates
-the generic outer tool and inner target, and performs no account read or write.
-The provider may return the currently forming candle: one request asks for
-three raw candles and RiskPilot uses only the two newest that are closed after
-a configurable two-second close grace.
+The public demo uses **real funds** and shows a complete Spot position lifecycle.
 
-### Scanner status — temporarily disabled
+### Demo Flow
 
-The scheduled scanner is deliberately **disabled** while its public-data path is optimized. Scanning a broad USDT allowlist caused repeated Binance public REST throttling (`HTTP 429`, and later `HTTP 418`), which can lead to a temporary IP ban. No scanner timer is active and no background scan or notification is currently sent.
+1. Read the live Spot balance
+2. Check open positions
+3. Analyze XRP, BNB, and SOL
+4. Rank assets using RiskPilot's deterministic market score
+5. Generate a LIVE trade proposal
+6. Approve the proposal
+7. Execute a real Spot BUY
+8. Arm TP / SL protection
+9. Perform a partial exit
+10. Re-arm protection for the remaining quantity
+11. Fully exit the position
+12. Verify the resulting history through Binance.com
 
-The planned safe re-enable path is: choose a small liquidity-ranked universe (target: 20 symbols by 24-hour quote volume), cache/bulk-read `exchangeInfo`, fetch only the required 15-minute candles, add bounded retry/backoff, and notify Telegram only for qualified candidates. A five-minute cadence remains the design target; it is not active until this work is verified. Manual multi-symbol analysis remains read-only but should be used sparingly while Binance is throttling.
+This demonstrates:
 
-**Demo video:** pending owner upload (owner asset).
+**Account → Analysis → Risk → Approval → Execution → Protection → Position Management → Exit**
+
+The final Binance.com history view in the video is an out-of-band verification step performed by the user, not a claim that RiskPilot exposes a general transaction-history reader.
+
+---
 
 ## Why RiskPilot?
 
-RiskPilot is more than an indicator script or Telegram bot:
+Many AI trading demos effectively stop at:
 
-- Two-stage design avoids spending model tokens on every scan.
-- Exact candle matching independently verifies qualified candidates.
-- Human approval is cryptographically bound to an immutable proposal.
-- Risk and exposure are enforced before proposal and approval.
-- PAPER supports scale-in, aggregate accounting, and partial/full close.
-- Replay protection and execution-lease recovery survive restarts.
-- PAPER is explicit; normal trading intent creates a LIVE proposal that still requires a native approval button.
-- Live Spot exits preserve protection: partial exit cancels the exact OCO, sells the approved rounded amount, then re-arms unchanged TP/SL for the remainder.
-- Timeout, denial, stale data, malformed output, mismatch, and invalid brackets fail closed.
-
-## How RiskPilot Uses Binance Agent OS
-
-Scheduled scans and manual analysis share the exact native score engine. Both score the same 60 validated closed candles from the Binance public REST prefilter; Binance Agent OS independently confirms the newest closed candle. Analysis reports market score separately from a read-only hypothetical PAPER eligibility projection and never creates a proposal. See [the score-engine audit](docs/SCORE_ENGINE.md) for the exact formula, weights, thresholds, and compatibility fixtures.
-
-1. Manual analysis uses deterministic Binance public Spot data.
-2. Only a qualified candidate would trigger Agent OS after the scanner is re-enabled.
-3. Agent OS performs a fixed read-only `spot.klines` confirmation.
-4. RiskPilot compares candle open time and exact OHLC values.
-5. Mismatch, timeout, denial, malformed output, or unexpected MCP activity fails closed.
-6. The model cannot choose symbol, product, side, amount, or risk values.
-7. Sanitized evidence is recorded in the audit ledger.
-
-```json
-{"event":"candidate.agent_os_confirmed","symbol":"BTCUSDT","interval":"15m","mcp_server":"binance-mcp-server","tool":"spot.klines","matched":true}
+```text
+Analyze → Buy
 ```
 
-Manual and fixture PAPER proposals do not claim Agent OS confirmation.
+RiskPilot treats entry as only one part of the workflow:
 
-## End-to-end workflow
+```text
+Analyze
+   ↓
+Rank
+   ↓
+Risk Check
+   ↓
+Proposal
+   ↓
+Human Approval
+   ↓
+Protected LIVE Execution
+   ↓
+TP / SL
+   ↓
+Partial Exit
+   ↓
+Re-arm Protection
+   ↓
+Full Exit
+```
+
+The important distinction is that the language-model-facing layer does not control trading limits.
+
+Natural-language interaction and deterministic execution policy are deliberately separated.
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart LR
-  A[Public Spot data] --> B[Deterministic prefilter]
-  B -->|top candidate| C[Agent OS read-only check]
-  C --> D[Risk engine]
-  D --> E[Telegram approval]
-  E --> F{Proposal mode}
-  F -->|PAPER| G[PAPER ledger]
-  F -->|LIVE| H[Spot OTOCO: entry + TP + SL]
+    A[Binance Public Spot Data] --> B[Deterministic Scoring]
+    B --> C[Agent OS Read-only Confirmation]
+    C --> D[Deterministic Risk Engine]
+    D --> E[Immutable Trade Proposal]
+    E --> F[Human Approval]
+    F --> G{Mode}
+    G -->|PAPER| H[PAPER SQLite Ledger]
+    G -->|LIVE| I[Protected Spot OTOCO Entry]
+    I --> J[TP / SL Protection]
+    J --> K[Partial / Full Exit]
+    K --> L[Protection Reconciliation]
 ```
 
-## Demonstrated capabilities
+RiskPilot separates:
 
-| Capability | Status |
-|---|---|
-| Scheduled scanner | Implemented, but **operationally disabled** during rate-limit/IP-ban optimization |
-| Agent OS exact-candle confirmation | Implemented · read-only |
-| PAPER proposal, fill, scale-in, partial close | Implemented · tested |
-| Automatic PAPER stop-loss/take-profit | Implemented · tested |
-| Replay, expiry, lease, restart recovery | Implemented · tested |
-| LIVE protected Spot entry (OTOCO) | Implemented · owner-confirmed · locally armed only |
-| LIVE TP/SL restore, partial exit, and protected full exit | Implemented · owner-confirmed · locally armed only |
-
-## Safety and fail-closed design
-
-- Spot-only configured allowlist. No Futures, Margin, Convert, wallet, transfer, payment, borrowing, or withdrawal route exists.
-- The only cancellation route is owner-approved cancellation of the exact active Spot TP/SL OCO list; it cannot cancel arbitrary orders.
-- No routine scan write exists; every live write begins with an immutable proposal and a native Telegram confirmation.
-- Natural-language buy and sell default to LIVE proposals; prefix `paper` for the explicit PAPER alternative.
-- `sell SYMBOL 47%` cancels the exact active OCO, sells an exchange-rounded protected amount, and re-arms unchanged TP/SL. `sell all SYMBOL` cancels OCO and exits the protected quantity without re-arming.
-- Approval is owner/chat bound, expiring, single-use, and payload-bound.
-- Long brackets require `stop < aggregate average < take-profit`.
-- LIVE requires a dedicated execution profile, local arm, protected OTOCO request, native Telegram confirmation, and reconciliation on any ambiguous result.
-
-See [Security](docs/SECURITY.md).
-
-## Reproducible quick demo
-
-### 60-second local evaluation
-
-```bash
-./scripts/demo-track-a.sh
-./scripts/demo-track-a.sh
-./scripts/verify.sh
-./spotguard --config config.example.json --json live status
+```text
+Observation
+    ↓
+Verification
+    ↓
+Policy
+    ↓
+Authorization
+    ↓
+Mutation
 ```
 
-The demo uses a new temporary database, mocked market reads, disabled Telegram, and no Binance write. Optional real read-only Agent OS check:
+---
 
-```bash
-./riskpilot --json agent-os market --symbol BTCUSDT
+## Separation of Responsibilities
+
+### Agent-facing layer
+
+The agent-facing layer handles:
+
+* natural-language interaction
+* intent routing
+* presentation and explanation
+* narrowly scoped Agent OS orchestration
+
+### Deterministic market engine
+
+Deterministic code handles:
+
+* technical-indicator calculation
+* native market scoring
+* score ranking
+* candidate eligibility
+* signal thresholds
+
+### Deterministic risk engine
+
+Deterministic code also enforces:
+
+* per-entry limits
+* exposure limits
+* position and tranche limits
+* stop-risk limits
+* aggregate-risk limits
+* daily and weekly loss limits
+* duplicate and replay protection
+* symbol allowlists
+* paper/live separation
+* live execution authorization
+* proposal expiry
+* execution leases
+
+### Binance Agent OS / MCP
+
+Agent OS / MCP is used only for narrowly scoped supported functions such as:
+
+* read-only market confirmation
+* account state required by LIVE workflows
+* exact protected Spot execution
+* protected-order management
+* execution reconciliation
+
+---
+
+## Deterministic Market Scoring
+
+RiskPilot does not ask the language model to invent a market score.
+
+The canonical score engine calculates a native score from deterministic components including:
+
+* EMA trend relationship
+* close vs fast EMA
+* RSI
+* short-term momentum
+* relative volume
+* ATR range
+* breakout condition
+
+The final score is bounded between:
+
+```text
+0 → 100
 ```
 
-## Telegram commands
+The public example configuration uses:
+
+```text
+Minimum qualifying score: 70
+```
+
+Candidate eligibility also requires deterministic bullish conditions and allowlist membership.
+
+Example:
+
+```text
+analyze XRP BNB SOL
+```
+
+RiskPilot returns exact native scores and ranks symbols deterministically.
+
+---
+
+## Binance Agent OS Integration
+
+RiskPilot uses separate, narrowly scoped Binance Agent OS / MCP paths for market-data confirmation and protected LIVE execution.
+
+### Market-data path
+
+```text
+Binance public Spot data
+        ↓
+60 closed candles
+        ↓
+Deterministic RiskPilot score
+        ↓
+Candidate
+        ↓
+Dedicated Agent OS read-only confirmation
+        ↓
+Exact candle / OHLC validation
+```
+
+Agent OS does **not** calculate RiskPilot's market score.
+
+Agent OS does **not** choose the winning trading candidate.
+
+Its role in this path is intentionally narrow: independent read-only confirmation.
+
+---
+
+## LIVE Execution Path
+
+LIVE execution uses a separate dedicated execution profile.
+
+RiskPilot only constructs fixed supported Spot write shapes.
+
+### Supported LIVE write surface
+
+* protected LIMIT BUY using OTOCO
+* SELL OCO protection restore
+* cancellation of the exact active protected OCO
+* approved MARKET SELL exit
+* ordered partial-exit workflow:
+
+  * cancel current protection
+  * sell approved quantity
+  * re-arm TP / SL for remaining quantity
+
+RiskPilot does not expose unrestricted Binance trading tools to the model.
+
+---
+
+## Human-in-the-Loop Execution
+
+A market signal is not permission to move real funds.
+
+The LIVE path requires:
+
+```text
+Immutable proposal
+        +
+Deterministic risk validation
+        +
+Supported Spot operation
+        +
+Dedicated execution profile
+        +
+Local LIVE arm
+        +
+Owner-bound human approval
+        +
+Binance response validation
+        =
+Eligible LIVE execution
+```
+
+Telegram or natural-language interaction cannot bypass the deterministic safety layer.
+
+---
+
+## Risk Guardrails
+
+RiskPilot separates natural-language interaction from deterministic execution policy.
+
+The public example configuration currently uses:
+
+| Guardrail                              | Current repository configuration |
+| -------------------------------------- | -------------------------------- |
+| Market type                            | Spot only                        |
+| Futures                                | Disabled                         |
+| Margin                                 | Disabled                         |
+| Withdrawals                            | Disabled                         |
+| Transfers                              | Disabled                         |
+| Convert / wallet / payment / borrowing | No supported execution route     |
+| Human approval                         | Required for every LIVE write    |
+| Default order size                     | 6 USDT                           |
+| Minimum quote amount                   | 5 USDT                           |
+| Maximum LIVE entry                     | 100 USDT                         |
+| Maximum PAPER entry                    | 100 USDT                         |
+| Maximum open exposure                  | 500 USDT                         |
+| Maximum economic positions             | 5                                |
+| Maximum active tranches                | 10                               |
+| Minimum LIVE free reserve              | 8 USDT                           |
+| Maximum risk per position              | 2 USDT                           |
+| Maximum aggregate open risk            | 4 USDT                           |
+| Daily realized-loss cap                | 5 USDT                           |
+| Weekly LIVE loss cap                   | 20 USDT                          |
+| Successful BUY entries / UTC day       | Maximum 10                       |
+| Pending LIVE proposals                 | Maximum 1                        |
+| Active proposals                       | Maximum 1                        |
+| LIVE approval TTL                      | 180 seconds                      |
+| Proposal TTL                           | 15 minutes                       |
+| Execution lease                        | 300 seconds                      |
+| Minimum reward:risk                    | 2.0                              |
+| Minimum stop distance                  | 0.5%                             |
+| Maximum stop distance                  | 3.0%                             |
+| Maximum entry drift                    | 1.0%                             |
+| Maximum spread                         | 0.25%                            |
+| LIVE startup state                     | Disabled and disarmed            |
+| LIVE arming                            | Local and time-limited           |
+| Replay protection                      | Enabled                          |
+| Paper/live separation                  | Enforced                         |
+| Automatic ambiguous-write retry        | Disabled                         |
+
+### Important: 6 USDT Is Not the Maximum
+
+```text
+risk.default_order_size_usdt = 6
+```
+
+is the default order amount when another amount is not supplied.
+
+It is **not** the maximum allowed trade size.
+
+The public example configuration independently defines:
+
+```text
+LIVE max entry:          100 USDT
+PAPER max entry:         100 USDT
+Maximum open exposure:   500 USDT
+Economic positions:      5
+Active tranches:         10
+```
+
+Actual executable size is still constrained by:
+
+* available Spot balance
+* 8 USDT minimum LIVE reserve
+* Binance exchange filters
+* per-entry maximum
+* total exposure
+* risk limits
+* active position limits
+* daily limits
+
+RiskPilot does not silently increase an order amount merely to satisfy an exchange minimum-notional requirement.
+
+---
+
+## Supported Symbols
+
+The current public example allowlist contains:
+
+```text
+BTCUSDT
+ETHUSDT
+BNBUSDT
+SOLUSDT
+XRPUSDT
+```
+
+Unsupported symbols fail closed.
+
+---
+
+## Protected Entry
+
+RiskPilot's LIVE entry path is designed around a protected Spot order list.
+
+```text
+Approved LIVE proposal
+        ↓
+Exchange filter validation
+        ↓
+LIMIT BUY
+        +
+Take Profit
+        +
+Stop Loss
+        ↓
+Spot OTOCO
+```
+
+The entry and protective bracket are derived from the immutable approved proposal.
+
+There is no unprotected MARKET BUY fallback in the LIVE entry path.
+
+---
+
+## Partial Exit
+
+RiskPilot supports protected partial exits.
+
+The workflow is intentionally ordered:
+
+```text
+Existing protected position
+        ↓
+Cancel exact active OCO
+        ↓
+Confirm protection cancellation
+        ↓
+Check free Spot balance
+        ↓
+MARKET SELL approved quantity
+        ↓
+Calculate remaining quantity
+        ↓
+Re-arm OCO using existing TP / SL
+```
+
+If the protection cancellation cannot be verified safely, the workflow requires reconciliation rather than blindly continuing.
+
+---
+
+## Full Exit
+
+A protected full exit follows the same fail-closed philosophy.
+
+```text
+Protected position
+        ↓
+Cancel exact active protection
+        ↓
+Validate executable quantity
+        ↓
+Approved MARKET SELL
+        ↓
+Verify execution result
+```
+
+RiskPilot does not expose arbitrary order cancellation.
+
+The cancellation route is limited to the exact active protection associated with the approved position workflow.
+
+---
+
+## Paper vs LIVE
+
+RiskPilot supports separate PAPER and LIVE execution paths.
+
+### PAPER
+
+PAPER mode supports:
+
+* simulated fills
+* scale-in
+* position accounting
+* partial close
+* full close
+* automatic TP / SL
+* risk-limit enforcement
+* restart recovery
+* proposal replay protection
+
+The public example starts with:
+
+```text
+mode = paper
+```
+
+### LIVE
+
+LIVE mode requires explicit readiness.
+
+The public example configuration starts with:
+
+```text
+live.enabled = false
+live.armed = false
+execution_ready = false
+```
+
+LIVE must be explicitly prepared and locally armed.
+
+Natural-language intent alone cannot arm LIVE execution.
+
+---
+
+## Scanner Status
+
+> **The scheduled scanner is implemented but currently operationally disabled while Binance public REST request budgeting and rate-limit / IP-ban protection are being optimized.**
+
+The scanner implementation remains in the repository and has offline/synthetic evaluation coverage.
+
+When enabled, the intended workflow is:
+
+```text
+Public Binance Spot data
+        ↓
+Deterministic prefilter
+        ↓
+Top candidate
+        ↓
+Agent OS read-only confirmation
+        ↓
+Risk engine
+        ↓
+Proposal
+```
+
+Manual analysis remains available separately.
+
+---
+
+## Fail-Closed Design
+
+RiskPilot prefers rejecting an unsafe or ambiguous operation over weakening the configured policy.
+
+Examples:
+
+```text
+Unsupported symbol
+→ reject
+
+Quote amount outside configured bounds
+→ reject
+
+Maximum exposure reached
+→ reject
+
+Position/tranche limit reached
+→ reject
+
+Daily loss limit reached
+→ reject
+
+Reward:risk below minimum
+→ reject
+
+Spread too wide
+→ reject
+
+Entry drift too large
+→ reject
+
+Stop distance outside allowed range
+→ reject
+
+Invalid TP / SL bracket
+→ reject
+
+Proposal expired
+→ reject
+
+LIVE not armed
+→ reject
+
+Invalid approval
+→ reject
+
+Unknown or ambiguous write result
+→ reconcile; do not automatically retry
+```
+
+---
+
+## Replay and Restart Safety
+
+RiskPilot includes safeguards for durable execution workflows.
+
+These include:
+
+* canonical proposal payloads
+* proposal hashes
+* owner/chat binding
+* nonces
+* proposal expiry
+* single-use claims
+* execution leases
+* idempotent fills
+* SQLite transactions
+* restart recovery
+* append-only audit evidence
+
+The objective is to prevent duplicate execution after:
+
+* repeated approval
+* timeout
+* process restart
+* ambiguous command delivery
+
+---
+
+## Example Interaction
+
+### Balance
+
+```text
+User:
+check my balance and open position
+
+RiskPilot:
+LIVE SPOT BALANCE
+
+• USDT: ...
+• XRP: ...
+```
+
+### Market Analysis
+
+```text
+User:
+analyze XRP BNB SOL
+
+RiskPilot:
+RiskPilot · Market-score ranking
+...
+```
+
+### LIVE Proposal
+
+```text
+User:
+buy 10 usd of XRP
+
+RiskPilot:
+LIVE TRADE PROPOSAL
+
+Symbol: XRPUSDT
+Side: BUY
+Amount: 10 USDT
+Entry: ...
+Stop: ...
+Target: ...
+
+Awaiting approval.
+```
+
+No real order exists merely because the proposal was created.
+
+### Execution
+
+After the required approval and LIVE safety gates pass:
+
+```text
+RiskPilot:
+LIVE execution confirmed.
+
+Protected Spot entry submitted.
+TP / SL protection active.
+```
+
+---
+
+## Telegram Interaction
+
+Examples supported by the project include:
 
 ```text
 /spot paper balance
 /spot paper positions
 /spot paper-buy SOL 25
-buy 25 usd of SOL          # LIVE proposal; no order yet
-paper buy 25 usd of SOL    # explicit PAPER proposal
-sell XRP 47%                 # LIVE protected partial-exit proposal
-sell all XRP                 # LIVE protected full-exit proposal
-restore TP SL XRP            # LIVE proposal restoring the last approved bracket
-paper sell 70% SOL           # explicit PAPER partial close
+
+buy 25 usd of SOL
+paper buy 25 usd of SOL
+
+sell XRP 47%
+sell all XRP
+
+restore TP SL XRP
+
+paper sell 70% SOL
 ```
 
-`/spot` is the registered Telegram route; `/risk` is not registered. Text creates proposals only. LIVE controls are short native `/binance_spotguard live-approve PROPOSAL_ID` and `live-reject PROPOSAL_ID` command buttons, so they survive OpenClaw's generic-callback handling.
+Normal trading intent defaults to a protected LIVE proposal unless `paper` is explicitly requested.
+
+Creating a LIVE proposal does not itself execute an order.
+
+LIVE execution remains gated by approval and local arm state.
+
+---
+
+## CLI Examples
 
 ```bash
 ./riskpilot --config config.example.json --json status
+
 ./riskpilot --config config.example.json --json paper balance
+
 ./riskpilot --config config.example.json --json paper positions
+
 ./spotguard --config config.example.json --json scan --synthetic --dry-run
+
 ./spotguard --config config.example.json --json live status
-./spotguard --help
+
+./riskpilot --json agent-os status
 ```
 
-Global flags precede subcommands. Success exits 0; validation/policy/security failures exit 2.
+---
 
-## Installation
+## Quick Start
 
-Prerequisites: Bash, Python 3.10+, SQLite; OpenClaw for Telegram; Codex CLI only for optional Agent OS confirmation.
+### Requirements
+
+* Linux / macOS environment
+* Bash
+* Python 3.10+
+* SQLite
+* OpenClaw for Telegram integration
+* Codex CLI for optional Agent OS integration
+* Binance Agent OS / MCP access for Agent OS workflows
+
+### Clone
 
 ```bash
-git clone REPOSITORY_URL riskpilot-agent-os
-cd riskpilot-agent-os
+git clone https://github.com/bobbymarc00/riskpilot.git
+cd riskpilot
+```
+
+### Create local configuration
+
+```bash
 cp config.example.json config.json
 chmod 600 config.json
+```
+
+Do not commit `config.json`.
+
+### Validate configuration
+
+```bash
 ./riskpilot --config config.json --json check
 ```
 
-Replace `REPOSITORY_URL`, `OWNER_ID`, and `TELEGRAM_CHAT_ID` locally. Never commit `config.json`.
+### Run the offline Track A demo
 
-## Configuration
+```bash
+./scripts/demo-track-a.sh
+```
 
-The example profile caps both PAPER and LIVE proposals at 100 USDT per entry and 500 USDT exposure. `risk.default_order_size_usdt=6` is the **default order size** used by read-only analysis when the user supplies no hypothetical amount; it is not a risk maximum or permission to create/fill a proposal. The legacy `default_quote_amount` spelling remains accepted without rewriting existing configuration. The remaining example limits are 10 tranches, 5 economic positions, 2 USDT position risk, 4 USDT aggregate risk, 5 USDT daily realized-loss cap, and 10 successful BUY entries/UTC day. LIVE also retains an 8 USDT reserve and one pending proposal maximum.
+The local demo uses isolated temporary state and does not require LIVE Binance execution.
 
-Keep `live.armed=false` in configuration. Enable/arm only through the documented local interactive command. A roughly 28 USDT account cannot support a 100 USDT entry plus the configured 8 USDT reserve at the maximum 100 USDT entry; use an amount compatible with your balance.
+---
 
-Legacy internal `spotguard` names preserve installed state and approvals; see [Compatibility](docs/COMPATIBILITY.md).
+## Reproducible Evaluation
 
-## Testing, limitations, and disclaimer
+Run:
 
-Run `./scripts/verify.sh`. CI is offline and has no write-capable transport. See [Evaluation](docs/EVALUATION.md).
+```bash
+./scripts/demo-track-a.sh
+./scripts/verify.sh
+```
 
-PAPER fills are models, not exchange fills. LIVE execution is experimental: every Spot write—entry, OCO restore, OCO cancel, partial exit, or full exit—requires a local arm and native confirmation. Ambiguous results never retry automatically and require reconciliation. The scheduled scanner is currently disabled because broad public REST polling triggered Binance throttling/IP-ban risk; see [Operations](docs/OPERATIONS.md). Screenshots/video remain owner-supplied.
+The repository includes tests covering areas such as:
 
-RiskPilot is experimental hackathon software, not financial advice, and provides no profit guarantee.
+* deterministic market scoring
+* Agent OS boundary validation
+* configuration validation
+* Telegram approval
+* durable approval
+* replay rejection
+* PAPER proposal flow
+* PAPER position accounting
+* scale-in
+* partial close
+* automatic PAPER TP / SL
+* tranche and position limits
+* daily-entry quota
+* execution recovery
+* restart recovery
+* LIVE safety
+* symbol expansion
+* localization
+
+See:
+
+* `docs/EVALUATION.md`
+* `docs/ARCHITECTURE.md`
+* `docs/SECURITY.md`
+* `docs/SCORE_ENGINE.md`
+
+---
+
+## Security Model
+
+RiskPilot follows a least-authority design.
+
+### Market analysis profile
+
+The read-only Agent OS path is isolated and narrowly scoped.
+
+It does not accept:
+
+* shell operations
+* file operations
+* trade writes
+* transfer operations
+* arbitrary MCP tools
+
+### LIVE execution profile
+
+LIVE execution uses a separate dedicated profile and fixed direct MCP envelopes.
+
+The intended LIVE surface excludes:
+
+```text
+Futures
+Margin
+Convert
+wallet operations
+transfers
+payments
+borrowing
+withdrawals
+arbitrary model-selected writes
+```
+
+Credentials belong in external runtime / OAuth stores.
+
+They must never be committed into the repository.
+
+---
+
+## Secret Hygiene
+
+Never commit:
+
+```text
+API keys
+OAuth credentials
+Telegram bot tokens
+private session tokens
+Binance account credentials
+private account information
+signing secrets
+```
+
+The repository should only contain sanitized configuration examples.
+
+---
+
+## Repository Structure
+
+Key project areas:
+
+```text
+riskpilot/
+├── src/spotguard/
+│   ├── cli.py
+│   ├── codex_bridge.py
+│   ├── config.py
+│   ├── db.py
+│   ├── indicators.py
+│   ├── intent.py
+│   ├── live_execution.py
+│   ├── market.py
+│   ├── paper.py
+│   ├── policy.py
+│   ├── score_engine.py
+│   ├── security.py
+│   ├── service.py
+│   ├── strategy.py
+│   └── telegram.py
+│
+├── tests/
+│
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── EVALUATION.md
+│   ├── LIVE_EXECUTION_SETUP.md
+│   ├── OPERATIONS.md
+│   ├── SCORE_ENGINE.md
+│   └── SECURITY.md
+│
+├── schemas/
+├── scripts/
+├── systemd/
+├── skills/
+│
+├── config.example.json
+├── config.execution.example.toml
+├── pyproject.toml
+├── LICENSE
+├── riskpilot
+└── spotguard
+```
+
+---
+
+## Design Principles
+
+### 1. Scoring is deterministic
+
+The LLM does not invent ranking scores.
+
+### 2. Risk is deterministic
+
+The model cannot override execution limits.
+
+### 3. Proposals are immutable
+
+Execution is bound to the approved payload.
+
+### 4. LIVE requires human authorization
+
+Analysis is not permission to trade.
+
+### 5. LIVE requires local arming
+
+Remote language input cannot independently enable LIVE.
+
+### 6. Spot only
+
+Unsupported product families fail closed.
+
+### 7. Protected entry first
+
+No unprotected LIVE MARKET BUY fallback.
+
+### 8. Ambiguous writes are not retried automatically
+
+RiskPilot requires reconciliation.
+
+### 9. Partial exits preserve protection
+
+Remaining quantity is re-protected after an approved partial exit.
+
+### 10. Real funds are used only to prove the execution architecture
+
+The demo is not intended to demonstrate profitability.
+
+---
+
+## What RiskPilot Is Not
+
+RiskPilot is not:
+
+* a guaranteed-profit bot
+* a high-frequency trading system
+* an unrestricted autonomous trader
+* a Futures bot
+* a Margin bot
+* an LLM with unlimited Binance account permissions
+* a system that allows natural-language instructions to bypass policy
+* a system that automatically retries unknown financial writes
+
+---
+
+## Hackathon Submission
+
+**Binance Agent OS Mini Hackathon — Track A**
+
+### Live Demo
+
+https://youtu.be/aYC23eYYUx0
+
+### X Submission
+
+https://x.com/bobbymarc00/status/2097039814482878806
+
+### Demonstrated LIVE Capabilities
+
+* live Binance Spot account interaction
+* multi-asset analysis
+* deterministic ranking
+* LIVE proposal generation
+* human approval
+* real-fund Spot BUY
+* protected TP / SL lifecycle
+* partial exit
+* protection re-arm
+* full exit
+* out-of-band Binance.com history verification
+
+### Repository Capabilities
+
+* deterministic score engine
+* Agent OS read-only confirmation path
+* PAPER trading lifecycle
+* durable approval
+* replay protection
+* restart recovery
+* LIVE Spot execution adapter
+* protected OTOCO entry
+* OCO protection restore
+* exact protection cancellation
+* protected partial exit
+* protected full exit
+* fail-closed reconciliation behavior
+* automated test coverage
+
+---
+
+## Disclaimer
+
+RiskPilot is experimental hackathon software.
+
+It is not financial advice and does not guarantee profitability or trading performance.
+
+Cryptocurrency trading involves financial risk.
+
+Users remain responsible for:
+
+* reviewing trade proposals
+* approving LIVE execution
+* securing their Binance account
+* controlling account permissions
+* complying with Binance terms
+* complying with applicable regional laws and regulations
+
+---
+
+## Links
+
+* **GitHub:** https://github.com/bobbymarc00/riskpilot
+* **YouTube Demo:** https://youtu.be/aYC23eYYUx0
+* **X Submission:** https://x.com/bobbymarc00/status/2097039814482878806
+
+---
+
+## Final Principle
+
+> **AI can interact. Deterministic code defines the boundaries. Humans authorize real execution.**

@@ -29,7 +29,7 @@ Presentation examples are deterministic:
 
 ```text
 analyze BNB
-buy BNB 40 usd
+paper buy 40 usd of BNB
 ```
 
-These commands use English presentation. Indonesian runtime localization is covered by the automated localization fixtures; no model call is used to select a language.
+Reason: normal trading intent defaults to a protected LIVE proposal. The word paper must be explicit when the documentation intends to demonstrate PAPER execution.

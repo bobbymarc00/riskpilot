@@ -1,44 +1,134 @@
-# Two-minute demo script
+# Final Two-Minute LIVE Demo
 
-## 0–20s — Product and problem
+This file documents the final public RiskPilot demo.
 
-Show the README opening and say:
+**Public video:** https://youtu.be/aYC23eYYUx0
 
-> RiskPilot is an Agent OS-powered Spot trading copilot. It separates deterministic scanning, read-only verification, human approval, and PAPER execution so an uncertain model cannot become an execution authority.
+The final recording demonstrates real-fund Binance Spot execution rather than the earlier PAPER-only demo plan.
 
-## 20–45s — Architecture and Agent OS
+## 0:00–0:10 — Product
 
-Show the Mermaid diagram and run:
+Show the Telegram / RiskPilot interface.
 
-```bash
-./riskpilot --json agent-os status
-./riskpilot --json agent-os market --symbol BTCUSDT
+Core message:
+
+> RiskPilot is a Binance Agent OS-powered Spot trading copilot with deterministic market scoring, deterministic risk controls, and human-approved LIVE execution.
+
+The architecture deliberately separates analysis, policy, approval, and execution.
+
+## 0:10–0:25 — LIVE Account State
+
+Request the LIVE balance and open-position state.
+
+Example:
+
+```text
+check my balance and open position
 ```
 
-Explain that routine scans use public Binance REST, while Agent OS is called only for a qualified candidate and only for a fixed read-only market confirmation.
+Show that RiskPilot is interacting with the actual Binance Spot account rather than a fixture ledger.
 
-## 45–90s — Reproducible PAPER workflow
+Do not expose credentials, OAuth material, private account identifiers, or other sensitive information.
 
-Run `./scripts/demo-track-a.sh`. Point out the deterministic scan, explicit fixture label, proposal, simulated approval, partial close, risk rejection, and audit count. Run it a second time to show fresh temporary state and repeatability.
+## 0:25–0:50 — Multi-Asset Analysis
 
-For a Telegram-connected PAPER walkthrough, use `/spot paper balance`, `buy 25 usd of SOL`, approve the proposal button, then request `close 50% SOL`. Never claim the fixture path is an Agent OS confirmation.
+Request:
 
-## 90–120s — Safety evidence
-
-Show the test command and live status:
-
-```bash
-./scripts/verify.sh
-./riskpilot --json live status
+```text
+analyze XRP BNB SOL
 ```
 
-End by showing the immutable audit evidence and saying:
+Show the deterministic RiskPilot market-score ranking.
 
-> LIVE is disabled and disarmed. No real order was placed, no Telegram message was sent by this local demo, and there is no profit guarantee.
+Key point:
 
-## Asset checklist
+> RiskPilot's ranking is calculated by deterministic code. Agent OS is used as a narrow confirmation/orchestration layer rather than as an unrestricted trading authority.
 
-- Replace the video field with the owner’s real recording URL.
-- Crop credentials, IDs, usernames, local paths, and notification metadata.
-- Label every fixture and PAPER result.
-- Include genuine Agent OS read-only transcript evidence only if available.
+## 0:50–1:15 — LIVE Proposal and Entry
+
+Create the LIVE trade proposal.
+
+Show:
+
+* symbol;
+* amount;
+* entry;
+* stop;
+* target;
+* risk information;
+* approval requirement.
+
+Explicitly approve the proposal.
+
+Then show the real Spot BUY execution.
+
+Key point:
+
+> Creating a proposal does not itself move funds. LIVE execution remains gated by deterministic policy, owner approval, and local LIVE arming.
+
+## 1:15–1:35 — Protection
+
+Show the position protected with TP / SL.
+
+RiskPilot's LIVE entry path uses protected Spot execution rather than an unprotected MARKET BUY fallback.
+
+The intended protected entry is:
+
+```text
+LIMIT BUY
++
+Take Profit
++
+Stop Loss
+=
+Spot OTOCO
+```
+
+## 1:35–1:50 — Partial Exit
+
+Show an approved partial exit.
+
+The protected partial-exit lifecycle is:
+
+```text
+Cancel exact active OCO
+→ confirm cancellation
+→ SELL approved quantity
+→ calculate remainder
+→ re-arm TP / SL
+```
+
+Show that the remaining position is protected again after the partial exit.
+
+## 1:50–2:00 — Full Exit and Verification
+
+Exit the remaining protected position.
+
+Finish by showing the resulting transaction/order history through Binance.com.
+
+This final Binance.com screen is out-of-band verification by the user.
+
+Closing message:
+
+> AI can interact. Deterministic code defines the boundaries. Humans authorize real execution.
+
+## What the Demo Proves
+
+The public recording demonstrates:
+
+* LIVE Binance Spot account interaction;
+* deterministic multi-asset ranking;
+* LIVE proposal generation;
+* human approval;
+* real-fund Spot BUY;
+* protected TP / SL lifecycle;
+* partial exit;
+* protection re-arm;
+* full protected exit;
+* Binance.com out-of-band verification.
+
+## Safety Notes
+
+The demo is intended to prove execution architecture, not profitability.
+
+RiskPilot remains Spot-only and does not provide an execution route for Futures, Margin, borrowing, transfers, withdrawals, or unrestricted model-selected Binance writes.

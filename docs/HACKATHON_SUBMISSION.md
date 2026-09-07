@@ -1,54 +1,224 @@
-# Hackathon submission
+# Hackathon Submission
 
-**Project:** RiskPilot — Agent OS-powered Spot trading copilot
+**Project:** RiskPilot — Binance Agent OS-powered Spot trading copilot
 **Track:** Binance Agent OS Mini Hackathon — Track A
-**Categories:** Trading Workflows and Data & Analysis
 
 ## One-line pitch
 
-Deterministic Binance Spot analysis, targeted Agent OS verification, enforceable risk limits, and cryptographically bound human approval for protected Spot workflows.
+RiskPilot combines deterministic Binance Spot market scoring, narrowly scoped Agent OS verification, enforceable risk controls, human-approved LIVE execution, and protected position management.
 
-## Problem and solution
+## Problem
 
-Trading assistants often mix probabilistic analysis with execution authority. RiskPilot prefilters deterministically, calls Agent OS only for the best qualified candidate, verifies independent candle evidence, applies deterministic policy, and requires explicit Telegram approval before any PAPER simulation or LIVE Spot write.
+Trading assistants can blur the boundary between analysis and execution.
 
-## Agent OS and architecture
+A probabilistic model should not be able to:
 
-Agent OS performs a fixed read-only `spot.klines` confirmation. It cannot select assets or order parameters. See [Architecture](ARCHITECTURE.md), [Security](SECURITY.md), and [Evaluation](EVALUATION.md).
+* invent position sizes;
+* bypass risk limits;
+* select arbitrary Binance tools;
+* silently switch PAPER activity into LIVE execution;
+* retry an ambiguous financial write;
+* remove protection without an explicit approved workflow.
 
-## Demo steps
+RiskPilot separates observation, verification, policy, authorization, and mutation.
 
-See [Evaluation evidence](EVALUATION.md). The offline demo is repeatable and has no network-write path.
+## Solution
 
-## Submission links
+RiskPilot uses:
 
-- GitHub: pending owner publication
-- Video: pending owner upload
+1. Binance public Spot data for deterministic market analysis.
+2. A canonical deterministic score engine for ranking and candidate eligibility.
+3. A dedicated Binance Agent OS read-only path for narrow market confirmation.
+4. Deterministic policy checks for risk and execution eligibility.
+5. Immutable trade proposals.
+6. Owner-bound human approval.
+7. A separate dedicated Agent OS / MCP execution profile for supported LIVE Spot writes.
+8. Protected TP / SL lifecycle management.
+9. Fail-closed reconciliation for ambiguous execution results.
 
-## Short description
+The language-model-facing layer can interact, explain, and orchestrate supported workflows, but it does not define RiskPilot's market score or override deterministic execution boundaries.
 
-RiskPilot is a fail-closed Binance Spot copilot with deterministic analysis, Agent OS read-only verification, protected PAPER or LIVE Spot proposals, and human approval.
+## Agent OS Integration
 
-## Longer technical description
+RiskPilot uses Binance Agent OS / MCP through separate narrow paths.
 
-RiskPilot analyzes closed candles, ranks candidates, and can invoke Agent OS at most once per cycle. Exact independent candle matching gates immutable proposals. SQLite provides replay-safe approvals, leases, recovery, scale-in, partial/full exits, and PAPER protection. When locally armed, LIVE supports owner-approved protected Spot entry, TP/SL restore, partial exit, and full exit; every ambiguous result fails closed for reconciliation. The scheduled scanner is temporarily disabled while its public-REST request budget is optimized to avoid throttling/IP-ban risk.
+### Market-data confirmation
 
-## X draft
+The market-analysis path is:
 
-Built RiskPilot for Binance Agent OS Mini Hackathon Track A: deterministic Spot analysis + targeted Agent OS verification + protected Spot proposals + explicit Telegram approval. Scanner is safely paused during rate-limit optimization. Scan. Verify. Approve. Protect. Links pending.
+```text
+Binance public Spot data
+        ↓
+60 closed candles
+        ↓
+Deterministic RiskPilot score
+        ↓
+Candidate selection
+        ↓
+Dedicated Agent OS read-only spot.klines confirmation
+        ↓
+Exact time / OHLC validation
+```
 
-## Known limitations
+Agent OS does not calculate the RiskPilot score and does not choose the winning candidate.
 
-PAPER simulation is not an exchange fill. LIVE Spot is experimental and owner-confirmed; it is not financial advice. The scheduled scanner is deliberately disabled until public-REST rate-limit/IP-ban protections are verified. Links, screenshots, and video are owner-supplied.
+### LIVE execution
 
-## Repository and media fields
+LIVE execution uses a separate dedicated execution profile.
 
-- GitHub repository: pending owner publication; suggested name `riskpilot-agent-os`
-- Demo video: pending owner upload; do not invent a URL
-- Screenshot assets: pending owner capture and sanitization
+The supported write surface is deliberately restricted to the Spot operations required by RiskPilot:
 
-## Submission copy
+* protected LIMIT BUY using OTOCO;
+* SELL OCO protection restore;
+* cancellation of the exact active protected OCO;
+* approved MARKET SELL exit;
+* protected partial exit using cancel → sell → re-arm.
 
-**Short X draft:** RiskPilot for Binance Agent OS Mini Hackathon Track A: deterministic Spot scans, targeted read-only Agent OS verification, protected PAPER/LIVE Spot proposals, and explicit Telegram approval. Scan. Verify. Approve. Protect.
+Every LIVE write remains gated by deterministic policy, local LIVE arming, owner-bound approval, immutable proposal validation, and Binance response checks.
 
-**GitHub description:** Fail-closed Binance Agent OS Spot trading copilot with deterministic signals, risk-controlled paper execution, and human approval.
+## Public LIVE Demo
+
+The public demonstration uses real funds and shows a complete protected Spot lifecycle.
+
+### Demo flow
+
+1. Read LIVE Spot account state.
+2. Check open positions.
+3. Analyze XRP, BNB, and SOL.
+4. Rank assets using RiskPilot's deterministic market score.
+5. Generate a LIVE proposal.
+6. Approve the proposal.
+7. Execute a real Spot BUY.
+8. Arm TP / SL protection.
+9. Perform a partial exit.
+10. Re-arm protection for the remaining quantity.
+11. Fully exit the position.
+12. Verify the resulting history through Binance.com.
+
+The Binance.com history view is an out-of-band user verification step. RiskPilot itself validates execution responses and protected-order state rather than claiming a general transaction-history reader.
+
+## Submission Links
+
+* **GitHub:** https://github.com/bobbymarc00/riskpilot
+* **YouTube demo:** https://youtu.be/aYC23eYYUx0
+* **X submission:** https://x.com/bobbymarc00/status/2097039814482878806
+
+## Demonstrated Capabilities
+
+### LIVE
+
+* Binance Spot account interaction
+* multi-asset analysis
+* deterministic ranking
+* LIVE proposal generation
+* explicit human approval
+* real-fund Spot BUY
+* protected TP / SL lifecycle
+* partial exit
+* protection re-arm
+* full protected exit
+* Binance.com out-of-band verification
+
+### Repository / engineering
+
+* deterministic market score engine
+* Agent OS read-only market confirmation
+* immutable proposals
+* owner/chat-bound approval
+* replay protection
+* execution leases
+* restart recovery
+* PAPER position accounting
+* scale-in
+* partial/full PAPER close
+* automatic PAPER TP / SL
+* LIVE protected OTOCO entry
+* OCO restore
+* exact protected-OCO cancellation
+* protected partial exit
+* protected full exit
+* fail-closed reconciliation
+* automated safety tests
+
+## Safety Model
+
+RiskPilot intentionally supports Spot only.
+
+The intended execution surface does not support:
+
+* Futures
+* Margin
+* Convert
+* arbitrary wallet operations
+* transfers
+* payments
+* borrowing
+* withdrawals
+* unrestricted model-selected writes
+
+LIVE execution also requires a short-lived local arm. Remote natural-language input cannot independently arm LIVE trading.
+
+Unknown or ambiguous financial write results are not automatically retried.
+
+## Current Public Example Limits
+
+The repository's example configuration includes:
+
+```text
+Default order size:             6 USDT
+Minimum quote amount:           5 USDT
+Maximum LIVE entry:           100 USDT
+Maximum PAPER entry:          100 USDT
+Maximum open exposure:        500 USDT
+Maximum economic positions:     5
+Maximum active tranches:        10
+Minimum LIVE free reserve:       8 USDT
+Maximum risk / position:         2 USDT
+Maximum aggregate risk:          4 USDT
+Daily realized-loss cap:         5 USDT
+Weekly LIVE loss cap:           20 USDT
+Successful BUY entries/day:     10
+Pending LIVE proposals:          1
+Minimum reward:risk:           2.0
+```
+
+`risk.default_order_size_usdt = 6` is a default amount, not the maximum permitted trade size.
+
+## Scanner Status
+
+The scheduled scanner implementation remains in the repository but is currently operationally disabled while Binance public REST request budgeting and rate-limit/IP-ban protections are optimized.
+
+The scanner has no independent LIVE execution authority.
+
+Manual analysis and owner-approved LIVE workflows remain separate.
+
+## Reproducible Offline Evaluation
+
+The safe local evaluation path does not require a real Binance write:
+
+```bash
+./scripts/demo-track-a.sh
+./scripts/verify.sh
+```
+
+The repository maps critical capabilities to implementation files and automated tests in:
+
+* `docs/EVALUATION.md`
+* `docs/ARCHITECTURE.md`
+* `docs/SECURITY.md`
+* `docs/SCORE_ENGINE.md`
+
+## Known Limitations
+
+* PAPER fills are simulations, not exchange fills.
+* LIVE execution is experimental.
+* The scheduled scanner is currently disabled during rate-limit optimization.
+* LIVE operation depends on Binance account permissions, exchange filters, and supported Agent OS / MCP capabilities.
+* Ambiguous LIVE results require reconciliation rather than automatic retry.
+* RiskPilot provides no guarantee of trading profitability.
+
+## Disclaimer
+
+RiskPilot is experimental hackathon software and is not financial advice.
+
+Cryptocurrency trading involves financial risk. Users remain responsible for reviewing and approving LIVE actions, securing their account permissions, and complying with applicable Binance terms and regional requirements.
