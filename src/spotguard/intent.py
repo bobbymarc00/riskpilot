@@ -150,7 +150,7 @@ def normalize_trade_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
     explicit_paper = bool(re.search(r"\bpaper\b", text, re.I))
     stripped = re.sub(r"\b(?:live|real|nyata|paper)\b", "", text, flags=re.I)
     result = normalize_paper_intent(stripped, allowed_symbols, locale)
-    if result.get("action") == "buy":
+    if result.get("action") in {"buy", "close"}:
         result["mode"] = "paper" if explicit_paper else "live"
     elif result.get("action") in {"balance", "positions"}:
         result["action"] = f"paper_{result['action']}" if explicit_paper else f"live_{result['action']}"

@@ -83,6 +83,40 @@ def _display_fields(values: dict[str, Any], locale: str) -> dict[str, Any]:
 def proposal_message(proposal: dict[str, Any], token: str, confirmation_code: str | None = None,
                      locale: str = "en") -> tuple[str, list[dict[str, str]]]:
     canonical = proposal["canonical"]
+    if canonical.get("source") == "manual-live-set-protection":
+        text=("🛡️ RISKPILOT TP/SL RESTORE PROPOSAL\n⚠️ LIVE — REAL FUNDS\n\n"
+              f"Protect {canonical['quantity']} {proposal['symbol'][:-len(canonical['quote_asset'])]}\n"
+              f"Stop loss: {canonical['stop_reference']}\nTake profit: {canonical['take_profit_reference']}\n"
+              f"ID: {proposal['id']}\nExpires: {proposal['expires_at']}\n\n"
+              "Approval submits a Spot SELL OCO only; it does not sell the asset now.")
+        return text,[{"label":translate("button.approve_live",locale),"command":_command(f"/binance_spotguard live-approve {proposal['id']}"),"style":"danger"},{"label":translate("button.reject_live",locale),"command":_command(f"/binance_spotguard live-reject {proposal['id']}"),"style":"secondary"}]
+    if canonical.get("source") == "manual-live-partial-exit":
+        remaining = Decimal(str(canonical["remaining_quantity"]))
+        if remaining == 0:
+            text=("🛡️ RISKPILOT FULL EXIT PROPOSAL\n⚠️ LIVE — REAL FUNDS\n\n"+f"{proposal['symbol']}: sell 100% ({canonical['sell_quantity']})\n"+"Remaining: 0\n"+f"ID: {proposal['id']}\nExpires: {proposal['expires_at']}\n\nApproval cancels OCO and sells the protected quantity. No TP/SL will be re-armed.")
+        else:
+            text=("🛡️ RISKPILOT PARTIAL EXIT PROPOSAL\n⚠️ LIVE — REAL FUNDS\n\n"+f"{proposal['symbol']}: sell {canonical['percentage']}% ({canonical['sell_quantity']})\n"+f"Remaining: {canonical['remaining_quantity']} with existing TP/SL {canonical['stop_reference']} / {canonical['take_profit_reference']}\n"+f"ID: {proposal['id']}\nExpires: {proposal['expires_at']}\n\nApproval cancels OCO, sells, then re-arms the unchanged TP/SL.")
+        return text,[{"label":translate("button.approve_live",locale),"command":_command(f"/binance_spotguard live-approve {proposal['id']}"),"style":"danger"},{"label":translate("button.reject_live",locale),"command":_command(f"/binance_spotguard live-reject {proposal['id']}"),"style":"secondary"}]
+    if canonical.get("source") == "manual-live-cancel-protection":
+        text = ("🛡️ RISKPILOT PROTECTION-CANCEL PROPOSAL\n⚠️ LIVE — REAL FUNDS\n\n"
+                f"Cancel active Spot OCO protection for {proposal['symbol']}\n"
+                f"Order list ID: {canonical['order_list_id']}\nID: {proposal['id']}\nExpires: {proposal['expires_at']}\n\n"
+                "Approval is required. Approving removes the active TP/SL; it does not sell the asset.")
+        return text, [{"label": translate("button.approve_live", locale), "command": _command(f"/binance_spotguard live-approve {proposal['id']}"), "style": "danger"},
+                      {"label": translate("button.reject_live", locale), "command": _command(f"/binance_spotguard live-reject {proposal['id']}"), "style": "secondary"}]
+    if canonical.get("source") == "manual-live-close":
+        text = ("🛡️ RISKPILOT TRADE PROPOSAL\n⚠️ LIVE — REAL FUNDS\n\n"
+                f"Spot MARKET SELL — close free {canonical['base_asset']} balance\n"
+                f"Pair: {proposal['symbol']}\nQuantity: {canonical['quantity']} {canonical['base_asset']}\n"
+                f"Estimated reference: {canonical['estimated_quote_amount']} {canonical['quote_asset']}\n"
+                f"ID: {proposal['id']}\nExpires: {proposal['expires_at']}\n\n"
+                "Approval is required. Approving submits this real-money Spot market close; it cannot be undone.")
+        return text, [
+            {"label": translate("button.approve_live", locale),
+             "command": _command(f"/binance_spotguard live-approve {proposal['id']}"), "style": "danger"},
+            {"label": translate("button.reject_live", locale),
+             "command": _command(f"/binance_spotguard live-reject {proposal['id']}"), "style": "secondary"},
+        ]
     mode = "proposal.mode.live" if proposal["mode"] == "live" else (
         "proposal.mode.manual" if canonical.get("source") == "manual-paper-test" else "proposal.mode.paper")
     text = translate("proposal.body", locale,

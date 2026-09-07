@@ -3,18 +3,9 @@
 ## Dedicated read-only Agent OS profile
 
 RiskPilot accepts a market read only after an explicit CODEX_HOME and neutral
-workspace pass path validation. The normal profile is dedicated and non-default.
-An explicitly marked legacy OAuth profile is PAPER-only, uses a neutral workspace
-outside the OAuth directory, and applies a one-process `tool_execute` approval
-override without changing `config.toml`. It is rejected when LIVE is enabled,
-armed, execution-ready, or scheduled for LIVE. Child processes receive a
-sanitized environment with an explicit CODEX_HOME and use `-a never exec
---strict-config --ephemeral --skip-git-repo-check --json -s read-only`.
-The allowed proof is exactly one completed configured Binance MCP call with
-outer `tool_execute`, inner `spot.klines`, and exact symbol/interval/limit.
-Shell, file, account, balance, history, trade, and transfer events fail closed.
-Binance MCP read-only: Agentic account + market data; this does not claim a
-market-only OAuth scope.
+workspace pass path validation. The analysis profile is dedicated and non-default. Its allowed proof is exactly one configured Binance MCP market-data call with outer `tool_execute`, inner `spot.klines`, and exact symbol/interval/limit. Shell, file, account, history, trade, and transfer events fail closed in the analysis path.
+
+LIVE execution uses a separate dedicated OAuth profile and fixed direct MCP envelopes. It accepts only a narrow Spot allowlist: protected entry OTOCO, SELL OCO restore, cancellation of the exact active protection list, and exact MARKET SELL exit. It never exposes credentials, accepts model-selected tool arguments, or permits Futures, Margin, Convert, wallet, transfer, payment, borrowing, or withdrawal.
 
 Providers may include the current forming kline. RiskPilot requests exactly
 three raw candles once, applies the configured two-second close grace against
@@ -35,7 +26,7 @@ consecutive fresh closed candles.
 - Revoke or restrict broad OAuth before funding a Binance account or considering LIVE use.
 - Synthetic and fixture inputs are explicit opt-in demo paths; production scanning does not silently fall back to them.
 - Error reporting is bounded and sanitized; raw subprocess environments and credentials are not returned.
-- Every write, cancel, transfer, withdrawal, wallet, Convert, Margin, Futures, generic `tool_execute`, unknown server/tool, and malformed event/result fails closed; no Binance write schema is guessed or enabled.
+- Every unsupported write, transfer, withdrawal, wallet, Convert, Margin, Futures, generic/model-selected tool, unknown server/tool, and malformed event/result fails closed. The few supported Spot write schemas are constructed solely from immutable owner-approved proposals.
 - Shell scripts quote paths and arguments and pass untrusted text as argv values, not shell code.
 
-LIVE is disabled/disarmed. No auto-review is allowed for writes. No unprotected MARKET BUY or delayed-protection fallback exists. Telegram approval cannot bypass Binance native confirmation. Binance website controls remain the final out-of-band emergency stop for any future LIVE implementation.
+LIVE is locally armed only for a limited period. No auto-review or automatic retry is allowed for writes. No unprotected MARKET BUY or delayed-protection fallback exists. Telegram approval cannot bypass local arm, immutable proposal validation, or Binance response checks. Binance website controls remain the final out-of-band emergency stop.

@@ -119,6 +119,25 @@ class LiveSafetyTests(unittest.TestCase):
    with self.assertRaisesRegex(SecurityError,"ambiguous"): adapter.validate_write_response({"orderListId":1,"listStatusType":"UNKNOWN"})
    with self.assertRaisesRegex(SecurityError,"must not be retried"): adapter.reconcile("p-1234567890ab")
 
+ def test_adapter_only_allows_exact_live_market_close_shape(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-close","product":"SPOT","side":"SELL","order_type":"MARKET","symbol":"BTCUSDT","quote_asset":"USDT","quote_amount":"0","quantity":"0.06","market_step_size":"0.001"}}
+   request=adapter.protected_request(proposal)
+   self.assertEqual(request["toolName"],"spot.newOrder")
+   self.assertEqual(request["arguments"],{"symbol":"BTCUSDT","side":"SELL","type":"MARKET","quantity":0.06,"newClientOrderId":"sgc-1234567890ab"})
+   self.assertEqual(adapter.validate_write_response({"orderId":7,"status":"FILLED"},close=True),"FILLED")
+   malformed={**proposal,"canonical":{**proposal["canonical"],"side":"BUY"}}
+   with self.assertRaises(SecurityError): adapter.protected_request(malformed)
+
+ def test_partial_exit_requires_immutable_cancel_sell_rearm_terms(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-partial-exit","product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","symbol":"BTCUSDT","quote_amount":"0","cancel_order_id":11,"order_list_id":12,"sell_quantity":"0.02","remaining_quantity":"0.04","market_step_size":"0.001","price_tick_size":"0.01","stop_reference":"98","take_profit_reference":"104"}}
+   self.assertEqual(adapter.freeze(proposal)["source"],"manual-live-partial-exit")
+   bad={**proposal,"canonical":{**proposal["canonical"],"side":"BUY"}}
+   with self.assertRaises(SecurityError): adapter.freeze(bad)
+
  def test_duplicate_exposure_and_fourth_position_guards(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d)))
@@ -159,5 +178,68 @@ class LiveSafetyTests(unittest.TestCase):
    with patch("sys.stdin.isatty",return_value=False):
     self.assertEqual(main(["--config",str(path),"--json","scheduled-mode","set","live","--owner-id",OWNER]),2)
    self.assertEqual(json.loads(path.read_text())["scheduled_proposal_mode"],"paper")
+
+ def test_live_partial_exit_creates_dormant_rounded_proposal(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True)); service.live_status=Mock(return_value={"execution_ready":True})
+   orders=[
+    {"symbol":"BTCUSDT","orderListId":12,"orderId":11,"side":"SELL","status":"NEW","type":"STOP_LOSS_LIMIT","origQty":"0.20","stopPrice":"98"},
+    {"symbol":"BTCUSDT","orderListId":12,"orderId":13,"side":"SELL","status":"NEW","type":"TAKE_PROFIT_LIMIT","origQty":"0.20","stopPrice":"104","price":"104"},
+   ]
+   service.live_executor.read_open_spot_orders=Mock(return_value=orders)
+   exchange={"market_step_size":"0.001","price_tick_size":"0.01","min_notional":"5"}
+   with patch("spotguard.service.validate_spot_symbol",return_value=exchange), patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET):
+    proposal=service.create_live_partial_exit_proposal("BTC",Decimal("65"))["proposal"]
+   canonical=proposal["canonical"]
+   self.assertEqual(proposal["status"],"PENDING")
+   self.assertEqual(canonical["source"],"manual-live-partial-exit")
+   self.assertEqual(canonical["sell_quantity"],"0.13")
+   self.assertEqual(canonical["remaining_quantity"],"0.07")
+   self.assertEqual(canonical["cancel_order_id"],11)
+   self.assertEqual(canonical["stop_reference"],"98")
+   self.assertEqual(canonical["take_profit_reference"],"104")
+
+ def test_partial_exit_executes_only_cancel_sell_then_rearm_in_mock(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-partial-exit","product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","symbol":"BTCUSDT","quote_amount":"0","cancel_order_id":11,"order_list_id":12,"sell_quantity":"0.02","remaining_quantity":"0.04","market_step_size":"0.001","price_tick_size":"0.01","stop_reference":"98","take_profit_reference":"104"}}
+   replies=[
+    {"structuredContent":{"orderId":11,"status":"CANCELED"}},
+    {"structuredContent":{"orderId":14,"status":"FILLED"}},
+    {"structuredContent":{"orderListId":15,"listStatusType":"RESPONSE","orderReports":[{"clientOrderId":"sgt-1234567890ab","status":"NEW"},{"clientOrderId":"sgs-1234567890ab","status":"NEW"}]}},
+   ]
+   adapter._direct_mcp_result=Mock(side_effect=replies)
+   adapter.read_open_spot_orders=Mock(return_value=[])
+   adapter.read_spot_account=Mock(return_value={"balances":[{"asset":"BTC","free":"0.06"}]})
+   result=adapter.execute_partial_exit(proposal)
+   self.assertEqual(result["orderId"],14)
+   self.assertEqual(adapter._direct_mcp_result.call_count,3)
+   cancel,sell,rearm=[call.args[0] for call in adapter._direct_mcp_result.call_args_list]
+   self.assertEqual(cancel["toolName"],"spot.deleteOrder")
+   self.assertEqual(sell["arguments"]["quantity"],0.02)
+   self.assertEqual(rearm["toolName"],"spot.orderListOco")
+   self.assertEqual(rearm["arguments"]["quantity"],0.04)
+   self.assertEqual(rearm["arguments"]["belowPrice"],97.9)
+
+ def test_partial_exit_does_not_sell_when_cancel_is_ambiguous(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-partial-exit","product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","symbol":"BTCUSDT","quote_amount":"0","cancel_order_id":11,"order_list_id":12,"sell_quantity":"0.02","remaining_quantity":"0.04","market_step_size":"0.001","price_tick_size":"0.01","stop_reference":"98","take_profit_reference":"104"}}
+   adapter._direct_mcp_result=Mock(return_value={"structuredContent":{"orderId":11,"status":"NEW"}})
+   adapter.read_open_spot_orders=Mock(return_value=[{"symbol":"BTCUSDT","orderListId":12}])
+   with self.assertRaises(SecurityError): adapter.execute_partial_exit(proposal)
+   self.assertEqual(adapter._direct_mcp_result.call_count,1)
+
+ def test_partial_exit_accepts_ambiguous_cancel_only_after_no_oco_reconciliation(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-partial-exit","product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","symbol":"BTCUSDT","quote_asset":"USDT","quote_amount":"0","cancel_order_id":11,"order_list_id":12,"sell_quantity":"0.02","remaining_quantity":"0","market_step_size":"0.001","price_tick_size":"0.01","stop_reference":"98","take_profit_reference":"104"}}
+   replies=[{"structuredContent":{"orderId":11,"status":"NEW"}},{"structuredContent":{"orderId":14,"status":"FILLED"}}]
+   adapter._direct_mcp_result=Mock(side_effect=replies)
+   adapter.read_open_spot_orders=Mock(return_value=[])
+   adapter.read_spot_account=Mock(return_value={"balances":[{"asset":"BTC","free":"0.02"}]})
+   result=adapter.execute_partial_exit(proposal)
+   self.assertEqual(result["orderId"],14)
+   self.assertEqual(adapter._direct_mcp_result.call_count,2)
 
 if __name__=="__main__": unittest.main()

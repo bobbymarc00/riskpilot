@@ -30,7 +30,7 @@ Codex CLI and Binance Agent OS OAuth are optional for the PAPER demo. Grant mark
 ./riskpilot --json agent-os market --symbol BTCUSDT
 ```
 
-RiskPilot invokes Agent OS only for an explicit read-only confirmation. The scheduled scan remains deterministic and does not launch Codex on every cycle.
+RiskPilot invokes Agent OS only for an explicit read-only confirmation. The scheduled scanner remains deterministic by design but is currently disabled during Binance public-REST rate-limit/IP-ban optimization.
 
 ## Verification and demo
 
@@ -50,4 +50,4 @@ systemctl --user list-timers --all
 journalctl --user -u spotguard-monitor.service -n 50 --no-pager
 ```
 
-The retained `spotguard-monitor.service` and `spotguard-monitor.timer` names are compatibility identifiers. Do not modify or restart installed units as part of repository review.
+The retained `spotguard-monitor.service` and `spotguard-monitor.timer` names are compatibility identifiers. The timer is intentionally disabled until request-budget/backoff optimization is complete; do not enable it as part of repository review.

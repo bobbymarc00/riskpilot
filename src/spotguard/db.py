@@ -216,6 +216,9 @@ class Ledger:
             return None
         result = dict(row)
         result["canonical"] = json.loads(result["canonical_json"])
+        # Legacy schema only permits BUY/MARKET columns; immutable canonical terms
+        # carry the actual live operation and are the sole execution authority.
+        result["side"] = result["canonical"].get("side", result["side"])
         result["order_type"] = result["canonical"].get("order_type", result["order_type"])
         if result.get("execution_summary_json"):
             result["execution_summary"] = json.loads(result["execution_summary_json"])

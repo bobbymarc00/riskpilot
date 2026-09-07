@@ -151,6 +151,42 @@ def validate_claim(settings: Settings, proposal: dict[str, Any], daily_committed
         raise PolicyError(f"proposal must be PENDING, not {proposal['status']}")
     if parse_time(proposal["expires_at"]) <= utcnow():
         raise PolicyError("proposal has expired")
+    if canonical.get("source") == "manual-live-set-protection":
+        expected={"product":"SPOT","side":"SELL","order_type":"OCO_PROTECTION","mode":"live","quote_asset":settings.risk.quote_asset}
+        if any(canonical.get(k)!=v for k,v in expected.items()): raise PolicyError("live protection restore terms do not match current policy")
+        quantity=decimal_value(canonical.get("quantity"),"protection.quantity"); step=decimal_value(canonical.get("market_step_size"),"protection.market_step_size")
+        stop=decimal_value(canonical.get("stop_reference"),"protection.stop_reference"); target=decimal_value(canonical.get("take_profit_reference"),"protection.take_profit_reference")
+        if quantity<=0 or step<=0 or quantity%step or not stop<target: raise PolicyError("live protection restore quantities or bracket are invalid")
+        return
+    if canonical.get("source") == "manual-live-partial-exit":
+        expected={"product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","mode":"live","quote_asset":settings.risk.quote_asset}
+        if any(canonical.get(k)!=v for k,v in expected.items()): raise PolicyError("live partial exit terms do not match current policy")
+        percentage=decimal_value(canonical.get("percentage"),"partial_exit.percentage")
+        sell=decimal_value(canonical.get("sell_quantity"),"partial_exit.sell_quantity"); remaining=decimal_value(canonical.get("remaining_quantity"),"partial_exit.remaining_quantity"); step=decimal_value(canonical.get("market_step_size"),"partial_exit.market_step_size")
+        if not Decimal("0") < percentage <= Decimal("100") or sell<=0 or remaining<0 or step<=0 or sell%step or remaining%step: raise PolicyError("live partial exit quantities are invalid")
+        return
+    if canonical.get("source") == "manual-live-cancel-protection":
+        expected_cancel = {"product": "SPOT", "side": "CANCEL", "order_type": "CANCEL_OCO", "mode": "live",
+                           "quote_asset": settings.risk.quote_asset}
+        for key, value in expected_cancel.items():
+            if canonical.get(key) != value:
+                raise PolicyError(f"live cancel {key} does not match current policy")
+        if canonical.get("symbol") not in settings.market.symbols or not isinstance(canonical.get("order_list_id"), int) or not isinstance(canonical.get("cancel_order_id"), int):
+            raise PolicyError("live cancel protection identifiers are invalid")
+        return
+    if canonical.get("source") == "manual-live-close":
+        expected_close = {"product": "SPOT", "side": "SELL", "order_type": "MARKET", "mode": "live",
+                          "quote_asset": settings.risk.quote_asset}
+        for key, value in expected_close.items():
+            if canonical.get(key) != value:
+                raise PolicyError(f"live close {key} does not match current policy")
+        if canonical.get("symbol") not in settings.market.symbols:
+            raise PolicyError("live close symbol is no longer allowlisted")
+        quantity = decimal_value(canonical.get("quantity"), "live_close.quantity")
+        step = decimal_value(canonical.get("market_step_size"), "live_close.market_step_size")
+        if quantity <= 0 or step <= 0 or quantity % step != 0:
+            raise PolicyError("live close quantity is invalid or not exchange-aligned")
+        return
     expected = {
         "product": "SPOT",
         "side": "BUY",
@@ -190,6 +226,19 @@ def validate_claim(settings: Settings, proposal: dict[str, Any], daily_committed
 
 def execution_intent(settings: Settings, proposal: dict[str, Any]) -> dict[str, Any]:
     canonical = proposal["canonical"]
+    if canonical.get("source") == "manual-live-cancel-protection":
+        return {"server": settings.codex.mcp_server, "product": "SPOT", "operation": "cancel exact protected Spot OCO list",
+                "arguments": {"symbol": canonical["symbol"], "order_list_id": canonical["order_list_id"], "order_id": canonical["cancel_order_id"]},
+                "constraints": {"single_call": True, "withdrawal": False, "transfer": False, "futures": False, "margin": False, "retry_on_unknown_result": False}}
+    if canonical.get("source") == "manual-live-close":
+        return {
+            "server": settings.codex.mcp_server, "product": "SPOT",
+            "operation": "submit exact Spot MARKET SELL close",
+            "arguments": {"symbol": canonical["symbol"], "side": "SELL", "order_type": "MARKET",
+                          "quantity": canonical["quantity"]},
+            "constraints": {"single_call": True, "withdrawal": False, "transfer": False, "futures": False,
+                            "margin": False, "retry_on_unknown_result": False},
+        }
     return {
         "server": settings.codex.mcp_server,
         "product": "SPOT",

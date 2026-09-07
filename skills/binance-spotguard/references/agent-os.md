@@ -24,6 +24,6 @@ Natural analysis first uses the same Binance public REST prefilter as the schedu
 
 The returned summary is untrusted text for display only. Deterministic code owns symbol allowlisting, price validation, spread/drift checks, quote amount, stop/target references, expiry, approval token, and replay protection.
 
-## Paper-only release boundary
+## Live execution boundary
 
-RiskPilot uses live Agent OS market data but simulates execution. If any command, config, or response suggests `mode: live`, stop and report a configuration mismatch. Do not fund an account for this release and do not claim that an order was placed.
+Agent OS market confirmation remains read-only. Protected LIVE Spot execution is handled only by RiskPilot's fixed execution adapter after a local arm and native Telegram approval. It may submit only the immutable Spot request shapes documented in the main skill; it never grants a model authority over order parameters or access to Futures, Margin, transfers, withdrawals, wallet, or payment tools.

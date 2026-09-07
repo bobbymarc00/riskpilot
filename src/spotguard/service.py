@@ -946,6 +946,227 @@ class SpotGuard:
                     else "PAPER proposal exists; notification was not delivered.")
         return result
 
+    @localized
+    def create_live_partial_exit_proposal(self, symbol: str, percentage: Decimal,
+                                          notify: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """Create a dormant owner-approved OCO cancel → partial sell → OCO re-arm plan."""
+        raw_symbol = symbol.upper()
+        symbol = raw_symbol if raw_symbol.endswith(self.settings.risk.quote_asset) else raw_symbol + self.settings.risk.quote_asset
+        if not Decimal("0") < percentage <= Decimal("100"):
+            raise PolicyError("live partial exit percentage must be greater than 0 and at most 100")
+        if symbol not in self.settings.market.symbols or symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("symbol is not enabled for live Spot intent")
+        if not self.settings.live.enabled or not self.live_arm.status().armed:
+            raise SecurityError("live trading is disabled or not armed on the VPS")
+        readiness = self.live_status(check_symbols=True, symbols=[symbol])
+        if not readiness["execution_ready"]:
+            raise SecurityError("live execution readiness checks have not all passed")
+
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for order in self.live_executor.read_open_spot_orders():
+            list_id = order.get("orderListId")
+            if order.get("symbol") == symbol and isinstance(list_id, int) and list_id > 0:
+                grouped.setdefault(list_id, []).append(order)
+        if len(grouped) != 1:
+            raise PolicyError("exactly one active two-leg Spot OCO protection list is required for a live partial exit")
+        order_list_id, legs = next(iter(grouped.items()))
+        if len(legs) != 2 or {row.get("side") for row in legs} != {"SELL"} or not {row.get("status") for row in legs} <= {"NEW", "PENDING_NEW"}:
+            raise PolicyError("active protection is not a safe two-leg SELL OCO")
+        stop_leg = next((row for row in legs if row.get("type") == "STOP_LOSS_LIMIT"), None)
+        target_leg = next((row for row in legs if row.get("type") == "TAKE_PROFIT_LIMIT"), None)
+        if stop_leg is None or target_leg is None or not isinstance(stop_leg.get("orderId"), int):
+            raise PolicyError("active OCO does not contain exact stop and target legs")
+        quantities = {Decimal(str(row.get("origQty", "0"))) for row in legs}
+        if len(quantities) != 1 or next(iter(quantities)) <= 0:
+            raise PolicyError("active OCO legs do not protect one exact quantity")
+        protected_quantity = next(iter(quantities))
+        exchange = validate_spot_symbol(self.settings, symbol)
+        step = Decimal(exchange["market_step_size"])
+        tick = Decimal(exchange["price_tick_size"])
+        market = fetch_spot_snapshot(self.settings, symbol)
+        sell_quantity = protected_quantity if percentage == Decimal("100") else floor_to_step(protected_quantity * percentage / Decimal("100"), step)
+        remaining_quantity = protected_quantity - sell_quantity
+        if sell_quantity <= 0 or sell_quantity * market.bid < Decimal(exchange["min_notional"]):
+            raise PolicyError("requested partial exit is below Binance minimum notional after LOT_SIZE rounding")
+        if percentage < Decimal("100") and (remaining_quantity <= 0 or remaining_quantity * market.bid < Decimal(exchange["min_notional"])):
+            raise PolicyError("partial exit would leave unprotectable dust; use sell all instead")
+        stop = Decimal(str(stop_leg.get("stopPrice", "0")))
+        target = Decimal(str(target_leg.get("stopPrice") or target_leg.get("price") or "0"))
+        if tick <= 0 or stop <= 0 or target <= stop or stop % tick or target % tick:
+            raise PolicyError("active OCO bracket is not valid for safe re-arm")
+
+        fingerprint = hashlib.sha256(f"manual-live-partial-exit:{symbol}:{order_list_id}:{percentage}:{time.time_ns()}".encode()).hexdigest()
+        signal = Signal(candidate_id=f"c-{fingerprint[:12]}", fingerprint=fingerprint, symbol=symbol,
+            interval=self.settings.market.interval, side="BUY", score=0, price=float(market.bid),
+            candle_close_time=int(time.time() * 1000), reasons=("manual live partial exit; approval required",),
+            metrics={"manual_live_partial_exit": True, "order_list_id": order_list_id, "percentage": str(percentage)})
+        candidate, _ = self.ledger.create_candidate(signal, self.settings.market.candidate_ttl_minutes)
+        now = utcnow(); proposal_id = f"p-{secrets.token_hex(6)}"
+        canonical = {"schema": "spotguard.order.v1", "proposal_id": proposal_id, "candidate_id": candidate["id"],
+            "product": "SPOT", "symbol": symbol, "side": "SELL", "order_type": "PARTIAL_EXIT",
+            "quote_asset": self.settings.risk.quote_asset, "quote_amount": "0", "entry_reference": str(market.bid),
+            "stop_reference": str(stop), "take_profit_reference": str(target), "reward_risk": "0",
+            "order_list_id": order_list_id, "cancel_order_id": stop_leg["orderId"],
+            "protected_order_ids": sorted(row["orderId"] for row in legs if isinstance(row.get("orderId"), int)),
+            "percentage": str(percentage), "protected_quantity": str(protected_quantity),
+            "sell_quantity": str(sell_quantity), "remaining_quantity": str(remaining_quantity),
+            "market_step_size": str(step), "price_tick_size": str(tick),
+            "mode": "live", "source": "manual-live-partial-exit", "approval_owner_id": self.settings.openclaw.telegram_owner_id,
+            "approval_chat_id": self.settings.telegram.chat_id, "approval_nonce": secrets.token_urlsafe(12),
+            "created_at": isoformat(now), "expires_at": isoformat(now + timedelta(seconds=self.settings.live.approval_ttl_seconds))}
+        values = {"id": proposal_id, "candidate_id": candidate["id"], "symbol": symbol, "side": "BUY", "product": "SPOT",
+            "order_type": "MARKET", "quote_amount": "0", "entry_reference": str(market.bid), "stop_reference": str(stop),
+            "take_profit_reference": str(target), "reward_risk": "0", "rationale": "Cancel exact OCO, sell requested percentage, then re-arm unchanged TP/SL; approval required.",
+            "mode": "live", "source": "manual-live-partial-exit", "created_at": canonical["created_at"], "expires_at": canonical["expires_at"],
+            "canonical": canonical, "canonical_json": canonical_json(canonical), "locale": self.locale}
+        token = self.signer.approval_token(values["canonical_json"])
+        proposal = self.ledger.create_proposal(values, self.signer.token_hash(token), self.settings.risk.max_active_proposals)
+        self.ledger.add_event("manual.live_partial_exit.proposal", proposal["id"], {"symbol": symbol, "percentage": str(percentage), "sell_quantity": str(sell_quantity), "remaining_quantity": str(remaining_quantity), "order_list_id": order_list_id})
+        result: dict[str, Any] = {"proposal": proposal, "notification": None}
+        if notify:
+            result["notification"] = self.notify_proposal(proposal["id"], dry_run=dry_run, token=token)
+        return result
+
+    @localized
+    def create_live_restore_protection_proposal(self, symbol: str, notify: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """Restore the last approved TP/SL bracket to the current free Spot balance."""
+        raw = symbol.upper(); symbol = raw if raw.endswith(self.settings.risk.quote_asset) else raw + self.settings.risk.quote_asset
+        if symbol not in self.settings.live.allowed_symbols or not self.settings.live.enabled or not self.live_arm.status().armed:
+            raise SecurityError("live protection restore is disabled or not armed")
+        if not self.live_status(check_symbols=True, symbols=[symbol])["execution_ready"]:
+            raise SecurityError("live execution readiness checks have not all passed")
+        if any(row.get("symbol") == symbol and isinstance(row.get("orderListId"), int) and row["orderListId"] > 0 for row in self.live_executor.read_open_spot_orders()):
+            raise PolicyError("active Spot OCO protection already exists; restore was not created")
+        prior = next((row["canonical"] for row in self.ledger.list_proposals(100)
+                      if row["symbol"] == symbol and row["mode"] == "live" and row["status"] in {"EXECUTED", "RECONCILE"} and row.get("canonical", {}).get("stop_reference") not in {None, "0"}
+                      and row.get("canonical", {}).get("take_profit_reference") not in {None, "0"}), None)
+        if prior is None:
+            raise PolicyError("no prior approved TP/SL bracket is available; specify a new protected entry instead")
+        exchange = validate_spot_symbol(self.settings, symbol); market = fetch_spot_snapshot(self.settings, symbol)
+        step=Decimal(exchange["market_step_size"]); tick=Decimal(exchange["price_tick_size"])
+        base=symbol[:-len(self.settings.risk.quote_asset)]; account=self.live_executor.read_spot_account()
+        quantity=floor_to_step(next((Decimal(row["free"]) for row in account["balances"] if row["asset"] == base), Decimal("0")), step)
+        stop=Decimal(str(prior["stop_reference"])); target=Decimal(str(prior["take_profit_reference"]))
+        if quantity <= 0 or quantity * market.bid < Decimal(exchange["min_notional"]): raise PolicyError("free Spot balance is below Binance minimum for protection")
+        if not stop < market.bid < target or stop % tick or target % tick: raise PolicyError("prior TP/SL bracket is no longer safe at the current market price")
+        now=utcnow(); proposal_id=f"p-{secrets.token_hex(6)}"; fingerprint=hashlib.sha256(f"manual-live-set-protection:{symbol}:{time.time_ns()}".encode()).hexdigest()
+        signal=Signal(candidate_id=f"c-{fingerprint[:12]}",fingerprint=fingerprint,symbol=symbol,interval=self.settings.market.interval,side="BUY",score=0,price=float(market.bid),candle_close_time=int(time.time()*1000),reasons=("restore live TP/SL; approval required",),metrics={"manual_live_set_protection":True})
+        candidate,_=self.ledger.create_candidate(signal,self.settings.market.candidate_ttl_minutes)
+        canonical={"schema":"spotguard.order.v1","proposal_id":proposal_id,"candidate_id":candidate["id"],"product":"SPOT","symbol":symbol,"side":"SELL","order_type":"OCO_PROTECTION","quote_asset":self.settings.risk.quote_asset,"quote_amount":"0","entry_reference":str(market.bid),"stop_reference":str(stop),"take_profit_reference":str(target),"reward_risk":"0","quantity":str(quantity),"market_step_size":str(step),"price_tick_size":str(tick),"mode":"live","source":"manual-live-set-protection","approval_owner_id":self.settings.openclaw.telegram_owner_id,"approval_chat_id":self.settings.telegram.chat_id,"approval_nonce":secrets.token_urlsafe(12),"created_at":isoformat(now),"expires_at":isoformat(now+timedelta(seconds=self.settings.live.approval_ttl_seconds))}
+        values={"id":proposal_id,"candidate_id":candidate["id"],"symbol":symbol,"side":"BUY","product":"SPOT","order_type":"MARKET","quote_amount":"0","entry_reference":str(market.bid),"stop_reference":str(stop),"take_profit_reference":str(target),"reward_risk":"0","rationale":"Restore last approved TP/SL to current free Spot balance; approval required.","mode":"live","source":"manual-live-set-protection","created_at":canonical["created_at"],"expires_at":canonical["expires_at"],"canonical":canonical,"canonical_json":canonical_json(canonical),"locale":self.locale}
+        token=self.signer.approval_token(values["canonical_json"]); proposal=self.ledger.create_proposal(values,self.signer.token_hash(token),self.settings.risk.max_active_proposals)
+        result={"proposal":proposal,"notification":None}
+        if notify: result["notification"]=self.notify_proposal(proposal["id"],dry_run=dry_run,token=token)
+        return result
+
+    @localized
+    def create_live_cancel_protection_proposal(self, symbol: str, notify: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        raw_symbol = symbol.upper()
+        symbol = raw_symbol if raw_symbol.endswith(self.settings.risk.quote_asset) else raw_symbol + self.settings.risk.quote_asset
+        if symbol not in self.settings.live.allowed_symbols or not self.settings.live.enabled or not self.live_arm.status().armed:
+            raise SecurityError("live cancel protection is disabled or not armed")
+        readiness = self.live_status(check_symbols=True, symbols=[symbol])
+        if not readiness["execution_ready"]:
+            raise SecurityError("live execution readiness checks have not all passed")
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for order in self.live_executor.read_open_spot_orders():
+            if order.get("symbol") == symbol and isinstance(order.get("orderListId"), int) and order["orderListId"] > 0:
+                grouped.setdefault(order["orderListId"], []).append(order)
+        if len(grouped) != 1:
+            raise PolicyError("exactly one active protection order list is required before it can be cancelled")
+        order_list_id, legs = next(iter(grouped.items()))
+        if len(legs) != 2 or {row.get("status") for row in legs} != {"NEW"} or {row.get("side") for row in legs} != {"SELL"}:
+            raise PolicyError("active protection order list is not a safe two-leg SELL OCO")
+        anchor = next((row for row in legs if row.get("type") == "STOP_LOSS_LIMIT"), None)
+        if anchor is None or not isinstance(anchor.get("orderId"), int):
+            raise PolicyError("active protection order list has no cancellable stop leg")
+        fingerprint = hashlib.sha256(f"manual-live-cancel-protection:{symbol}:{order_list_id}:{time.time_ns()}".encode()).hexdigest()
+        signal = Signal(candidate_id=f"c-{fingerprint[:12]}", fingerprint=fingerprint, symbol=symbol, interval=self.settings.market.interval,
+            side="BUY", score=0, price=0.0, candle_close_time=int(time.time() * 1000), reasons=("manual live OCO cancellation; approval required",),
+            metrics={"manual_live_cancel_protection": True, "order_list_id": order_list_id})
+        candidate, _ = self.ledger.create_candidate(signal, self.settings.market.candidate_ttl_minutes)
+        now = utcnow(); proposal_id = f"p-{secrets.token_hex(6)}"
+        canonical = {"schema": "spotguard.order.v1", "proposal_id": proposal_id, "candidate_id": candidate["id"], "product": "SPOT",
+            "symbol": symbol, "side": "CANCEL", "order_type": "CANCEL_OCO", "quote_asset": self.settings.risk.quote_asset,
+            "quote_amount": "0", "entry_reference": "0", "stop_reference": "0", "take_profit_reference": "0", "reward_risk": "0",
+            "order_list_id": order_list_id, "cancel_order_id": anchor["orderId"], "protected_order_ids": sorted(row["orderId"] for row in legs if isinstance(row.get("orderId"), int)),
+            "mode": "live", "source": "manual-live-cancel-protection", "approval_owner_id": self.settings.openclaw.telegram_owner_id,
+            "approval_chat_id": self.settings.telegram.chat_id, "approval_nonce": secrets.token_urlsafe(12), "created_at": isoformat(now),
+            "expires_at": isoformat(now + timedelta(seconds=self.settings.live.approval_ttl_seconds))}
+        values = {"id": proposal_id, "candidate_id": candidate["id"], "symbol": symbol, "side": "BUY", "product": "SPOT", "order_type": "CANCEL_OCO",
+            "quote_amount": "0", "entry_reference": "0", "stop_reference": "0", "take_profit_reference": "0", "reward_risk": "0",
+            "rationale": "Cancel the exact active live XRP protection order list; approval required.", "mode": "live", "source": "manual-live-cancel-protection",
+            "created_at": canonical["created_at"], "expires_at": canonical["expires_at"], "canonical": canonical, "canonical_json": canonical_json(canonical), "locale": self.locale}
+        token = self.signer.approval_token(values["canonical_json"])
+        proposal = self.ledger.create_proposal(values, self.signer.token_hash(token), self.settings.risk.max_active_proposals)
+        self.ledger.add_event("manual.live_cancel_protection.proposal", proposal["id"], {"symbol": symbol, "order_list_id": order_list_id})
+        result: dict[str, Any] = {"proposal": proposal, "notification": None}
+        if notify:
+            result["notification"] = self.notify_proposal(proposal["id"], dry_run=dry_run, token=token)
+        return result
+
+    @localized
+    def create_live_close_all_proposal(self, symbol: str, notify: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """Create one dormant, owner-confirmed close of the currently free Spot balance."""
+        raw_symbol = symbol.upper()
+        symbol = raw_symbol if raw_symbol.endswith(self.settings.risk.quote_asset) else raw_symbol + self.settings.risk.quote_asset
+        if symbol not in self.settings.market.symbols or symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("symbol is not enabled for live Spot intent")
+        if not self.settings.live.enabled or not self.live_arm.status().armed:
+            raise SecurityError("live trading is disabled or not armed on the VPS")
+        # Keep the legacy explicit close-all command safe too: if the asset is
+        # OCO-locked, it must use the protected 100% exit, never mistake dust
+        # as the whole position.
+        if any(row.get("symbol") == symbol and isinstance(row.get("orderListId"), int) and row["orderListId"] > 0
+               for row in self.live_executor.read_open_spot_orders()):
+            return self.create_live_partial_exit_proposal(symbol, Decimal("100"), notify=notify, dry_run=dry_run)
+        readiness = self.live_status(check_symbols=True, symbols=[symbol])
+        if not readiness["execution_ready"]:
+            raise SecurityError("live execution readiness checks have not all passed")
+        exchange = validate_spot_symbol(self.settings, symbol)
+        market = fetch_spot_snapshot(self.settings, symbol)
+        quote_asset = self.settings.risk.quote_asset
+        base_asset = symbol[:-len(quote_asset)]
+        account = self.live_executor.read_spot_account()
+        free = next((Decimal(row["free"]) for row in account["balances"] if row["asset"] == base_asset), Decimal("0"))
+        step = Decimal(exchange["market_step_size"])
+        quantity = floor_to_step(free, step)
+        estimated_quote = quantity * market.bid
+        if quantity <= 0 or estimated_quote < Decimal(exchange["min_notional"]):
+            raise PolicyError("free live balance is below Binance minimum after LOT_SIZE rounding; no close proposal was created")
+        klines = fetch_klines(self.settings, symbol)
+        snapshot = analyze(klines)
+        fingerprint = hashlib.sha256(f"manual-live-close:{symbol}:{time.time_ns()}:{secrets.token_hex(4)}".encode()).hexdigest()
+        signal = Signal(candidate_id=f"c-{fingerprint[:12]}", fingerprint=fingerprint, symbol=symbol,
+            interval=self.settings.market.interval, side="BUY", score=snapshot.score, price=float(market.bid),
+            candle_close_time=klines[-1].close_time, reasons=("manual live close; free Spot balance only",),
+            metrics={**snapshot.to_dict(), "manual_live_close": True, "base_asset": base_asset})
+        candidate, _ = self.ledger.create_candidate(signal, self.settings.market.candidate_ttl_minutes)
+        now = utcnow()
+        proposal_id = f"p-{secrets.token_hex(6)}"
+        canonical = {
+            "schema": "spotguard.order.v1", "proposal_id": proposal_id, "candidate_id": candidate["id"],
+            "product": "SPOT", "symbol": symbol, "side": "SELL", "order_type": "MARKET",
+            "quote_asset": quote_asset, "quote_amount": "0", "estimated_quote_amount": str(estimated_quote),
+            "entry_reference": str(market.bid), "stop_reference": "0", "take_profit_reference": "0", "reward_risk": "0",
+            "quantity": str(quantity), "market_step_size": str(step), "base_asset": base_asset,
+            "mode": "live", "source": "manual-live-close", "approval_owner_id": self.settings.openclaw.telegram_owner_id,
+            "approval_chat_id": self.settings.telegram.chat_id, "approval_nonce": secrets.token_urlsafe(12),
+            "created_at": isoformat(now), "expires_at": isoformat(now + timedelta(seconds=self.settings.live.approval_ttl_seconds)),
+        }
+        values = {"id": proposal_id, "candidate_id": candidate["id"], "symbol": symbol, "side": "BUY", "product": "SPOT",
+            "order_type": "MARKET", "quote_amount": "0", "entry_reference": str(market.bid), "stop_reference": "0",
+            "take_profit_reference": "0", "reward_risk": "0", "rationale": "Manual live close of rounded free Spot balance; approval required.",
+            "mode": "live", "source": "manual-live-close", "created_at": canonical["created_at"], "expires_at": canonical["expires_at"],
+            "canonical": canonical, "canonical_json": canonical_json(canonical), "locale": self.locale}
+        token = self.signer.approval_token(values["canonical_json"])
+        proposal = self.ledger.create_proposal(values, self.signer.token_hash(token), self.settings.risk.max_active_proposals)
+        self.ledger.add_event("manual.live_close.proposal", proposal["id"], {"symbol": symbol, "quantity": str(quantity), "base_asset": base_asset})
+        result: dict[str, Any] = {"proposal": proposal, "notification": None}
+        if notify:
+            result["notification"] = self.notify_proposal(proposal["id"], dry_run=dry_run, token=token)
+        return result
+
     def create_demo_candidate(
         self,
         symbol: str,
@@ -1298,20 +1519,42 @@ class SpotGuard:
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
         try:
-            response = self.live_executor.execute(proposal)
+            if proposal["canonical"].get("source") == "manual-live-cancel-protection":
+                list_id = proposal["canonical"]["order_list_id"]
+                current = self.live_executor.read_open_spot_orders()
+                if not any(row.get("symbol") == proposal["symbol"] and row.get("orderListId") == list_id and row.get("orderId") == proposal["canonical"]["cancel_order_id"] for row in current):
+                    raise SecurityError("the exact OCO protection list is no longer active; cancellation was not submitted")
+            if proposal["canonical"].get("source") == "manual-live-close":
+                base_asset = str(proposal["canonical"].get("base_asset", ""))
+                quantity = Decimal(proposal["canonical"]["quantity"])
+                step = Decimal(proposal["canonical"]["market_step_size"])
+                account = self.live_executor.read_spot_account()
+                free = next((Decimal(row["free"]) for row in account["balances"] if row["asset"] == base_asset), Decimal("0"))
+                if quantity > floor_to_step(free, step):
+                    raise SecurityError("free Spot balance changed; live close was not submitted")
+            response = self.live_executor.execute_partial_exit(proposal) if proposal["canonical"].get("source") == "manual-live-partial-exit" else self.live_executor.execute(proposal)
         except Exception as exc:
             # After a write child has started, absence of a usable response is
             # never proof that Binance rejected it. Preserve the lease outcome
             # as RECONCILE and do not retry automatically.
             return self.uncertain_execution(proposal_id, lease, str(exc))
-        order_list_id = response.get("orderListId")
-        if not isinstance(order_list_id, int):
-            return self.uncertain_execution(proposal_id, lease, "protected Spot response has no orderListId")
-        status = str(response.get("listStatusType", ""))
+        source = proposal["canonical"].get("source")
+        is_close = source == "manual-live-close"
+        is_cancel = source == "manual-live-cancel-protection"
+        is_partial = source == "manual-live-partial-exit"
+        is_restore = source == "manual-live-set-protection"
+        if is_cancel:
+            remaining = self.live_executor.read_open_spot_orders()
+            if any(row.get("symbol") == proposal["symbol"] and row.get("orderListId") == proposal["canonical"]["order_list_id"] for row in remaining):
+                return self.uncertain_execution(proposal_id, lease, "OCO cancellation response requires reconciliation")
+        order_id = response.get("orderId") if (is_close or is_cancel or is_partial) else response.get("orderListId")
+        if not isinstance(order_id, int):
+            return self.uncertain_execution(proposal_id, lease, "protected Spot response has no order identifier")
+        status = str(response.get("status" if (is_close or is_partial) else "listStatusType", ""))
         return self.ledger.finish_execution(
-            proposal_id, lease_hash, "EXECUTED", str(order_list_id), status,
-            {"simulated": False, "symbol": proposal["symbol"], "side": "BUY",
-             "protected_order_type": "OTOCO", "binance_response": dict(response)},
+            proposal_id, lease_hash, "EXECUTED", str(order_id), status,
+            {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"],
+             "protected_order_type": "PARTIAL_EXIT_REARM" if is_partial else ("OCO_RESTORE" if is_restore else ("OCO_CANCEL" if is_cancel else ("MARKET_CLOSE" if is_close else "OTOCO"))), "binance_response": dict(response)},
         )
 
     @localized
@@ -1451,6 +1694,12 @@ class SpotGuard:
             "uncertain_reason": sanitized,
             "required_action": "reconcile against Binance Agent OS order history; never retry automatically",
         }
+        if proposal["canonical"].get("source") == "manual-live-partial-exit":
+            summary["recovery"] = {
+                "retry_sell": f"/spot live-close-all {proposal['symbol']}",
+                "rearm_bracket": {"stop": proposal["canonical"]["stop_reference"], "target": proposal["canonical"]["take_profit_reference"], "remaining_quantity": proposal["canonical"]["remaining_quantity"]},
+                "approval_required": True,
+            }
         return self.ledger.finish_execution(
             proposal_id,
             lease_hash,

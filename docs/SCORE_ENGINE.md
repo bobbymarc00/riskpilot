@@ -1,8 +1,8 @@
 # RiskPilot canonical score engine
 
-## Audited scheduled-signal pipeline
+## Scheduled-signal pipeline (currently paused operationally)
 
-The active scheduled route is `riskpilot scan`, invoked by the monitor timer. For each configured symbol it validates Binance Spot `exchangeInfo`, requests 61 candles from Binance public REST `/api/v3/klines`, removes any forming candle, validates interval continuity and OHLC values, and scores the newest 60 closed candles. The configured `market.lookback` value is not used by this legacy route; the active compatibility boundary is the constants `PREFILTER_REQUEST_COUNT = 61` and `ANALYSIS_CANDLE_COUNT = 60`.
+The `riskpilot scan` implementation remains available, but its monitor timer is currently disabled during rate-limit/IP-ban optimization. It is not an active background route. For each configured symbol it validates Binance Spot `exchangeInfo`, requests 61 candles from Binance public REST `/api/v3/klines`, removes any forming candle, validates interval continuity and OHLC values, and scores the newest 60 closed candles. The configured `market.lookback` value is not used by this legacy route; the active compatibility boundary is the constants `PREFILTER_REQUEST_COUNT = 61` and `ANALYSIS_CANDLE_COUNT = 60`.
 
 The native score is the sum below, clamped to `[0, 100]`:
 
@@ -16,7 +16,7 @@ The native score is the sum below, clamped to `[0, 100]`:
 
 The default score threshold is 70 (`market.min_signal_score`). Passing the score threshold alone does not make a candidate. The existing bullish gate also requires: configured symbol, EMA(12) > EMA(26), close > EMA(12), RSI(14) from 45 through 72, positive 3-candle momentum, and ATR percentage no greater than `risk.max_stop_distance_pct`.
 
-Threshold-passing signals are subject to per-symbol cooldown/deduplication. Signals are ordered by score and candle close time, descending. Before Agent OS is invoked, the scheduled PAPER route checks active-tranche capacity and the daily successful-entry quota. Only the selected signal is confirmed. Binance Agent OS must return a fresh closed candle with exactly matching open time and OHLC; failure produces no candidate. A confirmed signal is then persisted as a candidate.
+When the scanner is re-enabled, threshold-passing signals will be subject to per-symbol cooldown/deduplication. Signals are ordered by score and candle close time, descending. Before Agent OS is invoked, the scheduled PAPER route checks active-tranche capacity and the daily successful-entry quota. Only the selected signal is confirmed. Binance Agent OS must return a fresh closed candle with exactly matching open time and OHLC; failure produces no candidate. A confirmed signal is then persisted as a candidate.
 
 The later Agent OS review/proposal stage reads the candidate, obtains the verified closed-candle price, and applies spread, drift, quote-size, ATR stop-distance, and reward/risk checks. PAPER entry guards cover active tranches, distinct economic positions and scale-ins, exposure, per-position and aggregate risk, free balance, daily fills, daily realized loss, minimum notional/quantity steps, and pending proposals. Proposal creation and execution remain separate, stateful approval stages.
 

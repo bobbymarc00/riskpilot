@@ -114,6 +114,18 @@ def build_parser() -> argparse.ArgumentParser:
     live_buy_direct.add_argument("--quote-amount", required=True)
     live_buy_direct.add_argument("--notify", action="store_true")
     live_buy_direct.add_argument("--dry-run", action="store_true")
+    live_close_direct = subparsers.add_parser("live-close-all", help="create a dormant LIVE close-all proposal")
+    live_close_direct.add_argument("--symbol", required=True)
+    live_close_direct.add_argument("--notify", action="store_true")
+    live_close_direct.add_argument("--dry-run", action="store_true")
+    live_cancel_direct = subparsers.add_parser("live-cancel-protection", help="create a dormant LIVE OCO-cancel proposal")
+    live_cancel_direct.add_argument("--symbol", required=True)
+    live_cancel_direct.add_argument("--notify", action="store_true")
+    live_cancel_direct.add_argument("--dry-run", action="store_true")
+    live_restore = subparsers.add_parser("live-restore-protection", help="create a dormant LIVE TP/SL restore proposal")
+    live_restore.add_argument("--symbol", required=True); live_restore.add_argument("--notify", action="store_true"); live_restore.add_argument("--dry-run", action="store_true")
+    live_partial = subparsers.add_parser("live-exit-percent", help="create a dormant LIVE partial-exit proposal")
+    live_partial.add_argument("--symbol", required=True); live_partial.add_argument("--percentage", required=True); live_partial.add_argument("--notify", action="store_true"); live_partial.add_argument("--dry-run", action="store_true")
     live_approve = subparsers.add_parser("live-approve", help="approve one LIVE proposal from a native Telegram button")
     live_approve.add_argument("proposal_id")
     live_approve.add_argument("--sender-id", required=True)
@@ -488,7 +500,7 @@ def _run(args: argparse.Namespace) -> Any:
     settings = load_settings(config_path)
     service = SpotGuard(settings, locale=args.locale)
     args._locale = service.locale
-    if args.utterance or args.command in vocabulary("input.analysis") or args.command in {"compare", "paper-buy", "live-buy", "paper-close"}:
+    if args.utterance or args.command in vocabulary("input.analysis") or args.command in {"compare", "paper-buy", "live-buy", "live-close-all", "live-cancel-protection", "live-exit-percent", "paper-close"}:
         args._locale = service.select_locale(args.utterance or args.command, args.locale)
 
     if args.command == "check":
@@ -507,6 +519,14 @@ def _run(args: argparse.Namespace) -> Any:
         return service.resend_paper_proposal(args.proposal_id, args.sender_id, args.chat_id, dry_run=args.dry_run)
     if args.command == "live-buy":
         return service.create_manual_buy_proposal(args.symbol, decimal_value(args.quote_amount, "quote_amount"), live=True, notify=args.notify, dry_run=args.dry_run)
+    if args.command == "live-close-all":
+        return service.create_live_close_all_proposal(args.symbol, notify=args.notify, dry_run=args.dry_run)
+    if args.command == "live-cancel-protection":
+        return service.create_live_cancel_protection_proposal(args.symbol, notify=args.notify, dry_run=args.dry_run)
+    if args.command == "live-restore-protection":
+        return service.create_live_restore_protection_proposal(args.symbol, notify=args.notify, dry_run=args.dry_run)
+    if args.command == "live-exit-percent":
+        return service.create_live_partial_exit_proposal(args.symbol, decimal_value(args.percentage, "percentage"), notify=args.notify, dry_run=args.dry_run)
     if args.command == "live-approve":
         return service.approve_live_button(args.proposal_id, args.sender_id, args.chat_id)
     if args.command == "live-reject":
@@ -530,6 +550,12 @@ def _run(args: argparse.Namespace) -> Any:
                 intent["symbol"], Decimal(intent["quote_amount"]),
                 live=intent.get("mode") == "live", notify=args.notify, dry_run=args.dry_run)}
         if intent["action"] == "close":
+            if intent.get("mode") == "live":
+                if intent.get("close_selector") == "all":
+                    return {"intent": intent, **service.create_live_partial_exit_proposal(intent["symbol"], Decimal("100"), notify=args.notify, dry_run=args.dry_run)}
+                if intent.get("close_selector") == "percentage":
+                    return {"intent": intent, **service.create_live_partial_exit_proposal(intent["symbol"], Decimal(intent["percentage"]), notify=args.notify, dry_run=args.dry_run)}
+                raise PolicyError("LIVE partial exit accepts only a percentage or 'sell all'")
             positions = [row for row in service.ledger.list_paper_positions(True) if row["symbol"] == intent["symbol"]]
             if not positions:
                 raise PolicyError(f"no open PAPER position exists for {intent['symbol']}")

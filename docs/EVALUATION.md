@@ -4,7 +4,7 @@ Run the complete offline evidence set with `./scripts/verify.sh` and the repeata
 
 | Capability | Implementation file | Test proving it | Safe reproduction | Expected output |
 |---|---|---|---|---|
-| Scheduled scan | `src/spotguard/service.py` | `test_symbol_expansion.py` | `./riskpilot --config /path/to/sanitized-config.json --json scan --synthetic --dry-run` | configured symbols scanned |
+| Scanner implementation | `src/spotguard/service.py` | `test_symbol_expansion.py` | `./riskpilot --config /path/to/sanitized-config.json --json scan --synthetic --dry-run` | offline configured-symbol scan; production timer is intentionally disabled during rate-limit/IP-ban optimization |
 | Agent OS read-only confirmation | `src/spotguard/codex_bridge.py` | `test_codex_bridge.py` | `./riskpilot --json agent-os status` | read-only boundary |
 | Signal generation | `src/spotguard/strategy.py` | `test_indicators.py` | `./scripts/demo-track-a.sh` | deterministic candidate |
 | PAPER proposal | `src/spotguard/service.py` | `test_manual_flows.py` | `./scripts/demo-track-a.sh` | pending proposal and fill |
@@ -18,4 +18,4 @@ Run the complete offline evidence set with `./scripts/verify.sh` and the repeata
 | Tranche/position limits | `src/spotguard/service.py` | `test_paper_limits_partial_close.py` | `PYTHONPATH=src python3 -m unittest tests.test_paper_limits_partial_close` | 10 tranches / 5 positions |
 | Approval replay rejection | `src/spotguard/db.py` | `test_approval_flow.py` | `PYTHONPATH=src python3 -m unittest tests.test_approval_flow` | replay rejected |
 | Timeout and restart recovery | `src/spotguard/db.py`, `src/spotguard/service.py` | `test_paper_execution_recovery.py` | `PYTHONPATH=src python3 -m unittest tests.test_paper_execution_recovery` | no duplicate |
-| LIVE fail-closed readiness | `src/spotguard/live_execution.py` | `test_live_safety.py` | `./riskpilot --config /path/to/sanitized-config.json --json live status` | disabled, disarmed, not ready |
+| LIVE protected entry/exit safety | `src/spotguard/live_execution.py` | `test_live_safety.py` | `./riskpilot --config /path/to/sanitized-config.json --json live status` | locally armed, owner-confirmed Spot-only boundary; no transport in offline evidence |

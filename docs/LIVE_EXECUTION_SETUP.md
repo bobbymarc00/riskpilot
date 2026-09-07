@@ -13,13 +13,11 @@ Codex CLI / Telegram
   -> RiskPilot proposal and policy checks
   -> explicit owner confirmation
   -> dedicated Binance execution MCP profile
-  -> protected Spot entry + native TP/SL
+  -> protected Spot entry, TP/SL restore, partial/full protected exit
   -> reconciliation
 ```
 
-The scanner remains read-only and only notifies when a candidate passes the
-configured signal, freshness, spread, and Agent OS confirmation checks. It must
-not create a LIVE proposal on its own.
+The scanner has no LIVE-order authority. It is currently disabled during public-REST rate-limit/IP-ban optimization; do not enable it as part of live setup.
 
 ## Profile preparation
 
@@ -34,7 +32,7 @@ modified.
 ## Scope review before OAuth
 
 Before connecting the execution profile, review the Agent OS/Binance permission
-screen. RiskPilot constructs only the protected Spot OTOCO request. If the
+screen. RiskPilot constructs only fixed protected Spot request shapes: entry OTOCO, SELL OCO restore, exact protection cancellation, and exact MARKET SELL exit. If the
 provider bundles Spot and Margin in one checkbox, do not route Margin
 operations through RiskPilot. Explicitly reject or disable wherever possible:
 
@@ -51,7 +49,4 @@ execution readiness.
 
 ## Current repository state
 
-The executor builds one Spot OTOCO request: a LIMIT BUY plus pending SELL
-take-profit and stop-loss legs. It is reached only after native Telegram owner
-confirmation and a short-lived VPS-local arm. A malformed, failed, or
-ambiguous result requires reconciliation and is never retried automatically.
+The executor builds fixed Spot request shapes: LIMIT BUY plus pending SELL TP/SL (OTOCO), SELL OCO protection restore, exact protection cancellation, and exact MARKET SELL exits. Each is reached only after native Telegram owner confirmation and a short-lived VPS-local arm. A malformed, failed, or ambiguous result requires reconciliation and is never retried automatically.
