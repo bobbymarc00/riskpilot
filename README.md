@@ -1,5 +1,23 @@
 # RiskPilot
 
+RiskPilot is a Binance Agent OS-powered Spot trading copilot
+with deterministic risk controls and human-approved live execution.
+
+Analyze → Rank → Propose → Approve → Execute → Protect → Exit
+
+🎥 Demo: [https://youtu.be/aYC23eYYUx0]
+
+𝕏 Submission: [https://x.com/bobbymarc00/status/2097039814482878806]
+
+🏆 Binance Agent OS Mini Hackathon — Track A
+
+- Live Binance Agentic Spot account integration
+- Market-score ranking across supported assets
+- Human-approved live execution
+- Automatic TP/SL protection
+- Deterministic exposure and loss limits
+
+
 **Agent OS-powered Spot trading copilot**
 
 **Scan. Verify. Approve. Protect.**
