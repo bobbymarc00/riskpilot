@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -503,36 +503,47 @@ def feature_dict(f: Feature) -> dict[str, Any]:
     }
 
 
-def scanner_message(feature: Feature, score: ScanScore | None, used_weight: int, active_count: int, configured: bool) -> str:
-    native = "warming up" if score is None or score.native_score is None else f"{score.native_score:.0f}/100 ({score.interval})"
-    mode = "CONFIGURED — existing RiskPilot flow can handle this symbol" if configured else "RADAR ONLY — not added to current execution allowlist"
-    fresh = "\n🆕 New since 24h baseline" if feature.new_symbol else ""
-    return (
-        "⚡ RISKPILOT SMART RADAR\n"
-        f"{feature.ticker.symbol} · {feature.lane or 'WATCH'}{fresh}\n\n"
-        f"Hype: {feature.hype_score:.0f} · Momentum: {feature.momentum_score:.0f} · Core: {feature.core_score:.0f}\n"
-        f"Native score: {native}\n"
-        f"5m move: {feature.ret_5m:+.2f}% · 15m move: {feature.ret_15m:+.2f}%\n"
-        f"5m quote-volume pulse: {feature.quote_delta_5m:,.0f} USDT\n"
-        f"24h quote volume: {feature.ticker.quote_volume:,.0f} USDT · spread {feature.ticker.spread_pct:.3f}%\n\n"
-        f"Universe: {active_count} active · API used weight seen: {used_weight}/6000\n"
-        f"Execution status: {mode}\n"
-        "Smart Radar never auto-adds a symbol to LIVE and never submits an order."
-    )
+def top_radar_rows(features: list[Feature], scores: dict[str, ScanScore], *, limit: int = 5) -> list[dict[str, Any]]:
+    """Rank cross-lane observation candidates without creating a trade signal.
 
-
-def should_alert(path: Path, feature: Feature, cfg: dict[str, Any], now_ts: float, *, mark: bool = True) -> bool:
-    state = read_json(path, {})
-    if not isinstance(state, dict):
-        state = {}
-    row = state.get(feature.ticker.symbol, {})
-    last = float(row.get("t", 0) or 0) if isinstance(row, dict) else 0.0
-    if now_ts - last < int(cfg["alert_cooldown_minutes"]) * 60:
-        return False
-    if mark:
-        state[feature.ticker.symbol] = {"t": now_ts, "hype": round(feature.hype_score, 1), "lane": feature.lane}
-        atomic_write_json(path, state)
-    return True
+    The lane scores are deliberately blended so a transient HYPE pulse cannot
+    monopolize the read-only view.  A current closed 15m canonical score is a
+    confirmation bonus, not a replacement for the existing candidate flow.
+    """
+    rows: list[dict[str, Any]] = []
+    for feature in features:
+        score = scores.get(feature.ticker.symbol)
+        potential = 0.40 * feature.core_score + 0.35 * feature.momentum_score + 0.25 * feature.hype_score
+        native_score = score.native_score if score else None
+        if score and score.interval == "15m" and native_score is not None:
+            potential += 10.0 if score.candidate_eligible else min(5.0, native_score / 20.0)
+        elif score and score.interval == "1m" and score.candidate_eligible:
+            potential += 3.0
+        if feature.ret_5m * feature.ret_15m < 0:
+            potential -= 5.0
+        label = "POTENSI"
+        if score and score.interval == "15m" and score.candidate_eligible:
+            label = "POTENSI_TINGGI"
+        elif score and score.interval == "1m" and score.candidate_eligible:
+            label = "EMERGING"
+        rows.append({
+            "symbol": feature.ticker.symbol,
+            "lane": feature.lane or "WATCH",
+            "potential_score": round(max(0.0, potential), 2),
+            "label": label,
+            "configured": False,  # Filled by the caller; never changes the allowlist.
+            "native_score": round(native_score, 2) if native_score is not None else None,
+            "native_interval": score.interval if score and native_score is not None else None,
+            "candidate_eligible": bool(score and score.candidate_eligible),
+            "core_score": round(feature.core_score, 2),
+            "momentum_score": round(feature.momentum_score, 2),
+            "hype_score": round(feature.hype_score, 2),
+            "ret_5m_pct": round(feature.ret_5m, 3),
+            "ret_15m_pct": round(feature.ret_15m, 3),
+            "spread_pct": round(feature.ticker.spread_pct, 4),
+        })
+    rows.sort(key=lambda row: (-float(row["potential_score"]), str(row["symbol"])))
+    return rows[:limit]
 
 
 def circuit_check(path: Path, now_ts: float) -> dict[str, Any]:
@@ -591,7 +602,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         sys.path.insert(0, str(project_root / "src"))
     from spotguard.config import default_config_path, load_settings
     from spotguard.service import SpotGuard
-    from spotguard.telegram import OpenClawMessenger
 
     smart_cfg_path = Path(args.smart_config).expanduser().resolve() if args.smart_config else project_root / "smart-scanner.json"
     cfg = load_smart_config(smart_cfg_path)
@@ -701,23 +711,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f.composite_score,
     ), reverse=True)
 
-    messenger = OpenClawMessenger(settings)
-    alerts: list[dict[str, Any]] = []
-    alert_state = state_dir / "alerts.json"
-    for f in ranked:
-        if len(alerts) >= int(cfg["max_alerts_per_cycle"]):
-            break
-        score = scores.get(f.ticker.symbol)
-        qualifies = ((score is not None and score.candidate_eligible) or
-                     f.hype_score >= float(cfg["urgent_hype_score"]) or f.new_symbol)
-        if not qualifies or not should_alert(alert_state, f, cfg, now_ts, mark=args.notify):
-            continue
-        configured = f.ticker.symbol in settings.market.symbols
-        message = scanner_message(f, score, client.used_weight_1m, active_count, configured)
-        delivery = messenger.send_text(message, dry_run=not args.notify).to_dict()
-        alerts.append({"symbol": f.ticker.symbol, "configured": configured,
-                       "feature": feature_dict(f), "score": asdict(score) if score else None,
-                       "delivery": delivery})
+    # Passive Radar observations are intentionally persisted, not pushed to
+    # Telegram.  This keeps a five-minute pulse from becoming notification
+    # spam; only the existing candidate/proposal flow below may notify.
+    radar_rows = top_radar_rows(universe["active"], scores)
+    for row in radar_rows:
+        row["configured"] = row["symbol"] in settings.market.symbols
+    atomic_write_json(state_dir / "top-radar.json", {
+        "generated_at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat(),
+        "active_count": active_count,
+        "used_weight_1m": client.used_weight_1m,
+        "rows": radar_rows,
+        "notice": "Read-only potential ranking; it is not a candidate, proposal, or entry instruction.",
+    })
 
     # Preserve the old flow exactly: if the strongest qualifying smart symbol is
     # already in the existing configured allowlist, hand only that symbol to the
@@ -742,7 +748,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "request_count": client.request_count,
         "mature_scan_due": mature_due,
         "budget_paused_mid_cycle": request_budget_stop,
-        "alerts": alerts,
+        "alerts": [],
+        "radar_notifications_suppressed": True,
+        "top_radar": radar_rows,
         "existing_flow_handoff": handoff,
         "state_dir": str(state_dir),
     }
@@ -752,7 +760,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="RiskPilot additive smart-universe scanner")
     parser.add_argument("--config", help="existing RiskPilot config.json; defaults to RiskPilot resolution")
     parser.add_argument("--smart-config", help="smart-scanner.json path")
-    parser.add_argument("--notify", action="store_true", help="send Smart Radar text alerts and configured-flow notifications")
+    parser.add_argument("--notify", action="store_true", help="send only existing candidate/proposal notifications; passive Radar remains read-only")
     parser.add_argument("--json", action="store_true", help="compact JSON output")
     args = parser.parse_args()
     try:

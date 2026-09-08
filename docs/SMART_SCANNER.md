@@ -6,7 +6,6 @@ It does **not** modify:
 
 - `src/spotguard/config.py`
 - `src/spotguard/market.py`
-- `src/spotguard/service.py`
 - `src/spotguard/live_execution.py`
 - `config.json`
 - the old `spotguard-monitor.timer`
@@ -55,24 +54,54 @@ Every 5 minutes
     |
     +-- deterministic RiskPilot scoring where enough candles exist
     |
-    +-- alert top qualifying radar candidates
+    +-- persist a cross-lane Top Radar Potensi snapshot (read-only)
+    |      -> no periodic Telegram notification
+    |      -> available through `riskpilot radar` or trusted `top radar` / `radar potensi`
     |
     +-- if a top candidate is ALREADY in existing config:
            hand only that candidate to the existing SpotGuard.scan() flow
                -> normal RiskPilot candidate notification
                -> native /binance_spotguard review CANDIDATE_ID button
                -> fresh Agent OS review
-               -> PAPER proposal only after the existing checks pass
-               -> a separate PAPER approval remains required for a simulated fill
+               -> approval-gated proposal in the configured scheduled mode
+               -> PAPER remains simulated; LIVE remains disarmed and fail-closed
+                  until its existing readiness/arm checks pass
 ```
 
 Dynamic coins are **never automatically added to `market.symbols`**. This is deliberate. A newly discovered HYPE coin can be surfaced in its first hour, but it remains `RADAR ONLY` until you explicitly decide to expand the execution allowlist later.
+
+## Notifications and Top Radar Potensi
+
+The five-minute scanner no longer sends passive `RISKPILOT SMART RADAR` texts.
+It persists `top-radar.json` and only the existing candidate handoff can send a
+Telegram notification: `RISKPILOT CANDIDATE` with AI REVIEW, followed by the
+normal approval-gated proposal flow. Existing safety/error notifications remain
+separate from this passive-observation suppression.
+
+Use the read-only local view when needed:
+
+```bash
+./riskpilot --json radar --limit 5
+```
+
+In a trusted Telegram direct chat, `top radar`, `radar potensi`, or `/spot
+radar` routes to the same local snapshot. The ranking blends CORE, MOMENTUM,
+and HYPE; a HYPE pulse is not automatically a trade signal. `POTENSI_TINGGI`
+means the current scan has a qualifying closed 15m canonical score, while
+`EMERGING` is an eligible 1m observation. Neither is a candidate, proposal, or
+entry instruction. AI REVIEW remains available only after the existing 15m
+candidate flow has independently passed its validation.
 
 The scanner never directly creates a LIVE order, changes LIVE arming, expands
 the execution allowlist, or bypasses RiskPilot's fresh-price, approval,
 TP/SL, or risk validation. A candidate may also be withheld by the existing
 per-symbol cooldown/deduplication guard even when it has a qualifying scanner
 score.
+
+`scheduled_proposal_mode` controls whether a successfully reviewed scheduled
+candidate becomes a PAPER or LIVE proposal. It does not arm LIVE and it never
+submits an order by itself: the existing native LIVE approval, account
+readiness, fresh validation, and protected Spot order checks still apply.
 
 ## Rate safety
 
@@ -104,7 +133,7 @@ All smart-scanner state is under the existing RiskPilot state directory:
   baseline-24h.json
   smart-exchange-info.json
   pulse-history.json
-  alerts.json
+  top-radar.json
   circuit.json
   schedule.json
   scanner.lock
@@ -122,7 +151,7 @@ chmod 600 smart-scanner.json
 python3 scripts/riskpilot-smart-scanner.py --smart-config smart-scanner.json --json
 ```
 
-This performs market reads and scoring but does not send Smart Radar Telegram alerts because `--notify` is absent.
+This performs market reads and scoring without sending Telegram notifications.
 
 Inspect:
 
@@ -132,13 +161,16 @@ cat .riskpilot-state/smart-scanner/active-universe.json | python3 -m json.tool
 
 If your production `state_dir` is elsewhere, use the path from your existing `config.json`.
 
-## Telegram test
+## Candidate/proposal notification test
 
 ```bash
 python3 scripts/riskpilot-smart-scanner.py \
   --smart-config smart-scanner.json \
   --notify --json
 ```
+
+`--notify` now enables only the existing configured-symbol candidate/proposal
+handoff. It never sends passive Radar texts.
 
 ## Enable timer
 

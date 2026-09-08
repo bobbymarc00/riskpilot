@@ -74,6 +74,21 @@ class SmartScannerTests(unittest.TestCase):
             state = smart.read_json(path, {})
             self.assertTrue(state["disabled"])
 
+    def test_top_radar_is_cross_lane_and_does_not_call_hype_actionable(self):
+        core = feature("COREUSDT", 10_000_000, 10_000, r5=1.2, r15=1.5, q5=100_000, n5=500)
+        hype = feature("HYPEUSDT", 1_000_000, 5_000, r5=3.0, r15=3.0, q5=500_000, n5=2_000)
+        smart.score_features([core, hype])
+        scores = {
+            "COREUSDT": smart.ScanScore("COREUSDT", "15m", 82.0, True, "UP", 1),
+            "HYPEUSDT": smart.ScanScore("HYPEUSDT", "1m", 100.0, True, "UP", 1),
+        }
+        rows = smart.top_radar_rows([core, hype], scores, limit=2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["symbol"], "COREUSDT")
+        self.assertEqual(rows[0]["label"], "POTENSI_TINGGI")
+        self.assertEqual(rows[1]["label"], "EMERGING")
+        self.assertNotIn("ACTIONABLE", {row["label"] for row in rows})
+
 
 if __name__ == "__main__":
     unittest.main()

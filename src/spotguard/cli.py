@@ -87,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check", help="validate config and local safety prerequisites")
     subparsers.add_parser("status", help="show current mode, ledger, MCP, and skill status")
     subparsers.add_parser("symbols", help="validate and show configured Binance Spot symbols")
+    radar_parser = subparsers.add_parser("radar", help="show the latest read-only Smart Radar potential ranking")
+    radar_parser.add_argument("--limit", type=int, default=5)
 
     paper_approve = subparsers.add_parser("paper-approve", help="approve one paper proposal with its one-time code")
     paper_approve.add_argument("proposal_id")
@@ -509,6 +511,8 @@ def _run(args: argparse.Namespace) -> Any:
         return service.status()
     if args.command == "symbols":
         return service.symbols_status()
+    if args.command == "radar":
+        return service.smart_radar(args.limit)
     if args.command == "paper-approve":
         return service.paper_text_approve(args.proposal_id, args.code, args.sender_id, args.chat_id)
     if args.command == "paper-reject":
@@ -545,6 +549,8 @@ def _run(args: argparse.Namespace) -> Any:
             return service.analyze_market(intent["symbol"], amount)
         if intent["action"] == "ranking":
             return service.compare_markets()
+        if intent["action"] == "radar":
+            return {"intent": intent, **service.smart_radar()}
         if intent["action"] == "buy":
             return {"intent": intent, **service.create_manual_buy_proposal(
                 intent["symbol"], Decimal(intent["quote_amount"]),

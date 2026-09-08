@@ -84,6 +84,32 @@ class RoutingLocaleIntegrationTests(unittest.TestCase):
             self.assertIn("routes directly through `trade-intent`", text)
             self.assertIn("Explicitly named unrelated platforms remain outside this skill", text)
 
+    def test_top_radar_intent_and_cli_are_read_only_local_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_config(Path(directory))
+            settings = load_settings(config)
+            state = settings.state_dir / "smart-scanner"
+            state.mkdir(parents=True)
+            (state / "top-radar.json").write_text(json.dumps({
+                "generated_at": "2026-09-09T00:00:00+00:00", "active_count": 48,
+                "used_weight_1m": 116,
+                "rows": [{
+                    "symbol": "VETUSDT", "lane": "MOMENTUM", "potential_score": 84.5,
+                    "label": "POTENSI_TINGGI", "configured": True, "native_score": 80.0,
+                    "native_interval": "15m", "candidate_eligible": True,
+                    "core_score": 76.0, "momentum_score": 92.0, "hype_score": 71.0,
+                    "ret_5m_pct": 0.4, "ret_15m_pct": 1.2, "spread_pct": 0.02,
+                }],
+            }), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--config", str(config), "--json", "--locale", "id", "radar"])
+        self.assertEqual(code, 0, output.getvalue())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["top_radar"][0]["symbol"], "VETUSDT")
+        self.assertIn("bukan kandidat", payload["presentation"]["text"])
+        self.assertEqual(normalize_paper_intent("radar potensi", ("BTCUSDT",))["action"], "radar")
+
 
 if __name__ == "__main__":
     unittest.main()

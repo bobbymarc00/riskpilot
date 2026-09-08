@@ -29,6 +29,8 @@ def normalize_paper_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
         return {"action": "positions"}
     if (set(words) & {"live", "real", "nyata"}) and (set(words) & {"balance", "saldo"}):
         return {"action": "live_balance", "message": t("intent.live_balance")}
+    if lowered.rstrip(" ?.!" ) in {"radar", "top radar", "radar potensi", "top potential radar"}:
+        return {"action": "radar"}
     if lowered.rstrip(" ?.!") in vocabulary("input.ranking"):
         return {"action": "ranking"}
     if words and words[0] in vocabulary("input.analysis"):

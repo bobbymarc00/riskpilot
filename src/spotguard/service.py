@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import secrets
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -468,6 +469,50 @@ class SpotGuard:
                 self.ledger.add_event("symbol.validation_rejected", symbol, item)
         return {"configured": list(self.settings.market.symbols), "enabled": enabled,
             "rejected": rejected, "validated_at": isoformat()}
+
+    def smart_radar(self, limit: int = 5) -> dict[str, Any]:
+        """Return the scanner's persisted observation-only ranking.
+
+        This deliberately does not contact Binance, mutate scanner state, or
+        invoke candidate/proposal/execution code.
+        """
+        if not 1 <= limit <= 10:
+            raise SpotGuardError("radar limit must be between 1 and 10")
+        path = self.settings.state_dir / "smart-scanner" / "top-radar.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SpotGuardError("Smart Radar has no verified local snapshot yet") from exc
+        if not isinstance(raw, dict) or not isinstance(raw.get("generated_at"), str) or not isinstance(raw.get("rows"), list):
+            raise SpotGuardError("Smart Radar local snapshot is invalid")
+        required = {"symbol", "lane", "potential_score", "label", "configured", "core_score", "momentum_score", "hype_score", "ret_5m_pct", "ret_15m_pct", "spread_pct"}
+        rows = [row for row in raw["rows"] if isinstance(row, dict) and required <= set(row)]
+        if len(rows) != len(raw["rows"]):
+            raise SpotGuardError("Smart Radar local snapshot is invalid")
+        rows = rows[:limit]
+        if self.locale == "id":
+            lines = ["📡 RISKPILOT TOP RADAR POTENSI", f"Snapshot: {raw['generated_at']} · Universe: {raw.get('active_count', '?')} aktif"]
+            for index, row in enumerate(rows, 1):
+                native = "belum ada candle tertutup" if row.get("native_score") is None else f"{row['native_score']}/100 ({row.get('native_interval')})"
+                lines.append(
+                    f"#{index} {row['symbol']} · {row['label']} · {row['lane']}\n"
+                    f"Potensi: {row['potential_score']}/100 · Native: {native}\n"
+                    f"Core {row['core_score']} · Momentum {row['momentum_score']} · Hype {row['hype_score']}\n"
+                    f"5m {row['ret_5m_pct']:+.3f}% · 15m {row['ret_15m_pct']:+.3f}% · spread {row['spread_pct']:.3f}%"
+                )
+            lines.append("Observasi read-only lintas lane; bukan kandidat, proposal, atau instruksi entry. AI REVIEW hanya muncul bila flow kandidat 15m yang ada lolos semua validasi.")
+        else:
+            lines = ["📡 RISKPILOT TOP POTENTIAL RADAR", f"Snapshot: {raw['generated_at']} · Universe: {raw.get('active_count', '?')} active"]
+            for index, row in enumerate(rows, 1):
+                native = "no closed-candle score yet" if row.get("native_score") is None else f"{row['native_score']}/100 ({row.get('native_interval')})"
+                lines.append(
+                    f"#{index} {row['symbol']} · {row['label']} · {row['lane']}\n"
+                    f"Potential: {row['potential_score']}/100 · Native: {native}\n"
+                    f"Core {row['core_score']} · Momentum {row['momentum_score']} · Hype {row['hype_score']}\n"
+                    f"5m {row['ret_5m_pct']:+.3f}% · 15m {row['ret_15m_pct']:+.3f}% · spread {row['spread_pct']:.3f}%"
+                )
+            lines.append("Cross-lane read-only observation; not a candidate, proposal, or entry instruction. AI REVIEW appears only when the existing 15m candidate flow passes every validation.")
+        return {"top_radar": rows, "generated_at": raw["generated_at"], "presentation": {"locale": self.locale, "text": "\n\n".join(lines)}}
 
     def _confirm_prefilter_candle(self, symbol: str, expected: Kline,
                                   *, record_event: bool = True) -> dict[str, Any]:
