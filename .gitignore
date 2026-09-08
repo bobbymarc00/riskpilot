@@ -26,6 +26,8 @@ ENV/
 
 # Runtime configuration and environment
 config.json
+config.local.*
+config.*.local
 # Production config backups are runtime artifacts too.  Keep rollback copies local.
 config.json.*
 .env
@@ -100,6 +102,7 @@ id_ed25519
 *.bak-*
 *.backup
 *.backup-*
+*.before-*
 *.pre-oauth-*
 *.pre-old-oauth-*
 *.tmp
