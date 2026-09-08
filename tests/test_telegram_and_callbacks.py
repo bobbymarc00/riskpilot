@@ -40,7 +40,7 @@ class TelegramAndCallbackTests(unittest.TestCase):
                 len(("tgcmd:" + candidate_buttons[0]["command"]).encode()),
                 64,
             )
-)
+
 self.assertNotIn("value", candidate_buttons[0])
             result = service.create_proposal(
                 candidate["id"],
