@@ -34,7 +34,7 @@ RiskPilot uses:
 6. Owner-bound human approval.
 7. A separate dedicated Agent OS / MCP execution profile for supported LIVE Spot writes.
 8. Protected TP / SL lifecycle management.
-9. Fail-closed reconciliation for ambiguous execution results.
+9. Fail-closed handling for ambiguous execution results: targeted read-back where implemented, otherwise `RECONCILE` with no blind retry.
 
 The language-model-facing layer can interact, explain, and orchestrate supported workflows, but it does not define RiskPilot's market score or override deterministic execution boundaries.
 
@@ -64,7 +64,7 @@ Agent OS does not calculate the RiskPilot score and does not choose the winning 
 
 ### LIVE execution
 
-LIVE execution uses a separate dedicated execution profile.
+LIVE execution uses a separate dedicated execution profile and authenticated direct MCP transport.
 
 The supported write surface is deliberately restricted to the Spot operations required by RiskPilot:
 
@@ -72,7 +72,7 @@ The supported write surface is deliberately restricted to the Spot operations re
 * SELL OCO protection restore;
 * cancellation of the exact active protected OCO;
 * approved MARKET SELL exit;
-* protected partial exit using cancel → sell → re-arm.
+* protected partial exit using cancel → verify → sell → re-arm.
 
 Every LIVE write remains gated by deterministic policy, local LIVE arming, owner-bound approval, immutable proposal validation, and Binance response checks.
 
@@ -102,6 +102,7 @@ The Binance.com history view is an out-of-band user verification step. RiskPilot
 * **GitHub:** https://github.com/bobbymarc00/riskpilot
 * **YouTube demo:** https://youtu.be/aYC23eYYUx0
 * **X submission:** https://x.com/bobbymarc00/status/2097039814482878806
+* **Public LIVE evidence bridge:** [LIVE_EVIDENCE.md](LIVE_EVIDENCE.md)
 
 ## Demonstrated Capabilities
 
@@ -158,7 +159,7 @@ The intended execution surface does not support:
 
 LIVE execution also requires a short-lived local arm. Remote natural-language input cannot independently arm LIVE trading.
 
-Unknown or ambiguous financial write results are not automatically retried.
+Unknown or ambiguous financial write results are not automatically retried. The protected partial-exit cancellation path includes targeted open-order read-back verification; generic automatic reconciliation for every ambiguous Binance write is intentionally unavailable in this release.
 
 ## Current Public Example Limits
 
@@ -194,12 +195,14 @@ Manual analysis and owner-approved LIVE workflows remain separate.
 
 ## Reproducible Offline Evaluation
 
-The safe local evaluation path does not require a real Binance write:
+The safe local evaluation path does not require Binance OAuth and cannot make a real financial write:
 
 ```bash
 ./scripts/demo-track-a.sh
 ./scripts/verify.sh
 ```
+
+This offline path proves deterministic behavior and safety invariants. The authenticated real-funds path is evidenced separately by the public demo and [LIVE_EVIDENCE.md](LIVE_EVIDENCE.md).
 
 The repository maps critical capabilities to implementation files and automated tests in:
 
@@ -212,6 +215,8 @@ The repository maps critical capabilities to implementation files and automated 
 
 * PAPER fills are simulations, not exchange fills.
 * LIVE execution is experimental.
+* Authenticated LIVE writes require a private local OAuth runtime profile and therefore are not executed by public CI.
+* Generic automatic reconciliation for every ambiguous LIVE write is not implemented; unresolved outcomes remain `RECONCILE` and must not be blindly retried.
 * The scheduled scanner is currently disabled during rate-limit optimization.
 * LIVE operation depends on Binance account permissions, exchange filters, and supported Agent OS / MCP capabilities.
 * Ambiguous LIVE results require reconciliation rather than automatic retry.

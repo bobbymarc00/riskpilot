@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 import json
-import os
-import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -40,11 +38,12 @@ class LiveReadiness:
 
 
 class LiveExecutionAdapter:
-    """Hard boundary for a future exact Binance protected Spot write.
+    """Fail-closed boundary for authenticated protected Binance Spot writes.
 
-    No write transport is installed in this release. The adapter validates immutable
-    approved intent and fails closed until exact MCP schema, scopes, native confirmation,
-    OPO/OCO protection, and reconciliation are verified.
+    The adapter submits only fixed allowlisted Spot request shapes through the
+    dedicated Binance Agent OS/MCP execution profile. Every write is derived
+    from immutable approved intent, validated before and after submission, and
+    ambiguous outcomes are never automatically retried.
     """
     server = BINANCE_MCP_SERVER
     # Binance Agentic MCP uses one generic envelope. The delegated name is
@@ -296,8 +295,11 @@ class LiveExecutionAdapter:
             raise SecurityError("protected Spot TP/SL leg status is unsafe; reconciliation required")
 
     def reconcile(self, proposal_id: str) -> None:
+        """Refuse generic automatic reconciliation rather than guessing exchange state."""
         self.client_ids(proposal_id)
-        raise SecurityError("reconciliation transport is unavailable; outcome remains unknown and must not be retried")
+        raise SecurityError(
+            "generic automatic reconciliation is unavailable; outcome remains unknown and must not be retried"
+        )
 
     def _direct_mcp_result(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Call the dedicated OAuth MCP profile without an LLM subprocess."""
@@ -347,12 +349,12 @@ class LiveExecutionAdapter:
         raise SecurityError("protected Binance MCP response is malformed; reconciliation required")
 
     def execute(self, proposal: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Submit one already-confirmed protected request through Codex MCP.
+        """Submit one approved protected request through the dedicated Binance MCP transport.
 
         The caller supplies no endpoint or arguments; both are derived from the
-        immutable proposal.  A failed/ambiguous child result is intentionally
-        surfaced to the service so it can mark the proposal RECONCILE rather
-        than retrying a possibly accepted Binance request.
+        immutable proposal. A failed or ambiguous transport result is surfaced
+        to the service so it can mark the proposal RECONCILE instead of retrying
+        a request that Binance may already have accepted.
         """
         request = self.protected_request(proposal)
         home = self.settings.codex.agent_os_home
@@ -369,61 +371,6 @@ class LiveExecutionAdapter:
         if not is_close and not is_cancel:
             self.validate_protective_legs(response, proposal)
         return dict(response)
-        prompt = (
-            "Use only the Binance MCP tool_execute tool exactly once. "
-            "Do not use shell, files, web, or any other tool. Call it with this exact JSON envelope: "
-            + json.dumps(request, sort_keys=True, separators=(",", ":"))
-            + ". Return only the MCP result."
-        )
-        command = [
-            self.settings.codex.command, "exec", "--json", "--sandbox", "read-only",
-            "--skip-git-repo-check", "--ephemeral", "-c",
-            f'mcp_servers.{server}.tools.tool_execute.approval_mode="approve"', prompt,
-        ]
-        environment = {key: value for key, value in os.environ.items()
-                       if key in {"LANG", "LC_ALL", "PATH", "SHELL", "TERM"}}
-        environment["CODEX_HOME"] = str(home)
-        environment.setdefault("PATH", os.defpath)
-        environment.setdefault("SHELL", "/bin/sh")
-        try:
-            result = subprocess.run(command, cwd=str(workspace), env=environment,
-                                    text=True, capture_output=True,
-                                    timeout=self.settings.codex.timeout_seconds, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SecurityError("protected Binance execution transport did not complete; reconciliation required") from exc
-        if result.returncode != 0:
-            raise SecurityError("protected Binance execution transport failed; reconciliation required")
-        calls: list[dict[str, Any]] = []
-        for line in result.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item") if isinstance(event, dict) else None
-            if (isinstance(item, dict) and item.get("type") == "mcp_tool_call"
-                    and event.get("type") == "item.completed"):
-                calls.append(item)
-        if len(calls) != 1:
-            raise SecurityError("protected Binance execution used an unexpected number of MCP calls; reconciliation required")
-        call = calls[0]
-        if (call.get("server") != server or call.get("tool") != self.tool_name
-                or call.get("arguments") != request or call.get("status") != "completed" or call.get("error")):
-            raise SecurityError("protected Binance execution did not match the approved Spot OTOCO request; reconciliation required")
-        result_data = call.get("result")
-        response = result_data.get("structured_content") if isinstance(result_data, Mapping) else None
-        if response is None and isinstance(result_data, Mapping):
-            content = result_data.get("content")
-            if (isinstance(content, list) and len(content) == 1
-                    and isinstance(content[0], Mapping) and isinstance(content[0].get("text"), str)):
-                try:
-                    response = json.loads(content[0]["text"])
-                except json.JSONDecodeError:
-                    response = None
-        if not isinstance(response, Mapping):
-            raise SecurityError("protected Binance execution response is malformed; reconciliation required")
-        self.validate_write_response(response)
-        return dict(response)
-
     def read_spot_account(self) -> dict[str, Any]:
         response = self._read_exact("account")
         balances = response.get("balances") if isinstance(response, Mapping) else None
@@ -459,49 +406,6 @@ class LiveExecutionAdapter:
             raise SecurityError("dedicated Binance execution profile is not configured")
         request = {"toolName": tool_name, "arguments": arguments}
         return self._decode_mcp_result(self._direct_mcp_result(request))
-        prompt = ("Use only the Binance MCP tool_execute tool exactly once. Do not use shell, files, web, "
-                  "or any other tool. Call it with this exact JSON envelope: "
-                  + json.dumps(request, sort_keys=True, separators=(",", ":")) + ". Return only the MCP result.")
-        command = [self.settings.codex.command, "exec", "--json", "--sandbox", "read-only",
-                   "--skip-git-repo-check", "--ephemeral", "-c",
-                   f'mcp_servers.{self.settings.codex.mcp_server}.tools.tool_execute.approval_mode="approve"', prompt]
-        environment = {key: value for key, value in os.environ.items() if key in {"LANG", "LC_ALL", "PATH", "SHELL", "TERM"}}
-        environment["CODEX_HOME"] = str(home); environment.setdefault("PATH", os.defpath); environment.setdefault("SHELL", "/bin/sh")
-        try:
-            result = subprocess.run(command, cwd=str(workspace), env=environment, text=True, capture_output=True,
-                                    timeout=self.settings.codex.timeout_seconds, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SecurityError("protected Spot account read did not complete") from exc
-        if result.returncode != 0:
-            raise SecurityError("protected Spot account read failed")
-        calls = []
-        for line in result.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item") if isinstance(event, dict) else None
-            if isinstance(item, Mapping) and item.get("type") == "mcp_tool_call" and event.get("type") == "item.completed":
-                calls.append(item)
-        if len(calls) != 1:
-            raise SecurityError("protected Spot account read used an unexpected number of MCP calls")
-        call = calls[0]
-        if (call.get("server") != self.settings.codex.mcp_server or call.get("tool") != self.tool_name
-                or call.get("arguments") != request or call.get("error") or call.get("status") != "completed"):
-            raise SecurityError("protected Spot account read did not match the approved request")
-        result_data = call.get("result")
-        if not isinstance(result_data, Mapping) or result_data.get("isError") is True:
-            raise SecurityError("protected Spot account read returned an error")
-        if result_data.get("structured_content") is not None:
-            return result_data["structured_content"]
-        content = result_data.get("content")
-        if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], Mapping) or not isinstance(content[0].get("text"), str):
-            raise SecurityError("protected Spot account read response is malformed")
-        try:
-            return json.loads(content[0]["text"])
-        except json.JSONDecodeError as exc:
-            raise SecurityError("protected Spot account read response is malformed") from exc
-
 
     @classmethod
     def validate_tool(cls, server: str, tool: str) -> None:

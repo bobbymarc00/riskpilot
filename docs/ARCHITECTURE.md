@@ -29,10 +29,14 @@ flowchart LR
 4. At most one top candidate is confirmed through one fixed Agent OS read-only `spot.klines` request.
 5. Exact candle time/OHLC matching gates deterministic proposal logic.
 6. Telegram carries immutable proposal details and owner-bound controls.
-7. PAPER execution updates SQLite atomically. LIVE supports owner-approved Spot OTOCO entry, OCO restore, exact-OCO cancel, protected partial exit, and protected full exit; every ambiguous outcome is RECONCILE with no automatic retry.
+7. PAPER execution updates SQLite atomically. LIVE supports owner-approved Spot OTOCO entry, OCO restore, exact-OCO cancel, protected partial exit, and protected full exit. An unresolved write outcome is persisted as `RECONCILE` and is never automatically retried.
 
 Scoring does not use Agent OS. Agent OS is a narrow confirmation stage after the public-data prefilter.
 
 SQLite uses WAL, busy timeout, transactions, proposal leases, idempotent fills, epoch-aware accounting, and append-only audit evidence. Legacy internal identifiers keep existing ledgers readable.
 
-LIVE is isolated behind an adapter that constructs a narrow allowlist of fixed Spot write shapes: protected LIMIT BUY OTOCO, SELL OCO restore, exact protected-OCO cancellation, and exact MARKET SELL exit. It requires a dedicated profile, local arm, native Telegram confirmation, response validation, post-cancel order-list verification, and reconciliation on failure.
+LIVE is isolated behind an adapter that constructs a narrow allowlist of fixed Spot write shapes: protected LIMIT BUY OTOCO, SELL OCO restore, exact protected-OCO cancellation, and exact MARKET SELL exit. It requires a dedicated profile, local arm, native Telegram confirmation, response validation, and post-cancel order-list verification.
+
+Reconciliation is intentionally bounded: the partial-exit path performs a targeted open-order read-back when OCO cancellation acknowledgement is ambiguous. Other ambiguous financial writes transition to `RECONCILE`; generic automatic recovery is not implemented and the request is not blindly retried.
+
+See [LIVE_EVIDENCE.md](LIVE_EVIDENCE.md) for the public real-funds evidence bridge and the exact offline-versus-LIVE evidence boundary.

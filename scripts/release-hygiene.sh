@@ -7,3 +7,9 @@ if printf '%s\n' "$files" | grep -Eiq "$patterns"; then
   printf '%s\n' 'release hygiene failed: sensitive or generated publication candidate found' >&2
   exit 1
 fi
+
+# Prevent obsolete pre-LIVE wording from contradicting the authenticated transport.
+if git grep -n -E 'No write transpor[t] is installed in this release|Hard boundary for a futur[e] exact Binance protected Spot write' -- . ':!scripts/release-hygiene.sh'; then
+  printf '%s\n' 'release hygiene failed: obsolete protected-live wording found' >&2
+  exit 1
+fi

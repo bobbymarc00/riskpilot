@@ -7,6 +7,8 @@
 [![Demo](https://img.shields.io/badge/YouTube-Live%20Demo-red?logo=youtube)](https://youtu.be/aYC23eYYUx0)
 [![X Submission](https://img.shields.io/badge/X-Submission-black?logo=x)](https://x.com/bobbymarc00/status/2097039814482878806)
 
+[Public LIVE evidence bridge](docs/LIVE_EVIDENCE.md)
+
 **Binance Agent OS Mini Hackathon — Track A**
 
 ---
