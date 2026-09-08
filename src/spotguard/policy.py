@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from typing import Any
 
 from .config import Settings
@@ -15,6 +15,35 @@ class PolicyError(RuntimeError):
 
 def _proposal_id() -> str:
     return f"p-{secrets.token_hex(6)}"
+
+
+def _exact_decimal_string(value: Decimal) -> str:
+    """Render a finite Decimal without discarding precision."""
+    rendered = format(value, "f").rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def _canonical_paper_bracket(entry_reference: Decimal, stop_reference: Decimal,
+                             minimum_reward_risk: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """Return a PAPER bracket whose persisted price references remain self-consistent.
+
+    Proposal prices are persisted to eight decimal places.  Derive the target from
+    the persisted entry/stop distance rather than independently truncating a target
+    derived from higher-precision references.  Rounding the target upward preserves
+    the configured minimum reward/risk after serialization.
+    """
+    entry = Decimal(decimal_string(entry_reference, 8))
+    stop = Decimal(decimal_string(stop_reference, 8))
+    if stop <= 0 or stop >= entry:
+        raise PolicyError("serialized PAPER stop reference is invalid")
+    quantum = Decimal("0.00000001")
+    target = (entry + (entry - stop) * minimum_reward_risk).quantize(
+        quantum, rounding=ROUND_UP
+    )
+    reward_risk = (target - entry) / (entry - stop)
+    if reward_risk < minimum_reward_risk:
+        raise PolicyError("serialized PAPER reward/risk is below the configured minimum")
+    return entry, stop, target, reward_risk
 
 
 def entry_policy_terms(settings: Settings, *, candidate_price: Any,
@@ -92,6 +121,10 @@ def build_proposal(
     stop_reference = terms["stop_reference"]
     take_profit_reference = terms["take_profit_reference"]
     reward_risk = terms["reward_risk"]
+    if mode == "paper":
+        entry_reference, stop_reference, take_profit_reference, reward_risk = _canonical_paper_bracket(
+            entry_reference, stop_reference, settings.risk.min_reward_risk
+        )
 
     now = utcnow()
     proposal_id = _proposal_id()
@@ -114,7 +147,10 @@ def build_proposal(
         "entry_limit_price": decimal_string(entry_reference, 8) if mode == "live" else None,
         "stop_reference": decimal_string(stop_reference, 8),
         "take_profit_reference": decimal_string(take_profit_reference, 8),
-        "reward_risk": decimal_string(reward_risk, 4),
+        # PAPER may need more than four decimal places to faithfully represent
+        # the ratio implied by its persisted eight-decimal price references.
+        "reward_risk": (_exact_decimal_string(reward_risk) if mode == "paper"
+                        else decimal_string(reward_risk, 4)),
         "mode": mode,
         "source": source,
         "approval_owner_id": settings.openclaw.telegram_owner_id,

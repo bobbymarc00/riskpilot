@@ -21,9 +21,11 @@ def normalize_paper_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
         return {"action": "clarify", "message": t("intent.direct")}
     words = re.findall(r"-?\d+(?:\.\d+)?|[a-zA-Z]+|[%?]", lowered)
     has_trade_verb = bool(set(words) & (BUY_WORDS | CLOSE_WORDS))
-    if not has_trade_verb and set(words) & {"balance", "balances", "saldo"}:
+    if not has_trade_verb and lowered in vocabulary("input.status"):
+        return {"action": "status"}
+    if not has_trade_verb and lowered in vocabulary("input.balance"):
         return {"action": "balance"}
-    if not has_trade_verb and set(words) & {"position", "positions", "posisi"}:
+    if not has_trade_verb and lowered in vocabulary("input.positions"):
         return {"action": "positions"}
     if (set(words) & {"live", "real", "nyata"}) and (set(words) & {"balance", "saldo"}):
         return {"action": "live_balance", "message": t("intent.live_balance")}
@@ -49,12 +51,6 @@ def normalize_paper_intent(text: str, allowed_symbols: tuple[str, ...], locale: 
         return {"action": "info", "message": t("intent.question")}
     if any(word in CONDITIONAL for word in words):
         return {"action": "unsupported", "message": t("intent.conditional")}
-    if lowered in vocabulary("input.positions"):
-        return {"action": "positions"}
-    if lowered in vocabulary("input.balance"):
-        return {"action": "balance"}
-    if lowered in vocabulary("input.status"):
-        return {"action": "status"}
     if any(word in vocabulary("input.reject") for word in words) and "pending" in words:
         return {"action":"reject_pending","buy_deferred":any(word in BUY_WORDS for word in words),
                 "message":t("intent.rejected_pending")}

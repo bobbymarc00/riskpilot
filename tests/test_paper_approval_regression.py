@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -12,8 +13,10 @@ from unittest.mock import patch
 from spotguard.cli import _dispatch_callback
 from spotguard.config import load_settings
 from spotguard.market import SpotMarketSnapshot, synthetic_bullish_klines
+from spotguard.policy import build_proposal
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
+from spotguard.strategy import Signal
 from spotguard.util import isoformat, utcnow
 from tests.helpers import write_config
 
@@ -70,6 +73,38 @@ class PaperApprovalRegressionTests(unittest.TestCase):
             result = service.paper_text_approve(proposal["id"], code,
                 settings.openclaw.telegram_owner_id, settings.telegram.chat_id)
             self.assertTrue(result["ok"])
+
+    def test_vet_scale_proposal_approves_after_canonical_bracket_serialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(write_config(Path(directory)))
+            settings = replace(settings, market=replace(settings.market, symbols=("VETUSDT",)))
+            service = SpotGuard(settings)
+            signal = Signal(
+                "c-0123456789ab", "vet-approval-regression", "VETUSDT", "15m",
+                "BUY", 80, 0.007956, 1, ("test",), {"atr_14": "0.0000984695"},
+            )
+            candidate, _ = service.ledger.create_candidate(signal, 15)
+            values = build_proposal(
+                settings, candidate, Decimal("0.00795"), Decimal("0.007956"),
+                Decimal("6"), "VET PAPER approval regression.", proposal_mode="paper",
+            )
+            code = service.signer.paper_confirmation_code(values["canonical_json"])
+            token = service.signer.approval_token(values["canonical_json"])
+            service.ledger.create_proposal(
+                values, service.signer.token_hash(token), settings.risk.max_active_proposals,
+                service.signer.token_hash(code),
+            )
+            snapshot = SpotMarketSnapshot(
+                "VETUSDT", Decimal("0.00795"), Decimal("0.007956"),
+                Decimal("0.007956"), Decimal("5"), Decimal("0.1"), "TRADING", 1,
+            )
+            with patch("spotguard.service.fetch_spot_snapshot", return_value=snapshot):
+                result = service.paper_text_approve(
+                    values["id"], code, settings.openclaw.telegram_owner_id,
+                    settings.telegram.chat_id,
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["proposal"]["status"], "EXECUTED")
 
     @patch("spotguard.service.fetch_klines", return_value=synthetic_bullish_klines())
     @patch("spotguard.service.fetch_spot_snapshot", return_value=SNAPSHOT)

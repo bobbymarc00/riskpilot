@@ -14,6 +14,20 @@ It does **not** modify:
 
 The new scanner is a parallel **read-only discovery/ranking layer**.
 
+## Verified deployment status
+
+The Smart Scanner is enabled on the RiskPilot VPS through the user-level
+`riskpilot-smart-scanner.timer`.  Its first enabled cycle completed with
+`status=0/SUCCESS`; the timer then schedules the next cycle approximately five
+minutes later (plus its configured randomized delay).
+
+Observed healthy cycles have covered roughly 480 eligible Spot/USDT symbols,
+kept a 64-symbol watchlist and a 48-symbol active universe, and reported
+`used_weight_1m` in the 116–196 range out of Binance's 6000/minute budget.
+Those values are observations, not static guarantees: the scanner adapts its
+active universe and stops kline work when its own lower safety thresholds are
+reached.
+
 ## Flow
 
 ```text
@@ -44,10 +58,21 @@ Every 5 minutes
     +-- alert top qualifying radar candidates
     |
     +-- if a top candidate is ALREADY in existing config:
-           hand it to the existing SpotGuard.scan() flow
+           hand only that candidate to the existing SpotGuard.scan() flow
+               -> normal RiskPilot candidate notification
+               -> native /binance_spotguard review CANDIDATE_ID button
+               -> fresh Agent OS review
+               -> PAPER proposal only after the existing checks pass
+               -> a separate PAPER approval remains required for a simulated fill
 ```
 
 Dynamic coins are **never automatically added to `market.symbols`**. This is deliberate. A newly discovered HYPE coin can be surfaced in its first hour, but it remains `RADAR ONLY` until you explicitly decide to expand the execution allowlist later.
+
+The scanner never directly creates a LIVE order, changes LIVE arming, expands
+the execution allowlist, or bypasses RiskPilot's fresh-price, approval,
+TP/SL, or risk validation. A candidate may also be withheld by the existing
+per-symbol cooldown/deduplication guard even when it has a qualifying scanner
+score.
 
 ## Rate safety
 
@@ -63,6 +88,11 @@ Internal guardrails are intentionally far below Binance's public limit:
 ```
 
 The design leaves at least ~85% of the documented 6000/min capacity outside the scanner's budget. A single all-market 24h ticker request currently costs 80 request weight. At a 5-minute cadence this averages about 16 weight/min before kline work.
+
+`circuit.json` is a fail-closed local circuit breaker. A `429` records a
+cooldown and skips further scanner work until it expires. A Binance `418` IP
+ban persistently disables Smart Scanner runs until an operator investigates and
+clears the circuit deliberately; it does not auto-retry around a ban.
 
 ## Local state
 
@@ -119,6 +149,12 @@ Only after the two manual tests above succeed:
 ```
 
 The installer enables **only** `riskpilot-smart-scanner.timer`. It does not enable or change `spotguard-monitor.timer`.
+
+The source service defines a bounded systemd PATH that includes
+`%h/.npm-global/bin` and `%h/.local/bin` before the standard system paths, so
+the user-installed `openclaw` command is available to the scanner. On an
+already-installed VPS, retain any working local PATH drop-in until this source
+unit has been reinstalled and `systemctl --user daemon-reload` has completed.
 
 Check it:
 

@@ -41,7 +41,7 @@ class TelegramAndCallbackTests(unittest.TestCase):
                 64,
             )
 
-self.assertNotIn("value", candidate_buttons[0])
+            self.assertNotIn("value", candidate_buttons[0])
             result = service.create_proposal(
                 candidate["id"],
                 Decimal(str(candidate["price"])) * Decimal("0.999"),

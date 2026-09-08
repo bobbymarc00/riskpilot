@@ -81,7 +81,7 @@ class RoutingLocaleIntegrationTests(unittest.TestCase):
             self.assertIn("An explicitly named unrelated platform or account always takes precedence", agents)
         for text in (source_skill, installed_skill):
             self.assertIn("After `/new`", text)
-            self.assertIn("routes directly through `paper-intent`", text)
+            self.assertIn("routes directly through `trade-intent`", text)
             self.assertIn("Explicitly named unrelated platforms remain outside this skill", text)
 
 

@@ -5,9 +5,10 @@ import unittest
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from dataclasses import replace
 
 from spotguard.config import load_settings
-from spotguard.policy import PolicyError, build_proposal
+from spotguard.policy import PolicyError, build_proposal, validate_claim
 from spotguard.service import SpotGuard
 from spotguard.util import isoformat, utcnow
 
@@ -87,6 +88,53 @@ class PolicyTests(unittest.TestCase):
             bid = ask * Decimal("0.99")
             with self.assertRaisesRegex(PolicyError, "spread"):
                 build_proposal(settings, candidate, bid, ask, Decimal("6"), "Wide spread.")
+
+    def test_low_price_paper_bracket_is_canonical_after_serialization(self) -> None:
+        """VET-scale references must remain approvable after eight-place storage."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(write_config(Path(directory)))
+            settings = replace(settings, market=replace(settings.market, symbols=("VETUSDT",)))
+            candidate = {
+                "id": "c-0123456789ab", "status": "ACTIVE", "side": "BUY",
+                "symbol": "VETUSDT", "price": "0.007956",
+                "expires_at": isoformat(utcnow() + timedelta(minutes=5)),
+                # This produces the formerly failing independently-truncated bracket.
+                "metrics": {"atr_14": "0.0000984695"},
+            }
+            proposal = build_proposal(
+                settings, candidate, Decimal("0.00795"), Decimal("0.007956"),
+                Decimal("6"), "Low-price PAPER bracket regression.",
+            )
+            canonical = proposal["canonical"]
+            entry = Decimal(canonical["entry_reference"])
+            stop = Decimal(canonical["stop_reference"])
+            target = Decimal(canonical["take_profit_reference"])
+            ratio = Decimal(canonical["reward_risk"])
+            self.assertEqual(canonical["take_profit_reference"], "0.00825142")
+            self.assertEqual((target - entry) / (entry - stop), ratio)
+            self.assertGreaterEqual(ratio, settings.risk.min_reward_risk)
+            proposal["status"] = "PENDING"
+            validate_claim(settings, proposal, Decimal("0"))
+
+    def test_high_price_paper_bracket_values_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(write_config(Path(directory)))
+            candidate = {
+                "id": "c-0123456789ab", "status": "ACTIVE", "side": "BUY",
+                "symbol": "BTCUSDT", "price": "100",
+                "expires_at": isoformat(utcnow() + timedelta(minutes=5)),
+                "metrics": {"atr_14": "1"},
+            }
+            proposal = build_proposal(
+                settings, candidate, Decimal("99.9"), Decimal("100"), Decimal("6"),
+                "High-price PAPER bracket regression.",
+            )
+            self.assertEqual(
+                {key: proposal["canonical"][key] for key in
+                 ("entry_reference", "stop_reference", "take_profit_reference", "reward_risk")},
+                {"entry_reference": "100", "stop_reference": "98.5",
+                 "take_profit_reference": "103", "reward_risk": "2"},
+            )
 
 
 if __name__ == "__main__":
