@@ -765,6 +765,20 @@ class Ledger:
             cutoff = max(day_prefix, reset["created_at"] if reset else day_prefix)
             return int(connection.execute("SELECT COUNT(*) FROM proposals WHERE mode='paper' AND status='EXECUTED' AND execution_status='FILLED' AND executed_at>=? AND substr(executed_at,1,10)=?", (cutoff, day_prefix)).fetchone()[0])
 
+    def committed_live_executions(self, day_prefix: str) -> int:
+        """Conservative quota evidence for LIVE writes recorded by this ledger.
+
+        A protected order-list acknowledgement is not a fill confirmation, but
+        it can still become an exchange fill. Count it against the daily entry
+        budget rather than allowing a replay or an unavailable fill report to
+        create extra capacity.
+        """
+        with self.connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM proposals WHERE mode='live' AND status='EXECUTED' "
+                "AND executed_at IS NOT NULL AND substr(executed_at,1,10)=?", (day_prefix,)
+            ).fetchone()[0])
+
     def terminalize_paper_proposal(self, proposal_id: str, reason: str) -> dict[str, Any]:
         now=isoformat()
         with self.transaction() as connection:

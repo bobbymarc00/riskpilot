@@ -14,6 +14,9 @@ from decimal import Decimal
 from .config import Settings
 
 EXCHANGE_INFO_CACHE_SECONDS = 86_400
+# Scanner/read-only flows may use the normal cache. LIVE preparation must use
+# recent exchange filters or fail closed when they cannot be refreshed.
+LIVE_EXCHANGE_INFO_MAX_AGE_SECONDS = 300
 _EXCHANGE_INFO_MEMORY: dict[str, dict[str, Any]] = {}
 
 
@@ -53,19 +56,19 @@ def _public_json(settings: Settings, path: str, params: dict[str, str]) -> Any:
         raise MarketError(f"invalid response from Binance market API: {exc}") from exc
 
 
-def _exchange_info_cache(settings: Settings) -> dict[str, Any]:
+def _exchange_info_cache(settings: Settings, *, maximum_age_seconds: int = EXCHANGE_INFO_CACHE_SECONDS) -> dict[str, Any]:
     """Cache one bulk exchangeInfo response for scanner and live validation."""
     path = settings.state_dir / "binance-exchange-info-cache.json"
     cached: dict[str, Any] | None = None
     cache_key = str(path)
     memory = _EXCHANGE_INFO_MEMORY.get(cache_key)
-    if memory is not None and time.time() - float(memory.get("fetched_at", 0)) < EXCHANGE_INFO_CACHE_SECONDS:
+    if memory is not None and time.time() - float(memory.get("fetched_at", 0)) < maximum_age_seconds:
         return memory
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(value, dict) and isinstance(value.get("symbols"), list):
             cached = value
-            if time.time() - float(value.get("fetched_at", 0)) < EXCHANGE_INFO_CACHE_SECONDS:
+            if time.time() - float(value.get("fetched_at", 0)) < maximum_age_seconds:
                 _EXCHANGE_INFO_MEMORY[cache_key] = value
                 return value
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -81,23 +84,26 @@ def _exchange_info_cache(settings: Settings) -> dict[str, Any]:
         _EXCHANGE_INFO_MEMORY[cache_key] = value
         return value
     except MarketError:
-        if cached is not None:
+        if cached is not None and time.time() - float(cached.get("fetched_at", 0)) < maximum_age_seconds:
             _EXCHANGE_INFO_MEMORY[cache_key] = cached
             return cached
         raise
 
 
-def _exchange_symbol(settings: Settings, symbol: str) -> dict[str, Any]:
-    for item in _exchange_info_cache(settings)["symbols"]:
+def _exchange_symbol(settings: Settings, symbol: str, *, maximum_age_seconds: int = EXCHANGE_INFO_CACHE_SECONDS) -> dict[str, Any]:
+    for item in _exchange_info_cache(settings, maximum_age_seconds=maximum_age_seconds)["symbols"]:
         if isinstance(item, dict) and item.get("symbol") == symbol:
             return item
     raise KeyError("symbol")
 
-def validate_spot_symbol(settings: Settings, symbol: str) -> dict[str, Any]:
+def validate_spot_symbol(settings: Settings, symbol: str, *, live: bool = False) -> dict[str, Any]:
     if symbol not in settings.market.symbols:
         raise SymbolValidationError(f"symbol is not configured: {symbol}")
     try:
-        item = _exchange_symbol(settings, symbol)
+        item = _exchange_symbol(
+            settings, symbol,
+            maximum_age_seconds=LIVE_EXCHANGE_INFO_MAX_AGE_SECONDS if live else EXCHANGE_INFO_CACHE_SECONDS,
+        )
     except MarketError as exc:
         raise SymbolValidationError(f"{symbol} exchangeInfo validation failed: {exc}") from exc
     try:

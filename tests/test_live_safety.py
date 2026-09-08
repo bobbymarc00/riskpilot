@@ -28,12 +28,23 @@ class LiveSafetyTests(unittest.TestCase):
 
  def test_status_distinguishes_default_order_size_from_entry_maxima(self):
   with tempfile.TemporaryDirectory() as d:
-   status=SpotGuard(configured(Path(d))).status()["limits"]
+   service_status=SpotGuard(configured(Path(d))).status()
+   self.assertEqual(service_status["version"],"1.0.1")
+   status=service_status["limits"]
    self.assertEqual(status["default_order_size_usdt"],"6.0")
    self.assertEqual(status["paper"]["max_quote_per_entry_usdt"],"100")
    self.assertEqual(status["live"]["max_quote_per_entry_usdt"],"100")
    self.assertEqual(status["paper"]["max_open_exposure_usdt"],"500")
    self.assertEqual(status["live"]["max_open_exposure_usdt"],"500")
+
+ def test_readiness_does_not_treat_profile_configuration_as_scope_proof(self):
+  with tempfile.TemporaryDirectory() as d:
+   readiness=LiveExecutionAdapter(configured(Path(d),enabled=True)).readiness(connected=True,armed=True,symbol_flags_verified=True)
+   self.assertTrue(hasattr(readiness,"execution_profile_configured"))
+   self.assertFalse(readiness.account_read_verified)
+   self.assertFalse(readiness.spot_trade_scope_verified)
+   self.assertFalse(readiness.write_schema_verified)
+   self.assertFalse(readiness.execution_ready)
 
  @patch("spotguard.service.fetch_klines",return_value=scaled_synthetic_klines(100))
  @patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET)
@@ -49,7 +60,7 @@ class LiveSafetyTests(unittest.TestCase):
  @patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET)
  def test_live_hundred_amount_fixture_is_proposal_only_and_above_is_rejected(self, market, klines):
   with tempfile.TemporaryDirectory() as d:
-   service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True)); service.live_status=Mock(return_value={"execution_ready":True})
+   service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True)); service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={})
    proposal=service.create_manual_buy_proposal("BTC",Decimal("100"),live=True)["proposal"]
    self.assertEqual(proposal["mode"],"live"); self.assertEqual(proposal["status"],"PENDING"); self.assertIsNone(proposal["execution_status"])
    with self.assertRaises(SecurityError): service.execute_paper(proposal["id"],"invalid")
@@ -92,7 +103,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_ready_fixture_live_buy_is_proposal_only(self, market, klines):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True))
-   service.live_status=Mock(return_value={"execution_ready":True})
+   service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={})
    proposal=service.create_manual_buy_proposal("BTC",Decimal("6"),live=True)["proposal"]
    self.assertEqual(proposal["mode"],"live"); self.assertEqual(proposal["order_type"],"LIMIT"); self.assertEqual(proposal["status"],"PENDING")
    self.assertIsNone(proposal["execution_status"])
@@ -127,6 +138,9 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertEqual(request["toolName"],"spot.newOrder")
    self.assertEqual(request["arguments"],{"symbol":"BTCUSDT","side":"SELL","type":"MARKET","quantity":0.06,"newClientOrderId":"sgc-1234567890ab"})
    self.assertEqual(adapter.validate_write_response({"orderId":7,"status":"FILLED"},close=True),"FILLED")
+   for status in ("NEW", "PARTIALLY_FILLED"):
+    with self.assertRaisesRegex(SecurityError,"reconciliation required"):
+     adapter.validate_write_response({"orderId":7,"status":status},close=True)
    malformed={**proposal,"canonical":{**proposal["canonical"],"side":"BUY"}}
    with self.assertRaises(SecurityError): adapter.protected_request(malformed)
 
@@ -148,21 +162,65 @@ class LiveSafetyTests(unittest.TestCase):
    with patch.object(service.ledger,"paper_balance",return_value={"open_positions":5,"active_tranches":10,"free_usdt":"100"}), patch.object(service.ledger,"list_paper_positions",return_value=[]):
     with self.assertRaisesRegex(Exception,"active PAPER tranche limit"): service._ensure_paper_entry_available("SOLUSDT",Decimal("6"))
 
+ def test_live_snapshot_enforces_reserve_and_records_projection(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"108","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=[])
+   service.live_executor.read_spot_trades=Mock(return_value=[])
+   projection=service._validate_live_entry_limits("BTCUSDT",Decimal("100"),Decimal("1"),Decimal("2"),Decimal("100"))
+   self.assertEqual(projection["projected_free_balance"],"8")
+   self.assertEqual(projection["projected_total_exposure"],"100")
+   self.assertTrue(projection["live_risk_snapshot_verified"])
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"107.99","locked":"0"}]})
+   with self.assertRaisesRegex(Exception,"reserve"):
+    service._validate_live_entry_limits("BTCUSDT",Decimal("100"),Decimal("1"),Decimal("2"),Decimal("100"))
+
+ def test_live_snapshot_refuses_unverified_sale_or_existing_position(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"1000","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=[])
+   service.live_executor.read_spot_trades=Mock(return_value=[{"isBuyer":False,"qty":"1","quoteQty":"100","time":1}])
+   with self.assertRaisesRegex(SecurityError,"realized loss"):
+    service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
+
+ def test_live_snapshot_refuses_unprotected_base_balance(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"1000","locked":"0"},{"asset":"BTC","free":"0.1","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=[])
+   with self.assertRaisesRegex(SecurityError,"not fully protected"):
+    service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
+
  @patch("spotguard.service.fetch_klines",return_value=scaled_synthetic_klines(100))
  @patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET)
  def test_only_one_pending_live_proposal(self, market, klines):
   with tempfile.TemporaryDirectory() as d:
-   service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True)); service.live_status=Mock(return_value={"execution_ready":True})
+   service=SpotGuard(configured(Path(d),enabled=True)); service.live_arm.status=Mock(return_value=Mock(armed=True)); service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={})
    service.create_manual_buy_proposal("BTC",Decimal("6"),live=True)
    with self.assertRaisesRegex(Exception,"maximum active"): service.create_manual_buy_proposal("ETH",Decimal("6"),live=True)
 
  @patch("spotguard.service.fetch_klines",return_value=scaled_synthetic_klines(100))
- def test_scheduled_live_mode_creates_proposal_not_execution(self, klines):
+ @patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET)
+ def test_scheduled_live_mode_creates_proposal_not_execution(self, market, klines):
   with tempfile.TemporaryDirectory() as d:
-   service=SpotGuard(configured(Path(d),enabled=True,scheduled="live")); service.live_status=Mock(return_value={"execution_ready":True})
+   service=SpotGuard(configured(Path(d),enabled=True,scheduled="live")); service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={"live_risk_snapshot_verified":True,"projected_free_balance":"994","projected_total_exposure":"6","projected_aggregate_risk":"1","live_entries_today":0,"live_daily_realized_loss":"0","live_weekly_realized_loss":"0","active_live_tranches":0,"active_live_economic_positions":0})
    candidate=service.scan(symbols=["BTCUSDT"],synthetic=True)["results"][0]["candidate"]
    result=service.create_proposal(candidate["id"],Decimal(str(candidate["price"]))*Decimal("0.999"),Decimal(str(candidate["price"])),Decimal("6"),"scheduled")
    self.assertEqual(result["proposal"]["mode"],"live"); self.assertEqual(result["proposal"]["status"],"PENDING"); self.assertIsNone(result["proposal"]["execution_status"])
+   canonical=result["proposal"]["canonical"]
+   self.assertIn("quantity",canonical); self.assertIn("pending_quantity",canonical)
+   self.assertTrue(canonical["live_risk_snapshot_verified"])
+   service._validate_live_entry_limits.assert_called_once()
+   token=service.signer.approval_token(result["proposal"]["canonical_json"])
+   claim=service.claim(result["proposal"]["id"],token,OWNER,OWNER)
+   self.assertEqual(service._validate_live_entry_limits.call_count,2)
+   service.live_arm.status=Mock(return_value=Mock(armed=True))
+   service.live_executor.execute=Mock(return_value={"orderListId":42,"listStatusType":"RESPONSE"})
+   executed=service.execute_live(result["proposal"]["id"],claim["lease"])
+   self.assertEqual(executed["status"],"EXECUTED")
+   self.assertEqual(service._validate_live_entry_limits.call_count,3)
 
  def test_paper_text_approval_cannot_cross_to_live(self):
   with tempfile.TemporaryDirectory() as d:
@@ -220,6 +278,18 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertEqual(rearm["toolName"],"spot.orderListOco")
    self.assertEqual(rearm["arguments"]["quantity"],0.04)
    self.assertEqual(rearm["arguments"]["belowPrice"],97.9)
+
+ def test_partial_exit_partial_fill_does_not_rearm(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=SpotGuard(configured(Path(d),enabled=True)).live_executor
+   proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-partial-exit","product":"SPOT","side":"SELL","order_type":"PARTIAL_EXIT","symbol":"BTCUSDT","quote_amount":"0","cancel_order_id":11,"order_list_id":12,"sell_quantity":"0.02","remaining_quantity":"0.04","market_step_size":"0.001","price_tick_size":"0.01","stop_reference":"98","take_profit_reference":"104"}}
+   replies=[{"structuredContent":{"orderId":11,"status":"CANCELED"}},{"structuredContent":{"orderId":14,"status":"PARTIALLY_FILLED"}}]
+   adapter._direct_mcp_result=Mock(side_effect=replies)
+   adapter.read_open_spot_orders=Mock(return_value=[])
+   adapter.read_spot_account=Mock(return_value={"balances":[{"asset":"BTC","free":"0.06"}]})
+   with self.assertRaisesRegex(SecurityError,"reconciliation required"):
+    adapter.execute_partial_exit(proposal)
+   self.assertEqual(adapter._direct_mcp_result.call_count,2)
 
  def test_partial_exit_does_not_sell_when_cancel_is_ambiguous(self):
   with tempfile.TemporaryDirectory() as d:

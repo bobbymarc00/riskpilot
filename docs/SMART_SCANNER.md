@@ -1,17 +1,12 @@
-# RiskPilot Smart Scanner — additive deadline-safe patch
+# RiskPilot Smart Scanner
 
-This patch intentionally leaves the existing RiskPilot flow untouched.
-
-It does **not** modify:
-
-- `src/spotguard/config.py`
-- `src/spotguard/market.py`
-- `src/spotguard/live_execution.py`
-- `config.json`
-- the old `spotguard-monitor.timer`
-- LIVE arming, risk policy, approval, execution, TP/SL, partial exit, or reconciliation
-
-The new scanner is a parallel **read-only discovery/ranking layer**.
+The scanner remains a parallel **read-only discovery/ranking layer**: it never
+adds symbols to the execution allowlist or submits an order. It is no longer an
+“additive-only” patch, however. Subsequent integration work intentionally
+updated RiskPilot service, policy, intent, Telegram, CLI, and tests so the
+scanner can persist radar state and hand configured symbols into the existing
+candidate flow. The safety boundary remains unchanged: discovery is not a
+candidate, proposal, or LIVE capability.
 
 ## Verified deployment status
 

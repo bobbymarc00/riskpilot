@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from spotguard.cli import _parse_callback
 from spotguard.config import load_settings
+from spotguard.db import LedgerError
 from spotguard.market import Kline, MarketError, SpotMarketSnapshot, synthetic_bullish_klines
 from spotguard.paper import build_fill_risk
 from spotguard.service import SpotGuard
@@ -60,6 +61,24 @@ class PaperPositionTests(unittest.TestCase):
             again = SpotGuard(settings)
             self.assertEqual(again.paper_migration["migrated"], [])
             self.assertEqual(len(again.ledger.list_paper_positions(True)), 1)
+
+    def test_malformed_legacy_fill_migration_raises_ledger_error(self):
+        """Startup migration must not turn an audit failure into NameError."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); settings = load_settings(write_config(root)); service = SpotGuard(settings)
+            with patch("spotguard.service.fetch_klines", return_value=synthetic_bullish_klines()), \
+                 patch("spotguard.service.fetch_spot_snapshot", return_value=SNAPSHOT):
+                proposal = service.create_manual_buy_proposal("BTCUSDT", Decimal("6"))["proposal"]
+                token = service.signer.approval_token(proposal["canonical_json"])
+                service.claim(proposal["id"], token, OWNER, OWNER)
+            # This has the legacy source/status shape but lacks immutable fill
+            # fields. It must fail closed with the ledger domain error.
+            service.ledger.finish_execution(
+                proposal["id"], service.ledger.get_proposal(proposal["id"], include_private=True)["execution_lease_hash"],
+                "EXECUTED", "paper-legacy", "FILLED", {"timestamp": isoformat()},
+            )
+            with self.assertRaisesRegex(LedgerError, "ambiguous"):
+                SpotGuard(settings)
 
     def test_fill_based_risk_fees_reward_and_balance(self):
         with tempfile.TemporaryDirectory() as directory:

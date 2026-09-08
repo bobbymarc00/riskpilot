@@ -14,7 +14,6 @@ jobs:
     env:
       PYTHONPATH: src
       NO_PROXY: "*"
-      no_proxy: "*"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -366,6 +366,15 @@ The public example configuration currently uses:
 | Paper/live separation                  | Enforced                         |
 | Automatic ambiguous-write retry        | Disabled                         |
 
+For every new LIVE entry, the policy takes a fresh authenticated snapshot of
+Spot balances, open OCO orders, and bounded Spot trade history when the
+proposal is created, claimed, and submitted. It fails closed if the 8 USDT
+reserve, exposure, tranche/position, per-position/aggregate-risk, or daily
+entry limits would be exceeded. A pre-existing base balance without a matching
+OCO, a historical sale whose cost basis cannot be proven from the bounded read,
+or truncated history blocks a new LIVE entry pending reconciliation; RiskPilot
+does not estimate a lower loss in those cases.
+
 ### Important: 6 USDT Is Not the Maximum
 
 ```text

@@ -21,11 +21,14 @@ FORBIDDEN_FAMILIES = ("futures", "margin", "convert", "wallet", "transfer", "pay
 @dataclass(frozen=True)
 class LiveReadiness:
     binance_mcp_connected: bool
-    agentic_account_accessible: bool
-    account_scope_available: bool
-    spot_trade_scope_available: bool
-    exact_spot_write_schema_verified: bool
-    protective_order_list_verified: bool
+    execution_profile_configured: bool
+    codex_login_reported: bool
+    account_read_verified: bool
+    open_orders_read_verified: bool
+    spot_trade_scope_verified: bool
+    write_tool_discovered: bool
+    write_schema_verified: bool
+    protective_order_capability_verified: bool
     symbol_exchange_flags_verified: bool
     live_limits_valid: bool
     live_enabled: bool
@@ -213,11 +216,11 @@ class LiveExecutionAdapter:
             self.validate_protective_legs(rearm_response, proposal)
         return {"orderId": sell_response["orderId"], "status": sell_response["status"], "partial_exit": {"cancel": cancel_response, "sell": sell_response, "rearm": rearm_response}}
 
-    def readiness(self, *, connected: bool, armed: bool, symbol_flags_verified: bool = False) -> LiveReadiness:
+    def readiness(self, *, connected: bool, armed: bool, symbol_flags_verified: bool = False,
+                  account_read_verified: bool = False, open_orders_read_verified: bool = False,
+                  spot_trade_scope_verified: bool = False, write_tool_discovered: bool = False,
+                  write_schema_verified: bool = False) -> LiveReadiness:
         blockers = []
-        # OAuth was completed against the dedicated execution profile.  The
-        # actual order call remains gated by the owner confirmation, local arm,
-        # exact OTOCO request construction, and response verification below.
         dedicated_execution_profile = (
             self.settings.codex.mcp_server == self.server
             and self.settings.codex.agent_os_home is not None
@@ -225,11 +228,20 @@ class LiveExecutionAdapter:
         )
         checks = {
             "binance_mcp_connected": connected and self.settings.codex.mcp_server == self.server,
-            "agentic_account_accessible": connected and dedicated_execution_profile,
-            "account_scope_available": connected and dedicated_execution_profile,
-            "spot_trade_scope_available": connected and dedicated_execution_profile,
-            "exact_spot_write_schema_verified": dedicated_execution_profile,
-            "protective_order_list_verified": dedicated_execution_profile and self.settings.live.protective_orders_available,
+            "execution_profile_configured": dedicated_execution_profile,
+            # Codex's login command reports its own session, not a successful
+            # Binance account read. Keep that distinction visible in status.
+            "codex_login_reported": connected,
+            "account_read_verified": account_read_verified,
+            "open_orders_read_verified": open_orders_read_verified,
+            # These require independent, server-provided evidence. A local
+            # profile or a pinned request dictionary is not such evidence.
+            "spot_trade_scope_verified": spot_trade_scope_verified,
+            "write_tool_discovered": write_tool_discovered,
+            "write_schema_verified": write_schema_verified,
+            "protective_order_capability_verified": (
+                self.settings.live.protective_orders_available and symbol_flags_verified
+            ),
             "symbol_exchange_flags_verified": symbol_flags_verified,
             "live_limits_valid": (self.settings.live.max_quote_per_entry_usdt == Decimal("100") and
                 self.settings.live.max_active_tranches == 10 and
@@ -266,9 +278,12 @@ class LiveExecutionAdapter:
             if not isinstance(response, Mapping) or not isinstance(response.get("orderId"), int):
                 raise SecurityError("malformed live Spot close response")
             status = response.get("status")
-            if status not in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
-                raise SecurityError("ambiguous live Spot close response requires reconciliation; do not retry")
-            return str(status)
+            # A market-close acknowledgement is not proof that its requested
+            # quantity filled.  Re-arming from a precomputed residual after a
+            # partial fill can leave the account unprotected or over-reserved.
+            if status != "FILLED":
+                raise SecurityError("live Spot close is not FILLED; reconciliation required; do not retry")
+            return "FILLED"
         if not isinstance(response, Mapping) or not isinstance(response.get("orderListId"), int):
             raise SecurityError("malformed protected Spot write response")
         status = response.get("listStatusType")
@@ -396,6 +411,30 @@ class LiveExecutionAdapter:
         if any(not isinstance(row, Mapping) or not isinstance(row.get("symbol"), str) for row in response):
             raise SecurityError("open Spot order response is malformed")
         return [{field: row[field] for field in fields if field in row} for row in response]
+
+    def read_spot_trades(self, symbol: str, start_time_ms: int) -> list[dict[str, Any]]:
+        """Read fixed Spot trade evidence; callers never control the tool name."""
+        if symbol not in self.settings.live.allowed_symbols or start_time_ms <= 0:
+            raise SecurityError("unapproved live trade-history read")
+        request = {"toolName": "spot.getMyTrades", "arguments": {
+            "symbol": symbol, "startTime": start_time_ms, "limit": 1000,
+        }}
+        response = self._decode_mcp_result(self._direct_mcp_result(request))
+        if not isinstance(response, list):
+            raise SecurityError("Spot trade history response is malformed")
+        if len(response) >= 1000:
+            raise SecurityError("Spot trade history is truncated; reconciliation required")
+        trades: list[dict[str, Any]] = []
+        for row in response:
+            if not isinstance(row, Mapping) or not isinstance(row.get("isBuyer"), bool):
+                raise SecurityError("Spot trade history row is malformed")
+            quantity = decimal_value(row.get("qty"), "trade_qty")
+            quote = decimal_value(row.get("quoteQty"), "trade_quote_qty")
+            if quantity <= 0 or quote <= 0:
+                raise SecurityError("Spot trade history row is invalid")
+            trades.append({"isBuyer": row["isBuyer"], "qty": format(quantity, "f"),
+                           "quoteQty": format(quote, "f"), "time": row.get("time")})
+        return trades
 
     def _read_exact(self, kind: str) -> Any:
         if kind not in self._READ_REQUESTS:

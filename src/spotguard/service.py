@@ -14,7 +14,7 @@ from . import __version__
 from .presentation import detect_locale, error_text, localized, number, render, translate
 from .codex_bridge import CodexAgentOSBridge
 from .config import Settings, openclaw_available
-from .db import Ledger
+from .db import Ledger, LedgerError
 from .indicators import analyze
 from .live_execution import LiveExecutionAdapter
 from .market import Kline, MarketError, SymbolValidationError, fetch_1m_candles_since, fetch_klines, fetch_spot_snapshot, floor_to_step, load_fixture, scaled_synthetic_klines, synthetic_bullish_klines, validate_spot_symbol
@@ -937,38 +937,7 @@ class SpotGuard:
                 values["canonical_json"] = canonical_json(values["canonical"])
 
         if live:
-            limit_price = floor_to_step(Decimal(values["entry_reference"]), market.price_tick_size)
-            stop_price = floor_to_step(Decimal(values["stop_reference"]), market.price_tick_size)
-            reward_risk = Decimal(values["reward_risk"])
-            target_price = limit_price + reward_risk * (limit_price - stop_price)
-            if stop_price <= 0 or not stop_price < limit_price < target_price:
-                raise PolicyError("LIVE tick-aligned bracket is invalid")
-            values["entry_reference"] = str(limit_price)
-            values["stop_reference"] = str(stop_price)
-            values["take_profit_reference"] = str(target_price)
-            values["canonical"]["entry_reference"] = str(limit_price)
-            values["canonical"]["entry_limit_price"] = str(limit_price)
-            values["canonical"]["stop_reference"] = str(stop_price)
-            values["canonical"]["take_profit_reference"] = str(target_price)
-            live_quantity = floor_to_step(quote_amount / limit_price, market.step_size)
-            if live_quantity <= 0 or live_quantity * limit_price < market.min_notional:
-                raise PolicyError(f"requested {quote_amount} USDT is below Binance minimum notional after rounding; amount will not be increased")
-            pending_quantity = floor_to_step(
-                live_quantity * (Decimal("1") - self.settings.risk.paper_fee_pct / Decimal("100")),
-                market.step_size,
-            )
-            if pending_quantity <= 0:
-                raise PolicyError("LIVE protective quantity is zero after fee and LOT_SIZE rounding")
-            risk_at_stop = live_quantity * (limit_price - stop_price)
-            if risk_at_stop > self.settings.live.max_risk_per_trade_usdt:
-                raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
-            values["canonical"].update({"quantity": str(live_quantity),
-                "pending_quantity": str(pending_quantity),
-                "price_tick_size": str(market.price_tick_size),
-                "risk_at_stop": str(risk_at_stop), "projected_total_exposure": str(quote_amount),
-                "projected_free_balance": "UNVERIFIED", "fee_estimate": str(quote_amount * self.settings.risk.paper_fee_pct / Decimal("100")),
-                "protection": "OPO_WITH_PENDING_SELL_OCO_REQUIRED", "execution_ready_at_creation": readiness["execution_ready"]})
-            values["canonical_json"] = canonical_json(values["canonical"])
+            self._prepare_live_entry_proposal(values, quote_amount, market, readiness["execution_ready"])
         token = self.signer.approval_token(values["canonical_json"])
         code = self.signer.paper_confirmation_code(values["canonical_json"]) if values["mode"] == "paper" else None
         values["locale"] = self.locale
@@ -990,6 +959,169 @@ class SpotGuard:
                 result["delivery_message"] = ("Approval controls delivered." if result["notification"].get("delivered") and len(controls) >= 2
                     else "PAPER proposal exists; notification was not delivered.")
         return result
+
+    def _prepare_live_entry_proposal(self, values: dict[str, Any], quote_amount: Decimal,
+                                     market: Any, execution_ready: bool) -> None:
+        """Attach the immutable, exchange-aligned LIVE terms every entry needs.
+
+        Both manual and scheduled/candidate entries call this one function so
+        the latter cannot create a LIVE proposal that skips risk snapshot or
+        protected OTOCO terms.
+        """
+        canonical = values["canonical"]
+        symbol = str(canonical["symbol"])
+        if symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("symbol is not enabled for live Spot intent")
+        if quote_amount <= 0 or quote_amount > self.settings.live.max_quote_per_entry_usdt:
+            raise PolicyError("LIVE quote amount exceeds configured per-entry limit")
+        limit_price = floor_to_step(Decimal(values["entry_reference"]), market.price_tick_size)
+        stop_price = floor_to_step(Decimal(values["stop_reference"]), market.price_tick_size)
+        reward_risk = Decimal(values["reward_risk"])
+        target_price = limit_price + reward_risk * (limit_price - stop_price)
+        if stop_price <= 0 or not stop_price < limit_price < target_price:
+            raise PolicyError("LIVE tick-aligned bracket is invalid")
+        live_quantity = floor_to_step(quote_amount / limit_price, market.step_size)
+        if live_quantity <= 0 or live_quantity * limit_price < market.min_notional:
+            raise PolicyError("requested LIVE amount is below Binance minimum notional after rounding; amount will not be increased")
+        pending_quantity = floor_to_step(
+            live_quantity * (Decimal("1") - self.settings.risk.paper_fee_pct / Decimal("100")), market.step_size,
+        )
+        if pending_quantity <= 0:
+            raise PolicyError("LIVE protective quantity is zero after fee and LOT_SIZE rounding")
+        risk_at_stop = live_quantity * (limit_price - stop_price)
+        if risk_at_stop > self.settings.live.max_risk_per_position_usdt:
+            raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
+        projection = self._validate_live_entry_limits(symbol, quote_amount, live_quantity, risk_at_stop, market.bid)
+        values.update({"entry_reference": str(limit_price), "stop_reference": str(stop_price),
+                       "take_profit_reference": str(target_price)})
+        canonical.update({"entry_reference": str(limit_price), "entry_limit_price": str(limit_price),
+            "stop_reference": str(stop_price), "take_profit_reference": str(target_price),
+            "quantity": str(live_quantity), "pending_quantity": str(pending_quantity),
+            "price_tick_size": str(market.price_tick_size), "market_step_size": str(market.step_size),
+            "risk_at_stop": str(risk_at_stop), "fee_estimate": str(quote_amount * self.settings.risk.paper_fee_pct / Decimal("100")),
+            "protection": "OPO_WITH_PENDING_SELL_OCO_REQUIRED",
+            "execution_ready_at_creation": execution_ready, **projection})
+        values["canonical_json"] = canonical_json(canonical)
+
+    def _validate_live_entry_limits(self, symbol: str, quote_amount: Decimal,
+                                    quantity: Decimal, risk_at_stop: Decimal,
+                                    bid: Decimal) -> dict[str, str | int]:
+        """Fail closed on independently read LIVE account/order/trade evidence.
+
+        Existing holdings without an auditable entry-cost basis deliberately
+        block a new entry. This is stricter than estimating aggregate risk from
+        current price and prevents a second LIVE trade from bypassing a limit.
+        """
+        account = self.live_executor.read_spot_account()
+        orders = self.live_executor.read_open_spot_orders()
+        quote_asset = self.settings.risk.quote_asset
+        free_quote = next((Decimal(row["free"]) for row in account["balances"]
+                           if row["asset"] == quote_asset), Decimal("0"))
+        projected_free = free_quote - quote_amount
+        if projected_free < self.settings.live.min_free_reserve_usdt:
+            raise PolicyError("LIVE free USDT reserve would fall below "
+                              f"{self.settings.live.min_free_reserve_usdt} USDT")
+
+        grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for order in orders:
+            list_id = order.get("orderListId")
+            if order.get("symbol") in self.settings.live.allowed_symbols and isinstance(list_id, int) and list_id > 0:
+                grouped.setdefault((str(order["symbol"]), list_id), []).append(order)
+        active_tranches = len(grouped)
+        active_symbols = {entry_symbol for entry_symbol, _ in grouped}
+        if active_tranches + 1 > self.settings.live.max_active_tranches:
+            raise PolicyError(f"LIVE active tranche limit reached ({self.settings.live.max_active_tranches})")
+        if len(active_symbols | {symbol}) > self.settings.live.max_economic_positions:
+            raise PolicyError(f"LIVE economic-position limit reached ({self.settings.live.max_economic_positions})")
+
+        # OCO quantities are the only exchange-side position evidence exposed
+        # by the approved read surface. Value them at current bid for exposure;
+        # any malformed or incomplete OCO is an execution blocker.
+        existing_exposure = Decimal("0")
+        protected_quantities: dict[str, Decimal] = {}
+        for (existing_symbol, _), legs in grouped.items():
+            quantities = {Decimal(str(row.get("origQty", "0"))) for row in legs}
+            if len(legs) != 2 or len(quantities) != 1 or next(iter(quantities)) <= 0:
+                raise SecurityError("LIVE open protection is incomplete; reconciliation required")
+            snapshot = fetch_spot_snapshot(self.settings, existing_symbol)
+            protected_quantity = next(iter(quantities))
+            protected_quantities[existing_symbol] = protected_quantities.get(existing_symbol, Decimal("0")) + protected_quantity
+            existing_exposure += protected_quantity * snapshot.bid
+        for balance in account["balances"]:
+            asset = balance["asset"]
+            matching_symbol = next((candidate for candidate in self.settings.live.allowed_symbols
+                                    if candidate == asset + quote_asset), None)
+            if matching_symbol is None:
+                continue
+            held = Decimal(balance["free"]) + Decimal(balance["locked"])
+            # A base balance that is not exactly represented by its active OCO
+            # may be a manual/external position. It has no immutable entry and
+            # stop evidence, so it must not be excluded from aggregate risk.
+            if held > protected_quantities.get(matching_symbol, Decimal("0")):
+                raise SecurityError("LIVE base balance is not fully protected by an auditable OCO; reconciliation required")
+        projected_exposure = existing_exposure + quote_amount
+        if projected_exposure > self.settings.live.max_open_exposure_usdt:
+            raise PolicyError("LIVE exposure limit reached: projected exposure would exceed "
+                              f"{self.settings.live.max_open_exposure_usdt} USDT")
+        if risk_at_stop > self.settings.live.max_risk_per_position_usdt:
+            raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
+
+        now = utcnow()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = day_start - timedelta(days=day_start.weekday())
+        daily_buys = 0
+        has_sale = False
+        for configured_symbol in self.settings.live.allowed_symbols:
+            daily = self.live_executor.read_spot_trades(configured_symbol, int(day_start.timestamp() * 1000))
+            weekly = self.live_executor.read_spot_trades(configured_symbol, int(week_start.timestamp() * 1000))
+            daily_buys += sum(1 for trade in daily if trade["isBuyer"])
+            has_sale = has_sale or any(not trade["isBuyer"] for trade in weekly)
+        committed = self.ledger.committed_live_executions(day_start.date().isoformat())
+        entries_today = max(daily_buys, committed)
+        if entries_today >= self.settings.live.max_successful_entries_per_utc_day:
+            raise PolicyError("LIVE daily entry quota reached "
+                              f"({self.settings.live.max_successful_entries_per_utc_day})")
+        # Trade history does not carry a complete historical cost basis for a
+        # sale opened before the query window. Treat every sale as unverified
+        # rather than under-reporting daily/weekly realized loss.
+        if has_sale:
+            raise SecurityError("LIVE realized loss cannot be proven from the bounded trade history; reconciliation required")
+        if grouped:
+            raise SecurityError("LIVE aggregate risk for existing positions requires reconciliation; new entry refused")
+        if risk_at_stop > self.settings.live.max_aggregate_risk_usdt:
+            raise PolicyError("LIVE aggregate risk limit reached")
+        return {"live_risk_snapshot_verified": True,
+                "projected_free_balance": str(projected_free),
+                "projected_total_exposure": str(projected_exposure),
+                "projected_aggregate_risk": str(risk_at_stop),
+                "live_entries_today": entries_today,
+                "live_daily_realized_loss": "0",
+                "live_weekly_realized_loss": "0",
+                "active_live_tranches": active_tranches,
+                "active_live_economic_positions": len(active_symbols)}
+
+    @staticmethod
+    def _is_live_buy_entry(canonical: dict[str, Any]) -> bool:
+        """Identify every protected LIVE BUY entry independently of its source."""
+        try:
+            return (canonical.get("product") == "SPOT" and canonical.get("side") == "BUY"
+                    and canonical.get("order_type") in {"LIMIT", "LIMIT_MAKER"}
+                    and Decimal(str(canonical.get("quote_amount", "0"))) > 0)
+        except (ArithmeticError, ValueError):
+            return False
+
+    def _revalidate_live_buy_entry(self, proposal: dict[str, Any]) -> None:
+        canonical = proposal["canonical"]
+        if not self._is_live_buy_entry(canonical):
+            return
+        required = ("quote_amount", "quantity", "risk_at_stop", "entry_limit_price")
+        if any(key not in canonical for key in required):
+            raise SecurityError("LIVE BUY proposal is missing immutable risk terms")
+        self._validate_live_entry_limits(
+            proposal["symbol"], Decimal(str(canonical["quote_amount"])),
+            Decimal(str(canonical["quantity"])), Decimal(str(canonical["risk_at_stop"])),
+            Decimal(str(canonical["entry_limit_price"])),
+        )
 
     @localized
     def create_live_partial_exit_proposal(self, symbol: str, percentage: Decimal,
@@ -1345,6 +1477,18 @@ class SpotGuard:
             proposal_mode=proposal_mode,
             source="deterministic-signal",
         )
+        if proposal_mode == "live":
+            # Scheduled/candidate LIVE proposals receive the same fresh public
+            # quote, exchange rounding, account snapshot, and OTOCO invariant
+            # as a manually requested LIVE entry.
+            market = fetch_spot_snapshot(self.settings, candidate["symbol"])
+            readiness = self.live_status(check_symbols=True, symbols=[candidate["symbol"]])
+            if not readiness["execution_ready"]:
+                raise SecurityError("scheduled LIVE proposal mode is not execution-ready")
+            self._prepare_live_entry_proposal(
+                proposal_values, quote_amount or self.settings.risk.default_quote_amount,
+                market, readiness["execution_ready"],
+            )
         token = self.signer.approval_token(proposal_values["canonical_json"])
         code = self.signer.paper_confirmation_code(proposal_values["canonical_json"]) if proposal_values["mode"] == "paper" else None
         proposal_values["locale"] = self.locale
@@ -1505,6 +1649,7 @@ class SpotGuard:
             readiness = self.live_status(check_symbols=True, symbols=[proposal["symbol"]])
             if not readiness["execution_ready"]:
                 raise SecurityError("live approval fails closed; readiness blockers: " + ", ".join(readiness["blockers"]))
+            self._revalidate_live_buy_entry(proposal)
         lease, lease_hash = self.signer.new_lease()
         lease_expires = isoformat(
             utcnow() + timedelta(seconds=self.settings.risk.execution_lease_seconds)
@@ -1564,6 +1709,7 @@ class SpotGuard:
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
         try:
+            self._revalidate_live_buy_entry(proposal)
             if proposal["canonical"].get("source") == "manual-live-cancel-protection":
                 list_id = proposal["canonical"]["order_list_id"]
                 current = self.live_executor.read_open_spot_orders()
@@ -1763,7 +1909,7 @@ class SpotGuard:
             targets = symbols if symbols is not None else self.settings.live.allowed_symbols
             for symbol in targets:
                 try:
-                    item = validate_spot_symbol(self.settings, symbol)
+                    item = validate_spot_symbol(self.settings, symbol, live=True)
                     item["protected_live_supported"] = bool(item.get("oto_allowed") and item.get("opo_allowed") and item.get("oco_allowed") and Decimal(item.get("price_tick_size", "0")) > 0 and item.get("percent_price_filter") and item.get("max_num_orders", 0) > 0 and item.get("max_num_algo_orders", 0) > 0 and item.get("max_num_order_lists", 0) > 0)
                 except Exception as exc:
                     item = {"symbol": symbol, "protected_live_supported": False, "reason": str(exc)}
@@ -1785,7 +1931,7 @@ class SpotGuard:
             "daily_realized_loss_cap_usdt": str(self.settings.live.daily_realized_loss_cap_usdt),
             "max_successful_entries_per_utc_day": self.settings.live.max_successful_entries_per_utc_day,
             "minimum_profile_balance_before_fees_usdt": str(minimum_profile_balance),
-            "balance_profile_note": "A 28 USDT account cannot support a 100 USDT entry plus the 8 USDT reserve; account balance is not queried by this read-only report.",
+            "balance_profile_note": "A 28 USDT account cannot support a 100 USDT entry plus the 8 USDT reserve. This status report does not claim an account-read or write-scope verification; the execution gate requires independent evidence.",
             "max_pending_proposals": self.settings.live.max_pending_proposals,
             "allowed_symbols": list(self.settings.live.allowed_symbols), "symbol_checks": symbol_checks})
         return result
