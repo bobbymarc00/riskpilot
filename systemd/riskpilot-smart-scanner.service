@@ -1,0 +1,18 @@
+[Unit]
+Description=RiskPilot additive smart-universe radar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.openclaw/workspace/tools/spotguard-agent-os
+Environment=SPOTGUARD_CONFIG=%h/.openclaw/workspace/tools/spotguard-agent-os/config.json
+ExecStart=/usr/bin/env python3 %h/.openclaw/workspace/tools/spotguard-agent-os/scripts/riskpilot-smart-scanner.py --smart-config %h/.openclaw/workspace/tools/spotguard-agent-os/smart-scanner.json --notify --json
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryHigh=256M
+MemoryMax=512M
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true

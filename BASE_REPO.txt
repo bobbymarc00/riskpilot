@@ -1,0 +1,4 @@
+Repository: https://github.com/bobbymarc00/riskpilot
+Verified default-branch commit while patch was prepared: 16a91769d29abbad18c5e06860bbc560ee3197f2
+Date: 2026-09-08
+Patch policy: additive-only; no existing repository file is replaced.

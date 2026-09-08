@@ -1,0 +1,43 @@
+{
+  "enabled": true,
+  "pulse_minutes": 5,
+  "baseline_refresh_hours": 24,
+  "exchange_info_refresh_hours": 24,
+  "min_active": 24,
+  "target_active": 36,
+  "max_active": 48,
+  "watchlist_size": 64,
+  "core_slots": 8,
+  "momentum_slots": 16,
+  "hype_slots": 12,
+  "green_used_weight": 300,
+  "caution_used_weight": 600,
+  "pause_used_weight": 750,
+  "absolute_scanner_ceiling": 900,
+  "min_core_quote_volume_usdt": 1000000,
+  "min_momentum_quote_volume_usdt": 250000,
+  "min_hype_quote_volume_usdt": 50000,
+  "max_core_spread_pct": 0.35,
+  "max_hype_spread_pct": 0.8,
+  "hype_score_threshold": 62,
+  "momentum_score_threshold": 56,
+  "urgent_hype_score": 82,
+  "alert_cooldown_minutes": 30,
+  "max_alerts_per_cycle": 2,
+  "handoff_configured_top": true,
+  "stable_bases": [
+    "USDC",
+    "FDUSD",
+    "TUSD",
+    "USDP",
+    "DAI",
+    "BUSD",
+    "USD1"
+  ],
+  "exclude_base_suffixes": [
+    "UP",
+    "DOWN",
+    "BULL",
+    "BEAR"
+  ]
+}
