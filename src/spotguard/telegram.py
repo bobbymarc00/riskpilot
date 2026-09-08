@@ -50,7 +50,11 @@ def candidate_message(candidate: dict[str, Any], locale: str = "en") -> tuple[st
     text = translate("candidate.body", locale, symbol=candidate["symbol"], interval=candidate["interval"],
                      score=number(candidate["score"], locale, 0), price=number(candidate["price"], locale),
                      identifier=candidate["id"])
-    return text, [{"label": translate("button.review", locale), "value": _callback(f"sg:review:{candidate['id']}"), "style": "primary"}]
+    return text, [{
+    "label": translate("button.review", locale),
+    "command": _command(f"/binance_spotguard review {candidate['id']}"),
+    "style": "primary",
+}]
 
 
 def _fixed(value: Any) -> str:

@@ -32,7 +32,16 @@ class TelegramAndCallbackTests(unittest.TestCase):
             service = SpotGuard(settings)
             candidate = service.scan(symbols=["BTCUSDT"], synthetic=True)["results"][0]["candidate"]
             _, candidate_buttons = candidate_message(candidate)
-            self.assertLessEqual(len(candidate_buttons[0]["value"].encode()), 64)
+            self.assertEqual(
+                candidate_buttons[0]["command"],
+                f"/binance_spotguard review {candidate['id']}",
+            )
+            self.assertLessEqual(
+                len(("tgcmd:" + candidate_buttons[0]["command"]).encode()),
+                64,
+            )
+)
+self.assertNotIn("value", candidate_buttons[0])
             result = service.create_proposal(
                 candidate["id"],
                 Decimal(str(candidate["price"])) * Decimal("0.999"),
