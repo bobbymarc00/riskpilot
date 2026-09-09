@@ -338,17 +338,17 @@ The public example configuration currently uses:
 | Convert / wallet / payment / borrowing | No supported execution route     |
 | Human approval                         | Required for every LIVE write    |
 | Default order size                     | 6 USDT                           |
-| Minimum quote amount                   | 5 USDT                           |
-| Maximum LIVE entry                     | 100 USDT                         |
-| Maximum PAPER entry                    | 100 USDT                         |
-| Maximum open exposure                  | 500 USDT                         |
+| Legacy/PAPER-demo quote floor          | 5 USDT                           |
+| Legacy/backstop LIVE entry             | 100 USDT                         |
+| Legacy/backstop PAPER entry            | 100 USDT                         |
+| Legacy/backstop open exposure          | 500 USDT                         |
 | Maximum economic positions             | 5                                |
 | Maximum active tranches                | 10                               |
-| Minimum LIVE free reserve              | 8 USDT                           |
-| Maximum risk per position              | 2 USDT                           |
-| Maximum aggregate open risk            | 4 USDT                           |
-| Daily realized-loss cap                | 5 USDT                           |
-| Weekly LIVE loss cap                   | 20 USDT                          |
+| Legacy/schema-1 LIVE free reserve      | 8 USDT                           |
+| Legacy/backstop risk per position      | 2 USDT                           |
+| Legacy/backstop aggregate open risk    | 4 USDT                           |
+| Legacy/backstop daily loss             | 5 USDT                           |
+| Legacy/backstop weekly LIVE loss       | 20 USDT                          |
 | Successful BUY entries / UTC day       | Maximum 10                       |
 | Pending LIVE proposals                 | Maximum 1                        |
 | Active proposals                       | Maximum 1                        |
@@ -366,31 +366,43 @@ The public example configuration currently uses:
 | Paper/live separation                  | Enforced                         |
 | Automatic ambiguous-write retry        | Disabled                         |
 
+For legacy configs these monetary values remain the existing absolute limits.
+The version-2 example instead derives entry, exposure, stop-risk, daily/weekly
+loss, and reserve limits as percentages of Spot mark-to-market equity, so it
+scales both down and up. The old USD values become a ceiling only when
+`absolute_safety_caps.enabled` is explicitly enabled. See
+[RiskPilot scalable equity-aware guardrails](docs/RISKPILOT_POLICY.md).
+
 For every new LIVE entry, the policy takes a fresh authenticated snapshot of
 Spot balances, open OCO orders, and bounded Spot trade history when the
 proposal is created, claimed, and submitted. It fails closed if the 8 USDT
-reserve, exposure, tranche/position, per-position/aggregate-risk, or daily
-entry limits would be exceeded. A pre-existing base balance without a matching
+reserve in legacy/schema-1 mode—or the equity-percentage reserve in scalable
+mode—plus exposure, tranche/position, per-position/aggregate-risk, or loss
+limits would be exceeded. A pre-existing base balance without a matching
 OCO, a historical sale whose cost basis cannot be proven from the bounded read,
 or truncated history blocks a new LIVE entry pending reconciliation; RiskPilot
 does not estimate a lower loss in those cases.
 
-### Important: 6 USDT Is Not the Maximum
+### Important: 6 USDT Is Neither a Target nor a Maximum
 
 ```text
 risk.default_order_size_usdt = 6
 ```
 
-is the default order amount when another amount is not supplied.
+is retained for legacy/manual compatibility. Under version-2 automated proposal
+flow, the risk engine calculates size from the structural stop and current
+account state.
 
 It is **not** the maximum allowed trade size.
 
-The public example configuration independently defines:
+The public example configuration uses these primary limits:
 
 ```text
-LIVE max entry:          100 USDT
-PAPER max entry:         100 USDT
-Maximum open exposure:   500 USDT
+Position notional:       20% of equity
+Maximum open exposure:   60% of equity
+Risk per position:       0.5% of equity
+Aggregate open risk:     1.5% of equity
+Minimum free reserve:    20% of equity
 Economic positions:      5
 Active tranches:         10
 ```
@@ -398,7 +410,7 @@ Active tranches:         10
 Actual executable size is still constrained by:
 
 * available Spot balance
-* 8 USDT minimum LIVE reserve
+* percentage-based free-quote reserve
 * Binance exchange filters
 * per-entry maximum
 * total exposure

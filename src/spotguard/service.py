@@ -19,12 +19,23 @@ from .indicators import analyze
 from .live_execution import LiveExecutionAdapter
 from .market import Kline, MarketError, SymbolValidationError, fetch_1m_candles_since, fetch_klines, fetch_spot_snapshot, floor_to_step, load_fixture, scaled_synthetic_klines, synthetic_bullish_klines, validate_spot_symbol
 from .policy import PolicyError, build_proposal, entry_policy_terms, execution_intent, validate_claim
+from .risk_policy.capital import AssetValuation, UsageSnapshot, build_equity_snapshot
+from .risk_policy.evaluator import PolicyContext, evaluate_entry
+from .risk_policy.limits import (
+    EffectiveLimits,
+    absolute_daily_quote_ceiling,
+    absolute_entry_ceiling,
+    effective_reserve,
+    limits_for,
+)
+from .risk_policy.sizing import SizingDecision, size_entry
+from .risk_policy.snapshot import build_policy_snapshot, validate_policy_snapshot
 from .paper import build_fill_risk, exit_values, validate_long_bracket
 from .security import ApprovalSigner, LiveArm, SecurityError
 from .strategy import Signal, evaluate
 from .score_engine import MarketScore, SCORE_ENGINE_VERSION, score_market, score_snapshot
 from .telegram import OpenClawMessenger, TelegramError, candidate_message, paper_close_message, proposal_message
-from .util import bounded_text, canonical_json, isoformat, parse_time, utcnow, validate_simple_id
+from .util import bounded_text, canonical_json, decimal_string, isoformat, parse_time, utcnow, validate_simple_id
 
 
 class SpotGuardError(RuntimeError):
@@ -48,6 +59,373 @@ class SpotGuard:
         self.live_executor = LiveExecutionAdapter(settings)
         self.paper_reconciliation = self.ledger.reconcile_paper_state()
         self.paper_migration = self._migrate_existing_paper_fills()
+
+    @staticmethod
+    def _raise_policy_rejection(result: Any, *, phase: str) -> None:
+        if not result.accepted:
+            raise PolicyError(
+                f"{phase} policy rejected; create a new proposal: "
+                + "; ".join(result.reasons)
+            )
+
+    @staticmethod
+    def _raise_sizing_rejection(result: SizingDecision, *, phase: str) -> None:
+        if not result.accepted:
+            raise PolicyError(
+                f"{phase} sizing rejected; exact proposal was not resized: "
+                + "; ".join(result.reasons)
+            )
+
+    def _paper_symbol_usage(self, symbol: str) -> tuple[Decimal, Decimal]:
+        rows = [
+            row
+            for row in self.ledger.list_paper_positions(open_only=True)
+            if row.get("status", "OPEN") in {"OPEN", "CLOSING"}
+            and row["symbol"] == symbol
+        ]
+        return (
+            sum((Decimal(str(row["quote_spent"])) for row in rows), Decimal("0")),
+            sum((Decimal(str(row["risk_amount"])) for row in rows), Decimal("0")),
+        )
+
+    def _active_proposal_limit(self, mode: str) -> int:
+        limit = self.settings.risk.max_active_proposals
+        if mode == "live":
+            limit = min(limit, self.settings.live.max_pending_proposals)
+            if self.settings.sizing_policy.percentage_based:
+                assert self.settings.sizing_policy.operations is not None
+                limit = min(
+                    limit,
+                    self.settings.sizing_policy.operations.max_pending_live_proposals,
+                )
+        return limit
+
+    def _paper_policy_context(
+        self, *, price_overrides: dict[str, Decimal] | None = None,
+        effective_equity: Decimal | None = None,
+    ) -> tuple[PolicyContext, set[str]]:
+        """Build a PAPER capital snapshot without treating base assets as free USDT."""
+        balance = self.ledger.paper_balance()
+        positions = [
+            row for row in self.ledger.list_paper_positions(open_only=True)
+            if row.get("status", "OPEN") in {"OPEN", "CLOSING"}
+        ]
+        quote_asset = self.settings.risk.quote_asset
+        valuations: list[AssetValuation] = []
+        if self.settings.sizing_policy.enabled:
+            grouped: dict[str, Decimal] = {}
+            for row in positions:
+                quantity = Decimal(str(row.get("net_quantity", "0")))
+                if quantity <= 0:
+                    raise PolicyError("PAPER position quantity is invalid for equity valuation")
+                grouped[row["symbol"]] = grouped.get(row["symbol"], Decimal("0")) + quantity
+            for symbol, quantity in sorted(grouped.items()):
+                mark = (price_overrides or {}).get(symbol)
+                if mark is None:
+                    mark = fetch_spot_snapshot(self.settings, symbol).bid
+                if not mark.is_finite() or mark <= 0:
+                    raise PolicyError(f"PAPER mark price is invalid for {symbol}")
+                asset = symbol[:-len(quote_asset)]
+                valuations.append(AssetValuation(
+                    asset=asset, symbol=symbol, quantity=quantity,
+                    mark_price=mark, quote_value=quantity * mark,
+                ))
+            # PAPER base assets are inventory, not locked quote currency.
+            locked_quote = Decimal("0")
+        else:
+            # Legacy configs retain their historical cost-basis balance view
+            # and do not gain extra market reads merely by upgrading code.
+            locked_quote = Decimal(str(balance.get("locked_usdt", "0")))
+        raw_equity = (
+            Decimal(str(balance["free_usdt"]))
+            + locked_quote
+            + sum((item.quote_value for item in valuations), Decimal("0"))
+        )
+        reserve_basis = (
+            min(raw_equity, effective_equity)
+            if effective_equity is not None else raw_equity
+        )
+        equity = build_equity_snapshot(
+            mode="paper", quote_asset=quote_asset,
+            free_quote=Decimal(str(balance["free_usdt"])),
+            locked_quote=locked_quote,
+            reserve_quote=effective_reserve(self.settings, "paper", reserve_basis),
+            asset_valuations=valuations,
+        )
+        symbols = {row["symbol"] for row in positions}
+        usage = UsageSnapshot(
+            open_exposure=sum(
+                (Decimal(str(row["quote_spent"])) for row in positions), Decimal("0")
+            ),
+            aggregate_open_risk=sum(
+                (Decimal(str(row["risk_amount"])) for row in positions), Decimal("0")
+            ),
+            daily_realized_loss=self.ledger.daily_paper_realized_loss(
+                utcnow().date().isoformat()
+            ),
+            economic_positions=max(
+                len(symbols), int(balance.get("open_positions", len(symbols)))
+            ),
+            active_tranches=max(
+                len(positions), int(balance.get("active_tranches", len(positions)))
+            ),
+            weekly_realized_loss=self.ledger.weekly_paper_realized_loss(
+                isoformat(
+                    utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                    - timedelta(days=utcnow().weekday())
+                )
+            ),
+        )
+        hard, effective = limits_for(
+            self.settings, "paper", equity.equity,
+            effective_equity=reserve_basis,
+        )
+        return PolicyContext(equity, usage, hard, effective), symbols
+
+    def _evaluate_paper_entry(
+        self,
+        context: PolicyContext,
+        symbols: set[str],
+        symbol: str,
+        requested: Decimal,
+        *,
+        projected_position_risk: Decimal | None = None,
+        projected_aggregate_risk: Decimal | None = None,
+        projected_exposure: Decimal | None = None,
+        projected_position_exposure: Decimal | None = None,
+        estimated_fee: Decimal = Decimal("0"),
+    ) -> Any:
+        return evaluate_entry(
+            context,
+            requested_notional=requested,
+            projected_exposure=(
+                projected_exposure
+                if projected_exposure is not None
+                else context.usage.open_exposure + requested
+            ),
+            projected_position_exposure=projected_position_exposure,
+            projected_position_risk=projected_position_risk,
+            projected_aggregate_risk=projected_aggregate_risk,
+            resulting_economic_positions=(
+                context.usage.economic_positions
+                if symbol in symbols
+                else context.usage.economic_positions + 1
+            ),
+            estimated_fee=estimated_fee,
+        )
+
+    def _attach_policy_snapshot(
+        self, values: dict[str, Any], context: PolicyContext, evaluation: Any,
+        sizing: SizingDecision | None = None,
+        calculated_quantity: Decimal | None = None,
+    ) -> None:
+        self._raise_policy_rejection(evaluation, phase="proposal")
+        snapshot = build_policy_snapshot(
+            self.settings, values["mode"], context, evaluation, sizing,
+            calculated_quantity=calculated_quantity,
+        )
+        canonical = values["canonical"]
+        snapshot["proposal_terms"] = {
+            "proposal_id": canonical["proposal_id"],
+            "created_at": canonical["created_at"],
+            "expires_at": canonical["expires_at"],
+            "symbol": canonical["symbol"],
+            "side": canonical["side"],
+            "strategy_or_signal_reference": canonical.get("candidate_id"),
+            "source": canonical.get("source"),
+            "entry_price": canonical["entry_reference"],
+            "stop_price": canonical["stop_reference"],
+            "target_price": canonical["take_profit_reference"],
+            "stop_distance_pct": (
+                sizing.to_dict()["stop_distance_pct"] if sizing else None
+            ),
+            "risk_budget_at_proposal": (
+                sizing.to_dict()["risk_budget"] if sizing else None
+            ),
+            "calculated_notional": canonical["quote_amount"],
+            "calculated_quantity": (
+                str(calculated_quantity) if calculated_quantity is not None else None
+            ),
+            "expected_risk": (
+                sizing.to_dict()["expected_risk"] if sizing else None
+            ),
+        }
+        canonical["policy_snapshot"] = snapshot
+        values["canonical_json"] = canonical_json(values["canonical"])
+
+    def _validate_stored_policy_snapshot(self, proposal: dict[str, Any]) -> None:
+        stored = proposal["canonical"].get("policy_snapshot")
+        if stored is None and not self.settings.sizing_policy.enabled:
+            # Pending proposals created by older code remain claimable under
+            # unchanged legacy hard caps. New proposals always carry a snapshot.
+            return
+        try:
+            validate_policy_snapshot(stored, self.settings, proposal["mode"])
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+        evaluation = stored.get("evaluation", {})
+        if str(evaluation.get("requested_notional")) != str(
+            proposal["canonical"].get("quote_amount")
+        ):
+            raise PolicyError("immutable policy snapshot notional does not match proposal")
+        if self.settings.sizing_policy.percentage_based:
+            sizing = stored.get("sizing")
+            if (not isinstance(sizing, dict) or sizing.get("accepted") is not True
+                    or str(sizing.get("calculated_notional"))
+                    != str(proposal["canonical"].get("quote_amount"))):
+                raise PolicyError(
+                    "immutable policy sizing does not match exact proposal action"
+                )
+            captured_quantity = stored.get("proposal_state", {}).get(
+                "calculated_quantity"
+            )
+            canonical_quantity = proposal["canonical"].get(
+                "quantity",
+                proposal["canonical"].get(
+                    "gross_reference_quantity",
+                    proposal["canonical"].get("reference_quantity"),
+                ),
+            )
+            if (captured_quantity is not None and canonical_quantity is not None
+                    and Decimal(str(captured_quantity))
+                    != Decimal(str(canonical_quantity))):
+                raise PolicyError(
+                    "immutable policy quantity does not match exact proposal action"
+                )
+            terms = stored.get("proposal_terms")
+            expected_terms = {
+                "proposal_id": proposal["id"],
+                "symbol": proposal["symbol"],
+                "entry_price": proposal["canonical"].get("entry_reference"),
+                "stop_price": proposal["canonical"].get("stop_reference"),
+                "target_price": proposal["canonical"].get("take_profit_reference"),
+                "calculated_notional": proposal["canonical"].get("quote_amount"),
+            }
+            if (not isinstance(terms, dict)
+                    or any(str(terms.get(key)) != str(value)
+                           for key, value in expected_terms.items())):
+                raise PolicyError(
+                    "APPROVAL_INVALID: immutable policy terms do not match proposal"
+                )
+
+    def _policy_reject(self, proposal: dict[str, Any], exc: Exception) -> None:
+        reason = bounded_text(str(exc), 500) or type(exc).__name__
+        current = self.ledger.get_proposal(proposal["id"])
+        if current["status"] in {"PENDING", "EXECUTING"}:
+            self.ledger.reject_proposal_by_policy(proposal["id"], reason)
+        raise PolicyError(
+            f"proposal rejected by refreshed policy; create a new proposal: {reason}"
+        ) from exc
+
+    def _proposal_equity(self, proposal: dict[str, Any]) -> Decimal | None:
+        if not self.settings.sizing_policy.percentage_based:
+            return None
+        stored = proposal["canonical"].get("policy_snapshot")
+        try:
+            value = Decimal(str(stored["proposal_state"]["equity_at_proposal"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise PolicyError(
+                "REVALIDATION_FAILED: proposal is missing immutable equity evidence"
+            ) from exc
+        if not value.is_finite() or value <= 0:
+            raise PolicyError(
+                "REVALIDATION_FAILED: proposal equity evidence is invalid"
+            )
+        return value
+
+    def _validate_equity_drift(
+        self, proposal_equity: Decimal | None, current_equity: Decimal
+    ) -> None:
+        if proposal_equity is None:
+            return
+        assert self.settings.sizing_policy.execution is not None
+        adverse_drift = max(
+            Decimal("0"), (proposal_equity - current_equity) / proposal_equity
+        )
+        if adverse_drift > self.settings.sizing_policy.execution.max_equity_drift_pct:
+            raise PolicyError(
+                "EQUITY_DRIFT_EXCEEDED: current equity fell "
+                f"{adverse_drift * Decimal('100'):f}% from the immutable proposal snapshot"
+            )
+
+    def _revalidate_paper_entry_policy(
+        self, proposal: dict[str, Any], *, phase: str,
+        price_overrides: dict[str, Decimal] | None = None,
+        projected_position_risk: Decimal | None = None,
+        projected_aggregate_risk: Decimal | None = None,
+        projected_exposure: Decimal | None = None,
+    ) -> tuple[PolicyContext, Any]:
+        self._validate_stored_policy_snapshot(proposal)
+        proposal_equity = self._proposal_equity(proposal)
+        context, symbols = self._paper_policy_context(
+            price_overrides=price_overrides,
+            effective_equity=proposal_equity,
+        )
+        self._validate_equity_drift(proposal_equity, context.equity.equity)
+        canonical = proposal["canonical"]
+        requested = Decimal(str(canonical["quote_amount"]))
+        if self.settings.sizing_policy.percentage_based:
+            candidate = self.ledger.get_candidate(proposal["candidate_id"])
+            if not candidate["metrics"].get("paper_demo"):
+                approval_market = fetch_spot_snapshot(
+                    self.settings, proposal["symbol"]
+                )
+                approval_quantity = floor_to_step(
+                    requested / approval_market.ask, approval_market.step_size
+                )
+                if (approval_quantity <= 0
+                        or approval_quantity * approval_market.ask
+                        < approval_market.min_notional):
+                    raise PolicyError(
+                        "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: refreshed Binance filters reject the exact immutable proposal; amount was not increased"
+                    )
+            existing_exposure, existing_risk = self._paper_symbol_usage(
+                proposal["symbol"]
+            )
+            sizing = size_entry(
+                context,
+                entry_price=Decimal(str(canonical["entry_reference"])),
+                stop_price=Decimal(str(canonical["stop_reference"])),
+                existing_position_exposure=existing_exposure,
+                existing_position_risk=existing_risk,
+                requested_notional=requested,
+                fee_buffer_rate=self.settings.risk.paper_fee_pct / Decimal("100"),
+            )
+            if not sizing.accepted:
+                raise PolicyError(
+                    "REVALIDATION_FAILED: ACCOUNT_STATE_CHANGED: immutable proposal no longer fits refreshed account state; "
+                    + "; ".join(sizing.reasons)
+                )
+        if projected_position_risk is None:
+            value = canonical.get("projected_risk_at_stop")
+            projected_position_risk = Decimal(str(value)) if value is not None else None
+        if projected_aggregate_risk is None:
+            stored = canonical.get("policy_snapshot", {}).get("evaluation", {})
+            at_creation = stored.get("projected_aggregate_risk")
+            usage_creation = canonical.get("policy_snapshot", {}).get("usage", {}).get(
+                "aggregate_open_risk"
+            )
+            if at_creation is not None and usage_creation is not None:
+                incremental = max(
+                    Decimal("0"), Decimal(str(at_creation)) - Decimal(str(usage_creation))
+                )
+                projected_aggregate_risk = context.usage.aggregate_open_risk + incremental
+        result = self._evaluate_paper_entry(
+            context, symbols, proposal["symbol"], requested,
+            projected_position_risk=projected_position_risk,
+            projected_aggregate_risk=projected_aggregate_risk,
+            projected_exposure=projected_exposure,
+            projected_position_exposure=(
+                self._paper_symbol_usage(proposal["symbol"])[0] + requested
+            ),
+            estimated_fee=(
+                requested * self.settings.risk.paper_fee_pct / Decimal("100")
+                if self.settings.sizing_policy.percentage_based
+                else Decimal("0")
+            ),
+        )
+        self._raise_policy_rejection(result, phase=phase)
+        return context, result
 
     def select_locale(self, text: str, explicit: str | None = None) -> str:
         self.locale = explicit or detect_locale(text, self.ledger.presentation_locale("chat", self.settings.telegram.chat_id), self.settings.default_locale)
@@ -159,7 +537,9 @@ class SpotGuard:
     def _hypothetical_paper_eligibility(self, scored: MarketScore, amount: Decimal,
                                         validation: dict[str, Any], price: Decimal) -> dict[str, Any]:
         try:
-            self._ensure_paper_entry_available(scored.symbol, amount, read_only=True)
+            context, _ = self._ensure_paper_entry_available(
+                scored.symbol, amount, read_only=True
+            )
             step = Decimal(validation["market_step_size"])
             minimum = Decimal(validation["min_notional"])
             quantity = floor_to_step(amount / price, step)
@@ -182,6 +562,7 @@ class SpotGuard:
             projection = self._paper_risk_projection(
                 scored.symbol, price, plan, bid=price, ask=price,
                 reward_risk=terms["reward_risk"],
+                effective_limits=context.effective_limits,
             )
             existing = [row for row in self.ledger.list_paper_positions(True)
                         if row["symbol"] == scored.symbol]
@@ -190,6 +571,7 @@ class SpotGuard:
                     "projected_exposure_usdt": str(sum((Decimal(row["quote_spent"]) for row in self.ledger.list_paper_positions(True)), Decimal("0")) + spend),
                     "projected_position_risk_usdt": str(projection["new_position_risk"]),
                     "projected_aggregate_risk_usdt": str(projection["projected_aggregate_risk"]),
+                    "effective_limits": context.effective_limits.to_dict(),
                     "minimum_notional_usdt": str(minimum), "quantity_step": str(step)}
         except (PolicyError, ValueError, KeyError) as exc:
             return {"eligible": False, "blocking_reason": str(exc), "hypothetical_only": True,
@@ -232,8 +614,9 @@ class SpotGuard:
 
     def _paper_risk_projection(self, symbol: str, fill_price: Decimal,
                                plan: dict[str, str], *, bid: Decimal | None = None,
-                               ask: Decimal | None = None, reward_risk: Decimal | None = None) -> dict[str, Decimal | int]:
-        rows = [row for row in self.ledger.list_paper_positions(open_only=True) if row["status"] in {"OPEN", "CLOSING"}]
+                               ask: Decimal | None = None, reward_risk: Decimal | None = None,
+                               effective_limits: EffectiveLimits | None = None) -> dict[str, Decimal | int]:
+        rows = [row for row in self.ledger.list_paper_positions(open_only=True) if row.get("status", "OPEN") in {"OPEN", "CLOSING"}]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(row["symbol"], []).append(row)
@@ -294,20 +677,22 @@ class SpotGuard:
             "existing_quantity": old_quantity,
             "existing_tranches": len(existing),
         }
-        limit = self.settings.paper.max_aggregate_risk_usdt
-        if new_position_risk > self.settings.paper.max_risk_per_position_usdt or projected_aggregate > limit:
+        limit = (effective_limits.max_aggregate_open_risk if effective_limits
+                 else self.settings.paper.max_aggregate_risk_usdt)
+        position_limit = (effective_limits.max_risk_per_position if effective_limits
+                          else self.settings.paper.max_risk_per_position_usdt)
+        if new_position_risk > position_limit or projected_aggregate > limit:
             raise PolicyError("PAPER risk rejected: current aggregate risk "
                 f"{current_aggregate:f} USDT; new economic-position risk {new_position_risk:f} USDT; "
-                f"projected aggregate risk {projected_aggregate:f} USDT; configured aggregate limit {limit:f} USDT; "
-                f"configured per-position limit {self.settings.paper.max_risk_per_position_usdt:f} USDT")
+                f"projected aggregate risk {projected_aggregate:f} USDT; configured aggregate limit {limit:f} USDT (effective); "
+                f"configured per-position limit {position_limit:f} USDT (effective)")
         return result
 
     def _ensure_paper_entry_available(self, symbol: str | None = None,
                                       requested: Decimal | None = None,
-                                      *, read_only: bool = False) -> None:
-        balance = self.ledger.paper_balance()
-        positions = self.ledger.list_paper_positions(open_only=True)
-        active_tranches = int(balance.get("active_tranches", balance.get("open_positions", 0)))
+                                      *, read_only: bool = False) -> tuple[PolicyContext, set[str]]:
+        context, symbols = self._paper_policy_context()
+        active_tranches = context.usage.active_tranches
         if active_tranches >= self.settings.paper.max_active_tranches:
             raise PolicyError(f"active PAPER tranche limit reached ({self.settings.paper.max_active_tranches})")
         if not read_only:
@@ -320,24 +705,27 @@ class SpotGuard:
                           else self.ledger.has_active_paper_buy(symbol) if symbol else False)
         if symbol and has_symbol_buy:
             raise PolicyError(f"a pending or processing paper BUY already exists for {symbol}")
-        if symbol is None and len({row["symbol"] for row in positions}) >= self.settings.paper.max_economic_positions:
+        if symbol is None and len(symbols) >= self.settings.paper.max_economic_positions:
             raise PolicyError(f"economic PAPER position/distinct-symbol limit reached ({self.settings.paper.max_economic_positions})")
-        if symbol and symbol not in {row["symbol"] for row in positions} and len({row["symbol"] for row in positions}) >= self.settings.paper.max_economic_positions:
-            raise PolicyError(f"economic PAPER position/distinct-symbol limit reached ({self.settings.paper.max_economic_positions})")
-        exposure = sum((Decimal(row["quote_spent"]) for row in positions), Decimal("0"))
-        aggregate_risk = sum((Decimal(row["risk_amount"]) for row in positions), Decimal("0"))
-        if requested is not None and exposure + requested > self.settings.paper.max_open_exposure_usdt:
-            raise PolicyError(f"PAPER exposure limit reached: projected exposure would exceed {self.settings.paper.max_open_exposure_usdt} USDT")
-        if aggregate_risk >= self.settings.paper.max_aggregate_risk_usdt:
+        if (symbol and symbol not in symbols
+                and context.usage.economic_positions >= context.effective_limits.max_economic_positions):
+            raise PolicyError(
+                "economic PAPER position/distinct-symbol limit reached "
+                f"({context.effective_limits.max_economic_positions})"
+            )
+        if symbol and requested is not None:
+            result = self._evaluate_paper_entry(context, symbols, symbol, requested)
+            self._raise_policy_rejection(result, phase="proposal")
+        elif context.usage.aggregate_open_risk >= context.effective_limits.max_aggregate_open_risk:
             raise PolicyError("paper aggregate open risk limit is exhausted")
         day = utcnow().date().isoformat()
-        if self.ledger.daily_paper_realized_loss(day) >= self.settings.paper.daily_realized_loss_cap_usdt:
-            raise PolicyError("paper daily realized loss cap is exhausted")
         if self.ledger.successful_paper_entries(day) >= self.settings.paper.max_successful_entries_per_utc_day:
             raise PolicyError(f"daily PAPER entry quota reached ({self.settings.paper.max_successful_entries_per_utc_day} successful BUY fills per UTC day)")
-        free = Decimal(balance["free_usdt"])
-        if free < self.settings.risk.min_quote_amount or (requested is not None and requested > free):
+        if (not self.settings.sizing_policy.percentage_based
+                and context.equity.available_buying_power
+                < self.settings.risk.min_quote_amount):
             raise PolicyError("insufficient free paper USDT")
+        return context, symbols
 
     def scan(
         self,
@@ -860,6 +1248,8 @@ class SpotGuard:
 
     @localized
     def create_manual_buy_proposal(self, symbol: str, quote_amount: Decimal, live: bool = False, notify: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        paper_context: PolicyContext | None = None
+        paper_symbols: set[str] = set()
         raw_symbol = symbol.upper()
         symbol = raw_symbol if raw_symbol.endswith(self.settings.risk.quote_asset) else raw_symbol + self.settings.risk.quote_asset
         if symbol not in self.settings.market.symbols:
@@ -868,13 +1258,16 @@ class SpotGuard:
             if symbol not in self.settings.live.allowed_symbols:
                 raise SecurityError("symbol is not enabled for live Spot intent")
             if not self.settings.live.enabled:
-                raise SecurityError("live trading is disabled")
+                raise SecurityError("LIVE_NOT_ENABLED: live trading is disabled")
             if not self.live_arm.status().armed:
-                raise SecurityError("live trading is not armed on the VPS")
+                raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
             if quote_amount <= 0:
                 raise PolicyError("LIVE quote amount must be positive")
-            if quote_amount > self.settings.live.max_live_trade_usdt:
-                raise PolicyError(f"requested amount {quote_amount} USDT exceeds configured maximum {self.settings.live.max_quote_per_entry_usdt} USDT")
+            ceiling = absolute_entry_ceiling(self.settings, "live")
+            if ceiling is not None and quote_amount > ceiling:
+                raise PolicyError(
+                    f"requested amount {quote_amount} USDT exceeds configured maximum {decimal_string(ceiling)} USDT"
+                )
             readiness = self.live_status(check_symbols=True)
             if not readiness["execution_ready"]:
                 raise SecurityError("live execution readiness checks have not all passed")
@@ -884,17 +1277,25 @@ class SpotGuard:
                 raise SecurityError("manual paper tests are only available when mode == paper")
             if quote_amount <= 0:
                 raise PolicyError("PAPER quote amount must be positive")
-            if quote_amount > self.settings.paper.max_quote_per_entry_usdt:
-                raise PolicyError(f"requested amount {quote_amount} USDT exceeds configured maximum {self.settings.paper.max_quote_per_entry_usdt} USDT")
+            ceiling = absolute_entry_ceiling(self.settings, "paper")
+            if ceiling is not None and quote_amount > ceiling:
+                raise PolicyError(
+                    f"requested amount {quote_amount} USDT exceeds configured maximum {decimal_string(ceiling)} USDT"
+                )
             proposal_mode, source, ttl = "paper", "manual-paper-test", None
-            self._ensure_paper_entry_available(symbol, quote_amount)
+            paper_context, paper_symbols = self._ensure_paper_entry_available(
+                symbol, quote_amount
+            )
         market = fetch_spot_snapshot(self.settings, symbol)
         quantity = floor_to_step(quote_amount / market.ask, market.step_size)
         spend = quantity * market.ask
         if quantity <= 0 or spend < market.min_notional:
             minimum_units = (market.min_notional / market.ask / market.step_size).to_integral_value(rounding=ROUND_CEILING)
             minimum_quote = minimum_units * market.step_size * market.ask
-            raise PolicyError(f"requested {quote_amount} USDT is below the current minimum notional request of {minimum_quote:f} USDT after downward quantity-step rounding; amount was not increased")
+            raise PolicyError(
+                "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: "
+                f"requested {quote_amount} USDT is below Binance minimum notional request {minimum_quote:f} USDT after downward quantity-step rounding; amount was not increased"
+            )
         klines = fetch_klines(self.settings, symbol)
         snapshot = analyze(klines)
         fingerprint = hashlib.sha256(f"{source}:{symbol}:{time.time_ns()}:{secrets.token_hex(4)}".encode()).hexdigest()
@@ -902,12 +1303,31 @@ class SpotGuard:
         candidate, _ = self.ledger.create_candidate(signal, self.settings.market.candidate_ttl_minutes)
         values = build_proposal(self.settings, candidate, market.bid, market.ask, quote_amount, "Manual intent; signal-score requirement bypassed only.", proposal_mode=proposal_mode, source=source, ttl_seconds=ttl)
         if not live:
+            assert paper_context is not None
+            existing_exposure, existing_risk = self._paper_symbol_usage(symbol)
+            sizing: SizingDecision | None = None
+            if self.settings.sizing_policy.percentage_based:
+                sizing = size_entry(
+                    paper_context,
+                    entry_price=Decimal(values["entry_reference"]),
+                    stop_price=Decimal(values["stop_reference"]),
+                    existing_position_exposure=existing_exposure,
+                    existing_position_risk=existing_risk,
+                    requested_notional=quote_amount,
+                    fee_buffer_rate=self.settings.risk.paper_fee_pct / Decimal("100"),
+                )
+                self._raise_sizing_rejection(sizing, phase="proposal")
             reference_plan = build_fill_risk(self.settings, values, market.ask, quantity)
-            projection = self._paper_risk_projection(symbol, market.ask, reference_plan, bid=market.bid, ask=market.ask, reward_risk=Decimal(values["reward_risk"]))
+            projection = self._paper_risk_projection(
+                symbol, market.ask, reference_plan, bid=market.bid, ask=market.ask,
+                reward_risk=Decimal(values["reward_risk"]),
+                effective_limits=paper_context.effective_limits,
+            )
             values["canonical"].update({
                 "projected_risk_at_stop": str(projection["new_position_risk"]),
                 "projected_aggregate_risk": str(projection["projected_aggregate_risk"]),
                 "reference_quantity": reference_plan["net_base_quantity"],
+                "gross_reference_quantity": reference_plan["gross_base_quantity"],
                 "fee_estimate_base": reference_plan["entry_fee_base"],
                 "fee_estimate_asset": symbol[:-4],
                 "fee_estimate_usdt": str(Decimal(reference_plan["entry_fee_base"]) * market.ask),
@@ -936,12 +1356,30 @@ class SpotGuard:
                     "fee_estimate_usdt": str(Decimal(reference_plan["entry_fee_base"]) * market.ask)})
                 values["canonical_json"] = canonical_json(values["canonical"])
 
+            evaluation = self._evaluate_paper_entry(
+                paper_context, paper_symbols, symbol, quote_amount,
+                projected_position_risk=Decimal(str(projection["new_position_risk"])),
+                projected_aggregate_risk=Decimal(str(projection["projected_aggregate_risk"])),
+                projected_position_exposure=existing_exposure + spend,
+                estimated_fee=(
+                    sizing.estimated_fee_buffer if sizing is not None else Decimal("0")
+                ),
+            )
+            self._attach_policy_snapshot(
+                values, paper_context, evaluation, sizing,
+                Decimal(str(reference_plan["gross_base_quantity"])),
+            )
+
         if live:
             self._prepare_live_entry_proposal(values, quote_amount, market, readiness["execution_ready"])
         token = self.signer.approval_token(values["canonical_json"])
         code = self.signer.paper_confirmation_code(values["canonical_json"]) if values["mode"] == "paper" else None
         values["locale"] = self.locale
-        proposal = self.ledger.create_proposal(values, self.signer.token_hash(token), self.settings.risk.max_active_proposals, self.signer.token_hash(code) if code else None)
+        proposal = self.ledger.create_proposal(
+            values, self.signer.token_hash(token),
+            self._active_proposal_limit(proposal_mode),
+            self.signer.token_hash(code) if code else None,
+        )
         self.ledger.add_event("manual.proposal", proposal["id"], {"source": source, "symbol": symbol, "quote_amount": str(quote_amount)})
         result = {"proposal": proposal, "notification": None}
         if notify:
@@ -960,8 +1398,10 @@ class SpotGuard:
                     else "PAPER proposal exists; notification was not delivered.")
         return result
 
-    def _prepare_live_entry_proposal(self, values: dict[str, Any], quote_amount: Decimal,
-                                     market: Any, execution_ready: bool) -> None:
+    def _prepare_live_entry_proposal(
+        self, values: dict[str, Any], quote_amount: Decimal,
+        market: Any, execution_ready: bool, *, auto_size: bool = False,
+    ) -> None:
         """Attach the immutable, exchange-aligned LIVE terms every entry needs.
 
         Both manual and scheduled/candidate entries call this one function so
@@ -972,24 +1412,47 @@ class SpotGuard:
         symbol = str(canonical["symbol"])
         if symbol not in self.settings.live.allowed_symbols:
             raise SecurityError("symbol is not enabled for live Spot intent")
-        if quote_amount <= 0 or quote_amount > self.settings.live.max_quote_per_entry_usdt:
-            raise PolicyError("LIVE quote amount exceeds configured per-entry limit")
+        ceiling = absolute_entry_ceiling(self.settings, "live")
+        if quote_amount <= 0 or (
+            ceiling is not None and quote_amount > ceiling
+        ):
+            raise PolicyError("LIVE quote amount exceeds the applicable entry limit")
         limit_price = floor_to_step(Decimal(values["entry_reference"]), market.price_tick_size)
         stop_price = floor_to_step(Decimal(values["stop_reference"]), market.price_tick_size)
         reward_risk = Decimal(values["reward_risk"])
         target_price = limit_price + reward_risk * (limit_price - stop_price)
         if stop_price <= 0 or not stop_price < limit_price < target_price:
             raise PolicyError("LIVE tick-aligned bracket is invalid")
+        if auto_size and self.settings.sizing_policy.percentage_based:
+            preview = self._validate_live_entry_limits(
+                symbol,
+                limit_price,
+                Decimal("1"),
+                limit_price - stop_price,
+                market.bid,
+                explain=True,
+                auto_size=True,
+            )
+            quote_amount = Decimal(str(preview["calculated_notional"]))
+            if quote_amount <= 0:
+                raise PolicyError(
+                    "REVALIDATION_FAILED: risk engine found no positive LIVE capacity"
+                )
+            values["quote_amount"] = str(quote_amount)
+            canonical["quote_amount"] = str(quote_amount)
         live_quantity = floor_to_step(quote_amount / limit_price, market.step_size)
         if live_quantity <= 0 or live_quantity * limit_price < market.min_notional:
-            raise PolicyError("requested LIVE amount is below Binance minimum notional after rounding; amount will not be increased")
+            raise PolicyError(
+                "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: requested LIVE amount is below Binance minimum notional after rounding; amount will not be increased"
+            )
         pending_quantity = floor_to_step(
             live_quantity * (Decimal("1") - self.settings.risk.paper_fee_pct / Decimal("100")), market.step_size,
         )
         if pending_quantity <= 0:
             raise PolicyError("LIVE protective quantity is zero after fee and LOT_SIZE rounding")
         risk_at_stop = live_quantity * (limit_price - stop_price)
-        if risk_at_stop > self.settings.live.max_risk_per_position_usdt:
+        if (absolute_entry_ceiling(self.settings, "live") is not None
+                and risk_at_stop > self.settings.live.max_risk_per_position_usdt):
             raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
         projection = self._validate_live_entry_limits(symbol, quote_amount, live_quantity, risk_at_stop, market.bid)
         values.update({"entry_reference": str(limit_price), "stop_reference": str(stop_price),
@@ -1001,70 +1464,159 @@ class SpotGuard:
             "risk_at_stop": str(risk_at_stop), "fee_estimate": str(quote_amount * self.settings.risk.paper_fee_pct / Decimal("100")),
             "protection": "OPO_WITH_PENDING_SELL_OCO_REQUIRED",
             "execution_ready_at_creation": execution_ready, **projection})
+        policy_snapshot = canonical.get("policy_snapshot")
+        if self.settings.sizing_policy.percentage_based and not isinstance(
+            policy_snapshot, dict
+        ):
+            raise PolicyError(
+                "REVALIDATION_FAILED: LIVE policy evaluator returned no immutable snapshot"
+            )
+        sizing_snapshot = (
+            policy_snapshot.get("sizing") or {}
+            if isinstance(policy_snapshot, dict) else {}
+        )
+        proposal_terms = {
+            "proposal_id": canonical["proposal_id"],
+            "created_at": canonical["created_at"],
+            "expires_at": canonical["expires_at"],
+            "symbol": symbol,
+            "side": "BUY",
+            "strategy_or_signal_reference": canonical.get("candidate_id"),
+            "source": canonical.get("source"),
+            "entry_price": str(limit_price),
+            "stop_price": str(stop_price),
+            "target_price": str(target_price),
+            "stop_distance_pct": sizing_snapshot.get("stop_distance_pct"),
+            "risk_budget_at_proposal": sizing_snapshot.get("risk_budget"),
+            "calculated_notional": str(quote_amount),
+            "calculated_quantity": str(live_quantity),
+            "expected_risk": str(risk_at_stop),
+        }
+        if isinstance(policy_snapshot, dict):
+            policy_snapshot["proposal_terms"] = proposal_terms
         values["canonical_json"] = canonical_json(canonical)
 
     def _validate_live_entry_limits(self, symbol: str, quote_amount: Decimal,
                                     quantity: Decimal, risk_at_stop: Decimal,
-                                    bid: Decimal) -> dict[str, str | int]:
+                                    bid: Decimal, *, explain: bool = False,
+                                    proposal_equity: Decimal | None = None,
+                                    auto_size: bool = False) -> dict[str, Any]:
         """Fail closed on independently read LIVE account/order/trade evidence.
 
-        Existing holdings without an auditable entry-cost basis deliberately
-        block a new entry. This is stricter than estimating aggregate risk from
-        current price and prevents a second LIVE trade from bypassing a limit.
+        Existing holdings require complete balance, mark-price, and protective
+        OCO evidence. Missing evidence blocks a new entry instead of silently
+        under-reporting exposure or stop-risk.
         """
         account = self.live_executor.read_spot_account()
         orders = self.live_executor.read_open_spot_orders()
         quote_asset = self.settings.risk.quote_asset
-        free_quote = next((Decimal(row["free"]) for row in account["balances"]
-                           if row["asset"] == quote_asset), Decimal("0"))
-        projected_free = free_quote - quote_amount
-        if projected_free < self.settings.live.min_free_reserve_usdt:
-            raise PolicyError("LIVE free USDT reserve would fall below "
-                              f"{self.settings.live.min_free_reserve_usdt} USDT")
 
         grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for order in orders:
             list_id = order.get("orderListId")
-            if order.get("symbol") in self.settings.live.allowed_symbols and isinstance(list_id, int) and list_id > 0:
+            if (order.get("symbol") in self.settings.live.allowed_symbols
+                    and isinstance(list_id, int) and list_id > 0):
                 grouped.setdefault((str(order["symbol"]), list_id), []).append(order)
         active_tranches = len(grouped)
         active_symbols = {entry_symbol for entry_symbol, _ in grouped}
         if active_tranches + 1 > self.settings.live.max_active_tranches:
-            raise PolicyError(f"LIVE active tranche limit reached ({self.settings.live.max_active_tranches})")
-        if len(active_symbols | {symbol}) > self.settings.live.max_economic_positions:
-            raise PolicyError(f"LIVE economic-position limit reached ({self.settings.live.max_economic_positions})")
+            raise PolicyError(
+                f"LIVE active tranche limit reached ({self.settings.live.max_active_tranches})"
+            )
 
-        # OCO quantities are the only exchange-side position evidence exposed
-        # by the approved read surface. Value them at current bid for exposure;
-        # any malformed or incomplete OCO is an execution blocker.
-        existing_exposure = Decimal("0")
         protected_quantities: dict[str, Decimal] = {}
+        snapshots: dict[str, Any] = {}
+        risk_by_symbol: dict[str, Decimal] = {}
+        exposure_by_symbol: dict[str, Decimal] = {}
+        existing_exposure = Decimal("0")
         for (existing_symbol, _), legs in grouped.items():
             quantities = {Decimal(str(row.get("origQty", "0"))) for row in legs}
-            if len(legs) != 2 or len(quantities) != 1 or next(iter(quantities)) <= 0:
-                raise SecurityError("LIVE open protection is incomplete; reconciliation required")
+            stop_prices = [
+                Decimal(str(row.get("stopPrice", "0")))
+                for row in legs if Decimal(str(row.get("stopPrice", "0"))) > 0
+            ]
+            if (len(legs) != 2 or len(quantities) != 1
+                    or next(iter(quantities)) <= 0 or len(stop_prices) != 2):
+                raise SecurityError(
+                    "LIVE open protection is incomplete; reconciliation required"
+                )
             snapshot = fetch_spot_snapshot(self.settings, existing_symbol)
+            snapshots[existing_symbol] = snapshot
             protected_quantity = next(iter(quantities))
-            protected_quantities[existing_symbol] = protected_quantities.get(existing_symbol, Decimal("0")) + protected_quantity
-            existing_exposure += protected_quantity * snapshot.bid
+            protected_quantities[existing_symbol] = (
+                protected_quantities.get(existing_symbol, Decimal("0"))
+                + protected_quantity
+            )
+            marked_exposure = protected_quantity * snapshot.bid
+            existing_exposure += marked_exposure
+            exposure_by_symbol[existing_symbol] = (
+                exposure_by_symbol.get(existing_symbol, Decimal("0"))
+                + marked_exposure
+            )
+            protective_stop = min(stop_prices)
+            protective_target = max(stop_prices)
+            ratio = self.settings.risk.min_reward_risk
+            inferred_entry = (
+                protective_target + ratio * protective_stop
+            ) / (Decimal("1") + ratio)
+            if not protective_stop < inferred_entry < protective_target:
+                raise SecurityError(
+                    "LIVE protected entry basis cannot be reconstructed; reconciliation required"
+                )
+            risk_by_symbol[existing_symbol] = (
+                risk_by_symbol.get(existing_symbol, Decimal("0"))
+                + protected_quantity * (inferred_entry - protective_stop)
+            )
+
+        free_quote = Decimal("0")
+        locked_quote = Decimal("0")
+        held_by_symbol: dict[str, Decimal] = {}
         for balance in account["balances"]:
-            asset = balance["asset"]
-            matching_symbol = next((candidate for candidate in self.settings.live.allowed_symbols
-                                    if candidate == asset + quote_asset), None)
-            if matching_symbol is None:
+            asset = str(balance["asset"])
+            free = Decimal(str(balance["free"]))
+            locked = Decimal(str(balance.get("locked", "0")))
+            if min(free, locked) < 0 or not free.is_finite() or not locked.is_finite():
+                raise SecurityError("LIVE Spot balance snapshot is invalid")
+            if asset == quote_asset:
+                free_quote += free
+                locked_quote += locked
                 continue
-            held = Decimal(balance["free"]) + Decimal(balance["locked"])
-            # A base balance that is not exactly represented by its active OCO
-            # may be a manual/external position. It has no immutable entry and
-            # stop evidence, so it must not be excluded from aggregate risk.
-            if held > protected_quantities.get(matching_symbol, Decimal("0")):
-                raise SecurityError("LIVE base balance is not fully protected by an auditable OCO; reconciliation required")
-        projected_exposure = existing_exposure + quote_amount
-        if projected_exposure > self.settings.live.max_open_exposure_usdt:
-            raise PolicyError("LIVE exposure limit reached: projected exposure would exceed "
-                              f"{self.settings.live.max_open_exposure_usdt} USDT")
-        if risk_at_stop > self.settings.live.max_risk_per_position_usdt:
-            raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
+            held = free + locked
+            if held <= 0:
+                continue
+            matching_symbol = next(
+                (candidate for candidate in self.settings.live.allowed_symbols
+                 if candidate == asset + quote_asset), None
+            )
+            if matching_symbol is None:
+                if self.settings.sizing_policy.enabled:
+                    raise SecurityError(
+                        f"LIVE Spot asset {asset} cannot be valued in configured {quote_asset}; reconciliation required"
+                    )
+                continue
+            held_by_symbol[matching_symbol] = held
+            if held != protected_quantities.get(matching_symbol, Decimal("0")):
+                raise SecurityError(
+                    "LIVE base balance is not fully protected by an auditable OCO; reconciliation required"
+                )
+
+        for protected_symbol, protected_quantity in protected_quantities.items():
+            if held_by_symbol.get(protected_symbol, Decimal("0")) != protected_quantity:
+                raise SecurityError(
+                    "LIVE OCO quantity does not match Spot balance; reconciliation required"
+                )
+
+        valuations: list[AssetValuation] = []
+        for held_symbol, held in sorted(held_by_symbol.items()):
+            snapshot = snapshots.get(held_symbol)
+            if snapshot is None:
+                snapshot = fetch_spot_snapshot(self.settings, held_symbol)
+                snapshots[held_symbol] = snapshot
+            valuations.append(AssetValuation(
+                asset=held_symbol[:-len(quote_asset)], symbol=held_symbol,
+                quantity=held, mark_price=snapshot.bid,
+                quote_value=held * snapshot.bid,
+            ))
 
         now = utcnow()
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1086,19 +1638,103 @@ class SpotGuard:
         # rather than under-reporting daily/weekly realized loss.
         if has_sale:
             raise SecurityError("LIVE realized loss cannot be proven from the bounded trade history; reconciliation required")
-        if grouped:
-            raise SecurityError("LIVE aggregate risk for existing positions requires reconciliation; new entry refused")
-        if risk_at_stop > self.settings.live.max_aggregate_risk_usdt:
-            raise PolicyError("LIVE aggregate risk limit reached")
+        raw_equity = (
+            free_quote
+            + locked_quote
+            + sum((item.quote_value for item in valuations), Decimal("0"))
+        )
+        effective_equity = (
+            min(raw_equity, proposal_equity)
+            if proposal_equity is not None else raw_equity
+        )
+        equity = build_equity_snapshot(
+            mode="live", quote_asset=quote_asset,
+            free_quote=free_quote, locked_quote=locked_quote,
+            reserve_quote=effective_reserve(
+                self.settings, "live", effective_equity
+            ),
+            asset_valuations=valuations,
+        )
+        current_aggregate_risk = sum(risk_by_symbol.values(), Decimal("0"))
+        usage = UsageSnapshot(
+            open_exposure=existing_exposure,
+            aggregate_open_risk=current_aggregate_risk,
+            daily_realized_loss=Decimal("0"),
+            economic_positions=len(active_symbols),
+            active_tranches=active_tranches,
+            weekly_realized_loss=Decimal("0"),
+        )
+        hard, effective = limits_for(
+            self.settings, "live", equity.equity,
+            effective_equity=effective_equity,
+        )
+        context = PolicyContext(equity, usage, hard, effective)
+        self._validate_equity_drift(proposal_equity, equity.equity)
+        sizing: SizingDecision | None = None
+        if self.settings.sizing_policy.percentage_based and quantity > 0:
+            sizing_entry = quote_amount / quantity
+            sizing_stop = sizing_entry - risk_at_stop / quantity
+            sizing = size_entry(
+                context,
+                entry_price=sizing_entry,
+                stop_price=sizing_stop,
+                existing_position_exposure=exposure_by_symbol.get(
+                    symbol, Decimal("0")
+                ),
+                existing_position_risk=risk_by_symbol.get(symbol, Decimal("0")),
+                requested_notional=None if auto_size else quote_amount,
+                fee_buffer_rate=self.settings.risk.paper_fee_pct / Decimal("100"),
+            )
+            if not sizing.accepted and not explain:
+                raise PolicyError(
+                    "REVALIDATION_FAILED: ACCOUNT_STATE_CHANGED: immutable LIVE amount was not resized; "
+                    + "; ".join(sizing.reasons)
+                )
+            if auto_size:
+                original_notional = quote_amount
+                quote_amount = sizing.calculated_notional
+                risk_at_stop = (
+                    risk_at_stop * quote_amount / original_notional
+                    if original_notional > 0 else Decimal("0")
+                )
+        projected_exposure = existing_exposure + quote_amount
+        projected_position_exposure = (
+            exposure_by_symbol.get(symbol, Decimal("0")) + quote_amount
+        )
+        projected_position_risk = risk_by_symbol.get(symbol, Decimal("0")) + risk_at_stop
+        projected_aggregate_risk = current_aggregate_risk + risk_at_stop
+        evaluation = evaluate_entry(
+            context,
+            requested_notional=quote_amount,
+            projected_exposure=projected_exposure,
+            projected_position_exposure=projected_position_exposure,
+            projected_position_risk=projected_position_risk,
+            projected_aggregate_risk=projected_aggregate_risk,
+            resulting_economic_positions=len(active_symbols | {symbol}),
+            estimated_fee=(
+                quote_amount * self.settings.risk.paper_fee_pct / Decimal("100")
+                if self.settings.sizing_policy.percentage_based
+                else Decimal("0")
+            ),
+        )
+        if not explain:
+            self._raise_policy_rejection(evaluation, phase="LIVE entry")
+        projected_free = free_quote - quote_amount
         return {"live_risk_snapshot_verified": True,
                 "projected_free_balance": str(projected_free),
                 "projected_total_exposure": str(projected_exposure),
-                "projected_aggregate_risk": str(risk_at_stop),
+                "projected_position_risk": str(projected_position_risk),
+                "projected_aggregate_risk": str(projected_aggregate_risk),
                 "live_entries_today": entries_today,
                 "live_daily_realized_loss": "0",
                 "live_weekly_realized_loss": "0",
                 "active_live_tranches": active_tranches,
-                "active_live_economic_positions": len(active_symbols)}
+                "active_live_economic_positions": len(active_symbols),
+                "calculated_notional": str(quote_amount),
+                "policy_snapshot": build_policy_snapshot(
+                    self.settings, "live", context, evaluation, sizing,
+                    calculated_quantity=quantity,
+                )}
 
     @staticmethod
     def _is_live_buy_entry(canonical: dict[str, Any]) -> bool:
@@ -1114,13 +1750,30 @@ class SpotGuard:
         canonical = proposal["canonical"]
         if not self._is_live_buy_entry(canonical):
             return
+        self._validate_stored_policy_snapshot(proposal)
         required = ("quote_amount", "quantity", "risk_at_stop", "entry_limit_price")
         if any(key not in canonical for key in required):
             raise SecurityError("LIVE BUY proposal is missing immutable risk terms")
+        market = fetch_spot_snapshot(self.settings, proposal["symbol"])
+        quantity = Decimal(str(canonical["quantity"]))
+        entry = Decimal(str(canonical["entry_limit_price"]))
+        stop = Decimal(str(canonical["stop_reference"]))
+        target = Decimal(str(canonical["take_profit_reference"]))
+        if (quantity <= 0 or quantity % market.step_size != 0
+                or entry % market.price_tick_size != 0
+                or stop % market.price_tick_size != 0
+                or target % market.price_tick_size != 0):
+            raise PolicyError(
+                "EXCHANGE_FILTER_FAILED: fresh Binance quantity/price filters no longer match immutable proposal"
+            )
+        if quantity * entry < market.min_notional:
+            raise PolicyError(
+                "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: fresh Binance minimum notional rejects immutable proposal; amount was not increased"
+            )
         self._validate_live_entry_limits(
             proposal["symbol"], Decimal(str(canonical["quote_amount"])),
-            Decimal(str(canonical["quantity"])), Decimal(str(canonical["risk_at_stop"])),
-            Decimal(str(canonical["entry_limit_price"])),
+            quantity, Decimal(str(canonical["risk_at_stop"])), market.bid,
+            proposal_equity=self._proposal_equity(proposal),
         )
 
     @localized
@@ -1458,26 +2111,141 @@ class SpotGuard:
     ) -> dict[str, Any]:
         proposal_mode = self.settings.scheduled_proposal_mode
         candidate_preview = self.ledger.get_candidate(candidate_id)
+        paper_context: PolicyContext | None = None
+        paper_symbols: set[str] = set()
+        requested_amount = quote_amount
+        initial_amount = (
+            requested_amount
+            if requested_amount is not None
+            else (
+                None
+                if self.settings.sizing_policy.percentage_based
+                else self.settings.risk.default_quote_amount
+            )
+        )
         if proposal_mode == "paper":
-            self._ensure_paper_entry_available(candidate_preview["symbol"], quote_amount or self.settings.risk.default_quote_amount)
+            paper_context, paper_symbols = self._ensure_paper_entry_available(
+                candidate_preview["symbol"],
+                initial_amount,
+            )
         elif not self.live_status()["execution_ready"]:
             raise SecurityError("scheduled LIVE proposal mode is not execution-ready")
-        if self.ledger.active_proposal_count() >= self.settings.risk.max_active_proposals:
+        if self.ledger.active_proposal_count() >= self._active_proposal_limit(
+            proposal_mode
+        ):
             raise SpotGuardError("maximum active proposal count has been reached")
         candidate = self.ledger.get_candidate(candidate_id)
         if not candidate["metrics"].get("agent_os_confirmed") and not candidate["metrics"].get("paper_demo"):
             raise SpotGuardError("candidate lacks successful Agent OS confirmation")
+        sizing: SizingDecision | None = None
+        amount = initial_amount or self.settings.risk.min_quote_amount
+        if proposal_mode == "paper" and self.settings.sizing_policy.percentage_based:
+            assert paper_context is not None
+            preliminary = entry_policy_terms(
+                self.settings,
+                candidate_price=candidate["price"],
+                atr_value=candidate["metrics"]["atr_14"],
+                bid_reference=bid_reference,
+                ask_reference=ask_reference,
+                quote_amount=amount,
+                mode="paper",
+            )
+            existing_exposure, existing_risk = self._paper_symbol_usage(
+                candidate["symbol"]
+            )
+            sizing = size_entry(
+                paper_context,
+                entry_price=preliminary["entry_reference"],
+                stop_price=preliminary["stop_reference"],
+                existing_position_exposure=existing_exposure,
+                existing_position_risk=existing_risk,
+                requested_notional=requested_amount,
+                fee_buffer_rate=self.settings.risk.paper_fee_pct / Decimal("100"),
+            )
+            self._raise_sizing_rejection(sizing, phase="proposal")
+            amount = sizing.calculated_notional
+        reference_quantity_override: Decimal | None = None
+        proposal_exchange_minimum: Decimal | None = None
+        proposal_exchange_step: Decimal | None = None
+        if proposal_mode == "paper" and self.settings.sizing_policy.percentage_based:
+            if candidate["metrics"].get("paper_demo"):
+                proposal_exchange_minimum = self.settings.risk.min_quote_amount
+                proposal_exchange_step = Decimal("0.00000001")
+            else:
+                proposal_market = fetch_spot_snapshot(
+                    self.settings, candidate["symbol"]
+                )
+                proposal_exchange_minimum = proposal_market.min_notional
+                proposal_exchange_step = proposal_market.step_size
+            reference_quantity_override = floor_to_step(
+                amount / ask_reference, proposal_exchange_step
+            )
+            if (reference_quantity_override <= 0
+                    or reference_quantity_override * ask_reference
+                    < proposal_exchange_minimum):
+                raise PolicyError(
+                    "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: Binance minimum notional exceeds the safe risk-derived size after downward LOT_SIZE rounding; amount was not increased"
+                )
         proposal_values = build_proposal(
             self.settings,
             candidate,
             bid_reference,
             ask_reference,
-            quote_amount or self.settings.risk.default_quote_amount,
+            amount,
             rationale,
             proposal_mode=proposal_mode,
             source="deterministic-signal",
         )
-        if proposal_mode == "live":
+        if proposal_mode == "paper":
+            assert paper_context is not None
+            reference_quantity = (
+                reference_quantity_override
+                if reference_quantity_override is not None
+                else amount / ask_reference
+            )
+            reference_plan = build_fill_risk(
+                self.settings, proposal_values, ask_reference, reference_quantity
+            )
+            projection = self._paper_risk_projection(
+                candidate["symbol"], ask_reference, reference_plan,
+                bid=bid_reference, ask=ask_reference,
+                reward_risk=Decimal(proposal_values["reward_risk"]),
+                effective_limits=paper_context.effective_limits,
+            )
+            proposal_values["canonical"].update({
+                "projected_risk_at_stop": str(projection["new_position_risk"]),
+                "projected_aggregate_risk": str(projection["projected_aggregate_risk"]),
+                "reference_quantity": reference_plan["net_base_quantity"],
+                "gross_reference_quantity": reference_plan["gross_base_quantity"],
+                "exchange_min_notional": (
+                    str(proposal_exchange_minimum)
+                    if proposal_exchange_minimum is not None else None
+                ),
+                "quantity_step": (
+                    str(proposal_exchange_step)
+                    if proposal_exchange_step is not None else None
+                ),
+            })
+            evaluation = self._evaluate_paper_entry(
+                paper_context, paper_symbols, candidate["symbol"], amount,
+                projected_position_risk=Decimal(str(projection["new_position_risk"])),
+                projected_aggregate_risk=Decimal(str(projection["projected_aggregate_risk"])),
+                projected_position_exposure=(
+                    self._paper_symbol_usage(candidate["symbol"])[0]
+                    + Decimal(str(reference_plan["quote_spent"]))
+                ),
+                estimated_fee=(
+                    sizing.estimated_fee_buffer if sizing is not None else Decimal("0")
+                ),
+            )
+            self._attach_policy_snapshot(
+                proposal_values,
+                paper_context,
+                evaluation,
+                sizing,
+                Decimal(str(reference_plan["gross_base_quantity"])),
+            )
+        else:
             # Scheduled/candidate LIVE proposals receive the same fresh public
             # quote, exchange rounding, account snapshot, and OTOCO invariant
             # as a manually requested LIVE entry.
@@ -1486,8 +2254,12 @@ class SpotGuard:
             if not readiness["execution_ready"]:
                 raise SecurityError("scheduled LIVE proposal mode is not execution-ready")
             self._prepare_live_entry_proposal(
-                proposal_values, quote_amount or self.settings.risk.default_quote_amount,
+                proposal_values, amount,
                 market, readiness["execution_ready"],
+                auto_size=(
+                    requested_amount is None
+                    and self.settings.sizing_policy.percentage_based
+                ),
             )
         token = self.signer.approval_token(proposal_values["canonical_json"])
         code = self.signer.paper_confirmation_code(proposal_values["canonical_json"]) if proposal_values["mode"] == "paper" else None
@@ -1495,7 +2267,7 @@ class SpotGuard:
         proposal = self.ledger.create_proposal(
             proposal_values,
             self.signer.token_hash(token),
-            self.settings.risk.max_active_proposals,
+            self._active_proposal_limit(proposal_mode),
             self.signer.token_hash(code) if code else None,
         )
         result: dict[str, Any] = {"proposal": proposal, "notification": None}
@@ -1569,7 +2341,9 @@ class SpotGuard:
             raise SecurityError("paper confirmation chat does not match")
         proposal = self.ledger.get_proposal(proposal_id, include_private=True)
         if proposal["status"] != "PENDING" or parse_time(proposal["expires_at"]) <= utcnow():
-            raise SecurityError("paper proposal is not pending or has expired")
+            raise SecurityError(
+                "PROPOSAL_EXPIRED: APPROVAL_EXPIRED: paper proposal is not pending or has expired"
+            )
         if proposal["canonical"].get("approval_owner_id") != sender_id or proposal["canonical"].get("approval_chat_id") != chat_id:
             raise SecurityError("paper confirmation does not match proposal ownership")
         if proposal["mode"] != "paper" or proposal["canonical"].get("mode") != "paper":
@@ -1596,7 +2370,13 @@ class SpotGuard:
         proposal, _ = self._validate_paper_confirmation(proposal_id, code, sender_id, chat_id)
         self._enforce_paper_daily_entry_quota(proposal)
         daily = self.ledger.daily_committed_quote(utcnow().date().isoformat())
-        validate_claim(self.settings, proposal, daily)
+        try:
+            validate_claim(self.settings, proposal, daily)
+            self._revalidate_paper_entry_policy(proposal, phase="approval")
+        except Exception as exc:
+            if proposal["status"] == "PENDING":
+                self._policy_reject(proposal, exc)
+            raise
         lease, lease_hash = self.signer.new_lease()
         lease_expires = isoformat(utcnow() + timedelta(seconds=self.settings.risk.execution_lease_seconds))
         self.ledger.claim_proposal_by_confirmation_code(
@@ -1624,11 +2404,15 @@ class SpotGuard:
         self.ledger.expire_stale_active_proposals()
         actor = self._validate_owner(sender_id)
         proposal = self.ledger.get_proposal(proposal_id)
+        if proposal["status"] == "EXPIRED":
+            raise SecurityError(
+                "PROPOSAL_EXPIRED: APPROVAL_EXPIRED: proposal approval window expired"
+            )
         effective_chat = chat_id or self.settings.telegram.chat_id
         if effective_chat != self.settings.telegram.chat_id or proposal["canonical"].get("approval_chat_id") != effective_chat or proposal["canonical"].get("approval_owner_id") != sender_id:
             raise SecurityError("rejection ownership or chat binding does not match")
         if not self.signer.verify_approval(proposal["canonical_json"], token):
-            raise SecurityError("approval token does not match the proposal")
+            raise SecurityError("APPROVAL_INVALID: approval token does not match the proposal")
         return self.ledger.reject_proposal(proposal_id, self.signer.token_hash(token), actor)
 
     @localized
@@ -1636,20 +2420,36 @@ class SpotGuard:
         self.ledger.expire_stale_active_proposals()
         actor = self._validate_owner(sender_id)
         proposal = self.ledger.get_proposal(proposal_id)
+        if proposal["status"] == "EXPIRED":
+            raise SecurityError(
+                "PROPOSAL_EXPIRED: APPROVAL_EXPIRED: proposal approval window expired"
+            )
         effective_chat = chat_id or self.settings.telegram.chat_id
         if effective_chat != self.settings.telegram.chat_id or proposal["canonical"].get("approval_chat_id") != effective_chat or proposal["canonical"].get("approval_owner_id") != sender_id:
             raise SecurityError("approval ownership or chat binding does not match")
         if not self.signer.verify_approval(proposal["canonical_json"], token):
-            raise SecurityError("approval token does not match the proposal")
+            raise SecurityError("APPROVAL_INVALID: approval token does not match the proposal")
         self._enforce_paper_daily_entry_quota(proposal)
         daily = self.ledger.daily_committed_quote(utcnow().date().isoformat())
-        validate_claim(self.settings, proposal, daily)
-        if proposal["mode"] == "live":
-            # Re-check the exact pair at the final execution gate.
-            readiness = self.live_status(check_symbols=True, symbols=[proposal["symbol"]])
-            if not readiness["execution_ready"]:
-                raise SecurityError("live approval fails closed; readiness blockers: " + ", ".join(readiness["blockers"]))
-            self._revalidate_live_buy_entry(proposal)
+        try:
+            validate_claim(self.settings, proposal, daily)
+            if proposal["mode"] == "paper":
+                self._revalidate_paper_entry_policy(proposal, phase="approval")
+            else:
+                # Re-check the exact pair at the final execution gate.
+                readiness = self.live_status(
+                    check_symbols=True, symbols=[proposal["symbol"]]
+                )
+                if not readiness["execution_ready"]:
+                    raise SecurityError(
+                        "live approval fails closed; readiness blockers: "
+                        + ", ".join(readiness["blockers"])
+                    )
+                self._revalidate_live_buy_entry(proposal)
+        except Exception as exc:
+            if proposal["status"] == "PENDING":
+                self._policy_reject(proposal, exc)
+            raise
         lease, lease_hash = self.signer.new_lease()
         lease_expires = isoformat(
             utcnow() + timedelta(seconds=self.settings.risk.execution_lease_seconds)
@@ -1661,7 +2461,11 @@ class SpotGuard:
             lease_hash,
             lease_expires,
             utcnow().date().isoformat(),
-            str(self.settings.risk.max_daily_quote),
+            (
+                str(absolute_daily_quote_ceiling(self.settings))
+                if absolute_daily_quote_ceiling(self.settings) is not None
+                else None
+            ),
         )
         return {
             "proposal_id": proposal_id,
@@ -1694,7 +2498,10 @@ class SpotGuard:
             current = self.ledger.get_proposal(proposal_id, include_private=True)
             if current["status"] == "EXECUTING":
                 reason = bounded_text(str(exc), 500) or type(exc).__name__
-                self.ledger.fail_execution(proposal_id, lease_hash, reason)
+                if self.settings.sizing_policy.enabled:
+                    self.ledger.reject_proposal_by_policy(proposal_id, reason)
+                else:
+                    self.ledger.fail_execution(proposal_id, lease_hash, reason)
             raise
 
     @localized
@@ -1702,14 +2509,19 @@ class SpotGuard:
         proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
         if not self.settings.live.enabled:
             self.ledger.fail_execution(proposal_id, lease_hash, "live execution is disabled locally")
-            raise SecurityError("live executor is disabled locally")
+            raise SecurityError("LIVE_NOT_ENABLED: live executor is disabled locally")
         if not self.live_arm.status().armed:
             self.ledger.fail_execution(proposal_id, lease_hash, "live arm expired before executor invocation")
-            raise SecurityError("live trading is not armed on the VPS")
+            raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
         try:
             self._revalidate_live_buy_entry(proposal)
+        except Exception as exc:
+            # No write has started. A stale balance/equity/risk snapshot is a
+            # normal policy rejection, never an ambiguous execution outcome.
+            self._policy_reject(proposal, exc)
+        try:
             if proposal["canonical"].get("source") == "manual-live-cancel-protection":
                 list_id = proposal["canonical"]["order_list_id"]
                 current = self.live_executor.read_open_spot_orders()
@@ -1780,17 +2592,67 @@ class SpotGuard:
             reference = Decimal(proposal["entry_reference"])
             drift = abs(fill_price - reference) / reference * Decimal("100")
             if drift > self.settings.market.max_entry_drift_pct:
-                self.ledger.fail_execution(proposal_id, lease_hash, "fresh price drift exceeds configured limit; requote required")
+                if not self.settings.sizing_policy.enabled:
+                    self.ledger.fail_execution(proposal_id, lease_hash, "fresh price drift exceeds configured limit; requote required")
                 raise PolicyError("fresh price drift exceeds configured limit; proposal rejected, request a requote")
         requested = Decimal(proposal["quote_amount"])
         gross = floor_to_step(requested / fill_price, step)
         if gross <= 0 or gross * fill_price < min_notional:
-            self.ledger.fail_execution(proposal_id, lease_hash, "fresh exchange filters fail minimum notional or quantity step")
-            raise PolicyError("fresh exchange filters reject the fill; proposal rejected, request a requote")
+            if not self.settings.sizing_policy.enabled:
+                self.ledger.fail_execution(proposal_id, lease_hash, "fresh exchange filters fail minimum notional or quantity step")
+            raise PolicyError(
+                "EXCHANGE_FILTER_FAILED: fresh exchange filters reject the immutable fill; proposal rejected, request a new proposal"
+            )
         plan = build_fill_risk(self.settings, proposal, fill_price, gross)
+        self._validate_stored_policy_snapshot(proposal)
+        fresh_bid = fill_price if is_demo else market.bid
+        fresh_ask = fill_price if is_demo else market.ask
+        proposal_equity = self._proposal_equity(proposal)
+        context, symbols = self._paper_policy_context(
+            price_overrides={proposal["symbol"]: fresh_bid},
+            effective_equity=proposal_equity,
+        )
+        self._validate_equity_drift(proposal_equity, context.equity.equity)
+        if self.settings.sizing_policy.percentage_based:
+            existing_exposure, existing_risk = self._paper_symbol_usage(
+                proposal["symbol"]
+            )
+            sizing = size_entry(
+                context,
+                entry_price=Decimal(proposal["entry_reference"]),
+                stop_price=Decimal(proposal["stop_reference"]),
+                existing_position_exposure=existing_exposure,
+                existing_position_risk=existing_risk,
+                requested_notional=requested,
+                fee_buffer_rate=self.settings.risk.paper_fee_pct / Decimal("100"),
+            )
+            if not sizing.accepted:
+                raise PolicyError(
+                    "REVALIDATION_FAILED: ACCOUNT_STATE_CHANGED: immutable proposal was not resized; "
+                    + "; ".join(sizing.reasons)
+                )
         projection = self._paper_risk_projection(proposal["symbol"], fill_price, plan,
-            bid=fill_price if is_demo else market.bid, ask=fill_price if is_demo else market.ask,
-            reward_risk=Decimal(proposal["reward_risk"]))
+            bid=fresh_bid, ask=fresh_ask,
+            reward_risk=Decimal(proposal["reward_risk"]),
+            effective_limits=context.effective_limits)
+        evaluation = self._evaluate_paper_entry(
+            context, symbols, proposal["symbol"], requested,
+            projected_position_risk=Decimal(str(projection["new_position_risk"])),
+            projected_aggregate_risk=Decimal(str(projection["projected_aggregate_risk"])),
+            projected_exposure=(
+                context.usage.open_exposure + Decimal(str(plan["quote_spent"]))
+            ),
+            projected_position_exposure=(
+                self._paper_symbol_usage(proposal["symbol"])[0]
+                + Decimal(str(plan["quote_spent"]))
+            ),
+            estimated_fee=(
+                requested * self.settings.risk.paper_fee_pct / Decimal("100")
+                if self.settings.sizing_policy.percentage_based
+                else Decimal("0")
+            ),
+        )
+        self._raise_policy_rejection(evaluation, phase="execution")
         order_id = f"paper-{proposal_id[2:]}"
         position_id = f"pp-{proposal_id[2:]}"
         opened_at = isoformat()
@@ -1825,11 +2687,22 @@ class SpotGuard:
         fee_usdt = Decimal(plan["entry_fee_base"]) * fill_price
         result = self.ledger.finish_paper_and_open(proposal_id, lease_hash, order_id, summary,
             position, fee_usdt, self.settings.paper.max_active_tranches,
-            self.settings.paper.max_open_exposure_usdt, self.settings.paper.max_risk_per_position_usdt,
-            self.settings.paper.max_aggregate_risk_usdt,
+            context.effective_limits.max_total_open_exposure,
+            context.effective_limits.max_risk_per_position,
+            context.effective_limits.max_aggregate_open_risk,
             self.settings.risk.paper_fee_pct / Decimal("100"),
             self.settings.paper.slippage_pct / Decimal("100"),
-            fill_price if is_demo else market.bid, fill_price if is_demo else market.ask)
+            fresh_bid, fresh_ask,
+            context.effective_limits.max_economic_positions,
+            context.equity.reserve_quote,
+            context.effective_limits.max_daily_realized_loss,
+            utcnow().date().isoformat(),
+            context.effective_limits.max_entry_notional,
+            context.effective_limits.max_weekly_realized_loss,
+            isoformat(
+                utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                - timedelta(days=utcnow().weekday())
+            ))
         self.ledger.add_event("paper.fill", proposal_id, summary)
         return result
 
@@ -1919,7 +2792,17 @@ class SpotGuard:
             connected=bool(agent.get("authenticated") and agent.get("mcp_configured")), armed=arm.armed,
             symbol_flags_verified=flags_ok)
         result = readiness.to_dict()
-        minimum_profile_balance = self.settings.live.max_quote_per_entry_usdt + self.settings.live.min_free_reserve_usdt
+        minimum_profile_balance = (
+            None
+            if self.settings.sizing_policy.percentage_based
+            else self.settings.live.max_quote_per_entry_usdt
+            + self.settings.live.min_free_reserve_usdt
+        )
+        balance_note = (
+            "Schema-v2 entry and reserve allowances depend on fresh Spot equity and free quote; use policy explain for a read-only snapshot."
+            if self.settings.sizing_policy.percentage_based
+            else "A 28 USDT account cannot support a 100 USDT entry plus the 8 USDT reserve. This status report does not claim an account-read or write-scope verification; the execution gate requires independent evidence."
+        )
         result.update({"arm_expires_at": arm.expires_at,
             "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
             "max_active_tranches": self.settings.live.max_active_tranches,
@@ -1930,8 +2813,11 @@ class SpotGuard:
             "max_aggregate_risk_usdt": str(self.settings.live.max_aggregate_risk_usdt),
             "daily_realized_loss_cap_usdt": str(self.settings.live.daily_realized_loss_cap_usdt),
             "max_successful_entries_per_utc_day": self.settings.live.max_successful_entries_per_utc_day,
-            "minimum_profile_balance_before_fees_usdt": str(minimum_profile_balance),
-            "balance_profile_note": "A 28 USDT account cannot support a 100 USDT entry plus the 8 USDT reserve. This status report does not claim an account-read or write-scope verification; the execution gate requires independent evidence.",
+            "minimum_profile_balance_before_fees_usdt": (
+                str(minimum_profile_balance)
+                if minimum_profile_balance is not None else None
+            ),
+            "balance_profile_note": balance_note,
             "max_pending_proposals": self.settings.live.max_pending_proposals,
             "allowed_symbols": list(self.settings.live.allowed_symbols), "symbol_checks": symbol_checks})
         return result
@@ -1955,6 +2841,83 @@ class SpotGuard:
         self.ledger.add_event("admin.live_armed", None, {"minutes": minutes, "local_tty": True})
         return result
 
+    def policy_explain(
+        self, *, mode: str | None = None, symbol: str | None = None,
+        quote_amount: Decimal | None = None,
+        risk_at_stop: Decimal | None = None,
+    ) -> dict[str, Any]:
+        """Explain current policy state without creating a proposal or order."""
+        selected_mode = mode or self.settings.mode
+        if selected_mode == "paper":
+            context, symbols = self._paper_policy_context()
+            selected_symbol = (symbol or self.settings.market.symbols[0]).upper()
+            if not selected_symbol.endswith(self.settings.risk.quote_asset):
+                selected_symbol += self.settings.risk.quote_asset
+            if selected_symbol not in self.settings.market.symbols:
+                raise PolicyError("policy explanation symbol is not allowlisted")
+            projected_aggregate = (
+                context.usage.aggregate_open_risk + risk_at_stop
+                if risk_at_stop is not None else None
+            )
+            evaluation = evaluate_entry(
+                context,
+                requested_notional=quote_amount,
+                projected_exposure=(context.usage.open_exposure + quote_amount
+                                    if quote_amount is not None else None),
+                projected_position_risk=risk_at_stop,
+                projected_aggregate_risk=projected_aggregate,
+                resulting_economic_positions=(
+                    context.usage.economic_positions
+                    if selected_symbol in symbols
+                    else context.usage.economic_positions + 1
+                ) if quote_amount is not None else None,
+            )
+            snapshot = build_policy_snapshot(
+                self.settings, "paper", context, evaluation
+            )
+        elif selected_mode == "live":
+            selected_symbol = (symbol or self.settings.market.symbols[0]).upper()
+            if not selected_symbol.endswith(self.settings.risk.quote_asset):
+                selected_symbol += self.settings.risk.quote_asset
+            amount = (
+                quote_amount if quote_amount is not None
+                else self.settings.risk.default_order_size_usdt
+            )
+            try:
+                projection = self._validate_live_entry_limits(
+                    selected_symbol, amount, Decimal("0"),
+                    risk_at_stop or Decimal("0"), Decimal("1"), explain=True,
+                )
+            except Exception as exc:
+                return {"schema": "riskpilot.policy-explain.v1", "read_only": True,
+                        "mode": "live", "accepted": False,
+                        "reasons": [str(exc)], "snapshot_available": False}
+            snapshot = projection["policy_snapshot"]
+        else:
+            raise PolicyError("policy explanation mode must be paper or live")
+        evaluation = snapshot["evaluation"]
+        return {
+            "schema": "riskpilot.policy-explain.v1", "read_only": True,
+            "mode": selected_mode,
+            "policy": snapshot["policy_config"]["sizing_policy"],
+            "equity_snapshot": snapshot["equity_snapshot"],
+            "hard_limits": snapshot["policy_config"]["hard_limits"],
+            "effective_limits": snapshot["effective_limits"],
+            "usage": snapshot["usage"],
+            "remaining": {"exposure": evaluation["remaining_exposure"],
+                          "position": evaluation["remaining_position_capacity"],
+                          "aggregate_risk": evaluation["remaining_aggregate_risk"],
+                          "buying_power": evaluation["remaining_buying_power"]},
+            "accepted": evaluation["accepted"],
+            "reason_codes": evaluation.get("reason_codes", []),
+            "reasons": evaluation["reasons"],
+            "hypothetical_request": {
+                "symbol": selected_symbol,
+                "quote_amount": str(quote_amount) if quote_amount is not None else None,
+                "risk_at_stop": str(risk_at_stop) if risk_at_stop is not None else None,
+            },
+        }
+
     def status(self) -> dict[str, Any]:
         arm_status = self.live_arm.status()
         codex_status = self.agent_os.status()
@@ -1969,6 +2932,7 @@ class SpotGuard:
             "scheduled_proposal_mode": self.settings.scheduled_proposal_mode,
             "limits": {
                 "default_order_size_usdt": str(self.settings.risk.default_quote_amount),
+                "sizing_policy": self.settings.sizing_policy.to_dict(),
                 "paper": {
                     "max_quote_per_entry_usdt": str(self.settings.paper.max_quote_per_entry_usdt),
                     "max_open_exposure_usdt": str(self.settings.paper.max_open_exposure_usdt),

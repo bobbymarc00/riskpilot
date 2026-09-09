@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .config import Settings
+from .risk_policy.limits import absolute_entry_ceiling
 from .security import SecurityError
 from .util import decimal_value
 
@@ -89,7 +90,11 @@ class LiveExecutionAdapter:
             raise SecurityError("live intent must be an exact protected Spot LIMIT BUY")
         if canonical.get("symbol") not in self.settings.market.symbols:
             raise SecurityError("live symbol is not configured")
-        if not is_close and not is_cancel and not is_partial_exit and not is_set_protection and decimal_value(canonical.get("quote_amount"), "quote_amount") > self.settings.live.max_quote_per_entry_usdt:
+        entry_ceiling = absolute_entry_ceiling(self.settings, "live")
+        if (not is_close and not is_cancel and not is_partial_exit
+                and not is_set_protection and entry_ceiling is not None
+                and decimal_value(canonical.get("quote_amount"), "quote_amount")
+                > entry_ceiling):
             raise SecurityError("live quote amount exceeds the configured per-entry limit")
         return MappingProxyType(canonical)
 
@@ -243,14 +248,18 @@ class LiveExecutionAdapter:
                 self.settings.live.protective_orders_available and symbol_flags_verified
             ),
             "symbol_exchange_flags_verified": symbol_flags_verified,
-            "live_limits_valid": (self.settings.live.max_quote_per_entry_usdt == Decimal("100") and
-                self.settings.live.max_active_tranches == 10 and
-                self.settings.live.max_economic_positions == 5 and
-                self.settings.live.max_open_exposure_usdt == Decimal("500") and
-                self.settings.live.max_risk_per_position_usdt == Decimal("2") and
-                self.settings.live.max_aggregate_risk_usdt == Decimal("4") and
-                self.settings.live.daily_realized_loss_cap_usdt == Decimal("5") and
-                self.settings.live.max_successful_entries_per_utc_day == 10),
+            # Config loading has already validated relationships and positive
+            # values. Readiness must not duplicate one historical USD profile.
+            "live_limits_valid": (
+                self.settings.live.max_active_tranches > 0
+                and self.settings.live.max_economic_positions > 0
+                and self.settings.live.max_successful_entries_per_utc_day > 0
+                and self.settings.live.max_open_exposure_usdt > 0
+                and self.settings.live.max_risk_per_position_usdt > 0
+                and self.settings.live.max_aggregate_risk_usdt
+                >= self.settings.live.max_risk_per_position_usdt
+                and self.settings.live.daily_realized_loss_cap_usdt > 0
+            ),
             "live_enabled": self.settings.live.enabled,
             "live_armed": armed,
         }

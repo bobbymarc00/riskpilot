@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_UP
 from typing import Any
 
 from .config import Settings
+from .risk_policy.limits import absolute_daily_quote_ceiling, absolute_entry_ceiling
 from .util import bounded_text, canonical_json, decimal_string, decimal_value, isoformat, parse_time, utcnow
 
 
@@ -60,10 +61,15 @@ def entry_policy_terms(settings: Settings, *, candidate_price: Any,
             f"Agent OS order-book spread is {decimal_string(spread_pct, 4)}%, above the configured limit"
         )
     entry_reference = (ask_reference * (Decimal("1") + settings.paper.slippage_pct / Decimal("100"))) if mode == "live" else ask_reference
-    maximum_quote = settings.live.max_live_trade_usdt if mode == "live" else settings.paper.max_quote_per_entry_usdt
-    if not settings.risk.min_quote_amount <= quote_amount <= maximum_quote:
+    maximum_quote = absolute_entry_ceiling(settings, mode)
+    if (not settings.sizing_policy.percentage_based
+            and quote_amount < settings.risk.min_quote_amount):
         raise PolicyError(
-            f"quote amount must be between {settings.risk.min_quote_amount} and {maximum_quote}"
+            f"quote amount must be at least {settings.risk.min_quote_amount}"
+        )
+    if maximum_quote is not None and quote_amount > maximum_quote:
+        raise PolicyError(
+            f"quote amount exceeds absolute safety ceiling {maximum_quote}"
         )
     candidate_price = decimal_value(candidate_price, "candidate.price")
     drift_pct = abs((entry_reference - candidate_price) / candidate_price) * Decimal("100")
@@ -184,9 +190,11 @@ def build_proposal(
 def validate_claim(settings: Settings, proposal: dict[str, Any], daily_committed_quote: Decimal) -> None:
     canonical = proposal["canonical"]
     if proposal["status"] != "PENDING":
-        raise PolicyError(f"proposal must be PENDING, not {proposal['status']}")
+        raise PolicyError(
+            f"APPROVAL_INVALID: proposal must be PENDING, not {proposal['status']}"
+        )
     if parse_time(proposal["expires_at"]) <= utcnow():
-        raise PolicyError("proposal has expired")
+        raise PolicyError("PROPOSAL_EXPIRED: proposal has expired")
     if canonical.get("source") == "manual-live-set-protection":
         expected={"product":"SPOT","side":"SELL","order_type":"OCO_PROTECTION","mode":"live","quote_asset":settings.risk.quote_asset}
         if any(canonical.get(k)!=v for k,v in expected.items()): raise PolicyError("live protection restore terms do not match current policy")
@@ -236,10 +244,15 @@ def validate_claim(settings: Settings, proposal: dict[str, Any], daily_committed
     if canonical.get("symbol") not in settings.market.symbols:
         raise PolicyError("proposal symbol is no longer allowlisted")
     quote = decimal_value(canonical.get("quote_amount"), "proposal.quote_amount")
-    maximum = settings.live.max_live_trade_usdt if proposal["mode"] == "live" else settings.paper.max_quote_per_entry_usdt
-    if not settings.risk.min_quote_amount <= quote <= maximum:
+    maximum = absolute_entry_ceiling(settings, proposal["mode"])
+    if ((not settings.sizing_policy.percentage_based
+            and quote < settings.risk.min_quote_amount) or (
+        maximum is not None and quote > maximum
+    )):
         raise PolicyError("proposal quote amount violates the current per-trade limit")
-    if proposal["mode"] == "live" and daily_committed_quote + quote > settings.risk.max_daily_quote:
+    daily_ceiling = absolute_daily_quote_ceiling(settings)
+    if (proposal["mode"] == "live" and daily_ceiling is not None
+            and daily_committed_quote + quote > daily_ceiling):
         raise PolicyError("proposal would exceed the current daily quote limit")
     reward_risk = decimal_value(canonical.get("reward_risk"), "proposal.reward_risk")
     if reward_risk < settings.risk.min_reward_risk:

@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .risk_policy.schema import (
+    SizingPolicyConfigError,
+    SizingPolicySettings,
+    load_sizing_policy,
+)
 from .util import decimal_value, ensure_private_dir
 
 
@@ -183,6 +188,7 @@ class Settings:
     security: SecuritySettings
     live: LiveSettings
     paper: PaperSettings
+    sizing_policy: SizingPolicySettings
     scheduled_proposal_mode: str
     execution_ready: bool
     config_path: Path
@@ -262,8 +268,8 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
     _reject_embedded_secrets(raw)
 
     version = raw.get("version")
-    if version != 1:
-        raise ConfigError("version must be 1")
+    if isinstance(version, bool) or version not in {1, 2}:
+        raise ConfigError("version must be 1 or 2")
     mode = str(raw.get("mode", "")).lower()
     if mode not in {"paper", "live"}:
         raise ConfigError("mode must be paper or live")
@@ -524,6 +530,20 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
             live.enabled or live.arm or execution_ready or scheduled_proposal_mode != "paper"):
         raise ConfigError("legacy OAuth profile is PAPER-only and cannot be used with LIVE or scheduled non-PAPER mode")
 
+    try:
+        sizing_policy = load_sizing_policy(
+            raw.get("sizing_policy"),
+            quote_asset=risk.quote_asset,
+            legacy_reference_equity=paper.initial_balance_usdt,
+            risk_value=risk_raw,
+            capital_value=raw.get("capital"),
+            operations_value=raw.get("operations"),
+            execution_value=raw.get("execution"),
+            absolute_safety_caps_value=raw.get("absolute_safety_caps"),
+        )
+    except SizingPolicyConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
     return Settings(
         version=version,
         mode=mode,
@@ -537,6 +557,7 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
         security=security,
         live=live,
         paper=paper,
+        sizing_policy=sizing_policy,
         scheduled_proposal_mode=scheduled_proposal_mode,
         execution_ready=execution_ready,
         config_path=config_path.resolve(strict=False),

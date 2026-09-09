@@ -561,6 +561,30 @@ class Ledger:
             )
         return self.get_proposal(proposal_id)
 
+    def reject_proposal_by_policy(self, proposal_id: str, reason: str) -> dict[str, Any]:
+        """Terminalize an invalid immutable proposal without approval credentials."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"proposal not found: {proposal_id}")
+            if row["status"] not in {"PENDING", "EXECUTING"}:
+                raise LedgerError(
+                    f"proposal cannot be policy-rejected from {row['status']}"
+                )
+            connection.execute(
+                """UPDATE proposals SET status='REJECTED',failure_reason=?,
+                   execution_lease_hash=NULL,execution_lease_expires_at=NULL WHERE id=?""",
+                (reason, proposal_id),
+            )
+            connection.execute(
+                "INSERT INTO events(kind,entity_id,payload_json,created_at) VALUES(?,?,?,?)",
+                ("proposal.policy_rejected", proposal_id,
+                 canonical_json({"reason": reason}), isoformat()),
+            )
+        return self.get_proposal(proposal_id)
+
     def claim_proposal(
         self,
         proposal_id: str,
@@ -569,7 +593,7 @@ class Ledger:
         lease_hash: str,
         lease_expires_at: str,
         day_prefix: str,
-        max_daily_quote: str,
+        max_daily_quote: str | None,
     ) -> dict[str, Any]:
         now = isoformat()
         with self.transaction() as connection:
@@ -592,7 +616,8 @@ class Ledger:
                 (day_prefix,),
             ).fetchall()
             committed = sum((Decimal(item["quote_amount"]) for item in committed_rows), Decimal("0"))
-            if row["mode"] == "live" and committed + Decimal(row["quote_amount"]) > Decimal(max_daily_quote):
+            if (row["mode"] == "live" and max_daily_quote is not None
+                    and committed + Decimal(row["quote_amount"]) > Decimal(max_daily_quote)):
                 raise LedgerError("proposal would exceed the current daily quote limit")
             connection.execute(
                 """
@@ -798,12 +823,56 @@ class Ledger:
                 connection.execute("INSERT INTO events(kind,entity_id,payload_json,created_at) VALUES(?,?,?,?)",("paper.proposal_terminalized",row["id"],canonical_json({"reason":reason}),now))
         return len(rows)
 
+    @staticmethod
+    def _daily_paper_realized_loss_from(
+        connection: sqlite3.Connection, day_prefix: str
+    ) -> Decimal:
+        reset = connection.execute(
+            "SELECT created_at FROM events WHERE kind='paper.account_reset' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        cutoff = max(day_prefix, reset["created_at"] if reset else day_prefix)
+        rows = connection.execute(
+            """SELECT payload_json FROM events
+               WHERE kind IN ('paper.position_closed','paper.position_partially_closed')
+                 AND created_at>=? AND substr(created_at,1,10)=?""",
+            (cutoff, day_prefix),
+        ).fetchall()
+        losses = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            pnl = Decimal(str(payload["realized_pnl"]))
+            if pnl < 0:
+                losses.append(-pnl)
+        return sum(losses, Decimal("0"))
+
     def daily_paper_realized_loss(self, day_prefix: str) -> Decimal:
         with self.connect() as connection:
-            reset = connection.execute("SELECT created_at FROM events WHERE kind='paper.account_reset' ORDER BY id DESC LIMIT 1").fetchone()
-            cutoff = max(day_prefix, reset["created_at"] if reset else day_prefix)
-            rows = connection.execute("SELECT realized_pnl FROM paper_positions WHERE status='CLOSED' AND closed_at>=? AND substr(closed_at,1,10)=? AND realized_pnl IS NOT NULL", (cutoff, day_prefix)).fetchall()
-        return sum((-Decimal(row["realized_pnl"]) for row in rows if Decimal(row["realized_pnl"]) < 0), Decimal("0"))
+            return self._daily_paper_realized_loss_from(connection, day_prefix)
+
+    @staticmethod
+    def _paper_realized_loss_since(
+        connection: sqlite3.Connection, start: str
+    ) -> Decimal:
+        reset = connection.execute(
+            "SELECT created_at FROM events WHERE kind='paper.account_reset' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        cutoff = max(start, reset["created_at"] if reset else start)
+        rows = connection.execute(
+            """SELECT payload_json FROM events
+               WHERE kind IN ('paper.position_closed','paper.position_partially_closed')
+                 AND created_at>=?""",
+            (cutoff,),
+        ).fetchall()
+        loss = Decimal("0")
+        for row in rows:
+            pnl = Decimal(str(json.loads(row["payload_json"])["realized_pnl"]))
+            if pnl < 0:
+                loss -= pnl
+        return loss
+
+    def weekly_paper_realized_loss(self, week_start: str) -> Decimal:
+        with self.connect() as connection:
+            return self._paper_realized_loss_since(connection, week_start)
 
     def has_active_paper_buy(self, symbol: str) -> bool:
         with self.connect() as connection:
@@ -866,7 +935,13 @@ class Ledger:
                               max_exposure: Decimal, max_symbol_risk: Decimal,
                               max_aggregate_risk: Decimal, fee_rate: Decimal,
                               slippage_rate: Decimal, fresh_bid: Decimal,
-                              fresh_ask: Decimal) -> dict[str, Any]:
+                              fresh_ask: Decimal, max_economic_positions: int,
+                              minimum_free_reserve: Decimal,
+                              max_daily_realized_loss: Decimal,
+                              day_prefix: str,
+                              max_symbol_exposure: Decimal | None = None,
+                              max_weekly_realized_loss: Decimal | None = None,
+                              week_start: str | None = None) -> dict[str, Any]:
         with self.transaction() as connection:
             proposal = connection.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
             if proposal is None or proposal["status"] != "EXECUTING" or proposal["execution_lease_hash"] != lease_hash:
@@ -874,9 +949,21 @@ class Ledger:
             open_rows = connection.execute("SELECT * FROM paper_positions WHERE status IN ('OPEN','CLOSING')").fetchall()
             if len(open_rows) >= max_positions:
                 raise LedgerError(f"active PAPER tranche limit reached ({max_positions})")
+            economic_symbols = {row["symbol"] for row in open_rows}
+            if (position["symbol"] not in economic_symbols
+                    and len(economic_symbols) >= max_economic_positions):
+                raise LedgerError(
+                    f"economic PAPER position/distinct-symbol limit reached ({max_economic_positions})"
+                )
             if sum((Decimal(row["quote_spent"]) for row in open_rows), Decimal("0")) + Decimal(position["quote_spent"]) > max_exposure:
                 raise LedgerError(f"PAPER exposure limit reached: projected exposure would exceed {max_exposure} USDT")
             same = [row for row in open_rows if row["symbol"] == position["symbol"]]
+            if (max_symbol_exposure is not None
+                    and sum((Decimal(row["quote_spent"]) for row in same), Decimal("0"))
+                    + Decimal(position["quote_spent"]) > max_symbol_exposure):
+                raise LedgerError(
+                    f"PAPER single-position exposure would exceed {max_symbol_exposure} USDT"
+                )
             projected_rows = same + [position]
             def economic_risk(items: list[Any]) -> Decimal:
                 quantity=sum((Decimal(row["net_quantity"] if "net_quantity" in row.keys() else row["net_base_quantity"]) for row in items),Decimal("0"))
@@ -928,8 +1015,19 @@ class Ledger:
                 raise LedgerError(f"PAPER risk rejected: current aggregate risk {current_other + (economic_risk(same) if same else Decimal('0')):f} USDT; new economic-position risk {symbol_risk:f} USDT; projected aggregate risk {projected_aggregate:f} USDT; configured aggregate limit {max_aggregate_risk:f} USDT; configured per-position limit {max_symbol_risk:f} USDT")
             account = connection.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
             spend = Decimal(position["quote_spent"])
-            if Decimal(account["free_usdt"]) < spend:
-                raise LedgerError("insufficient free paper USDT")
+            if Decimal(account["free_usdt"]) - spend < minimum_free_reserve:
+                raise LedgerError("insufficient free paper USDT after reserve")
+            daily_loss = self._daily_paper_realized_loss_from(
+                connection, day_prefix
+            )
+            if daily_loss >= max_daily_realized_loss:
+                raise LedgerError("paper daily realized loss cap is exhausted")
+            if max_weekly_realized_loss is not None:
+                if week_start is None:
+                    raise LedgerError("weekly loss gate is missing its UTC boundary")
+                weekly_loss = self._paper_realized_loss_since(connection, week_start)
+                if weekly_loss >= max_weekly_realized_loss:
+                    raise LedgerError("paper weekly realized loss cap is exhausted")
             self._insert_position(connection, position)
             if same:
                 symbol_rows = connection.execute("SELECT * FROM paper_positions WHERE symbol=? AND status IN ('OPEN','CLOSING')", (position["symbol"],)).fetchall()

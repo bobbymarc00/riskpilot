@@ -1,5 +1,16 @@
 {
-  "version": 1,
+  "version": 2,
+  "sizing_policy": {
+    "enabled": true,
+    "schema_version": 2,
+    "capital_basis": "mark_to_market_equity",
+    "quote_asset": "USDT",
+    "reference_equity_usdt": 1000,
+    "scaling_model": "equity_percentage_risk"
+  },
+  "absolute_safety_caps": {
+    "enabled": false
+  },
   "presentation": {"default_locale": "en"},
   "mode": "paper",
   "workspace": "./.riskpilot-workspace",
@@ -30,6 +41,10 @@
   },
   "risk": {
     "quote_asset": "USDT",
+    "risk_per_trade_pct": 0.005,
+    "max_aggregate_open_risk_pct": 0.015,
+    "daily_realized_loss_pct": 0.02,
+    "weekly_realized_loss_pct": 0.05,
     "default_order_size_usdt": 6,
     "min_quote_amount": 5.0,
     "max_quote_per_trade": 100,
@@ -43,6 +58,18 @@
     "execution_lease_seconds": 300,
     "max_live_arm_minutes": 1440,
     "paper_fee_pct": 0.1
+  },
+  "capital": {
+    "max_position_pct": 0.20,
+    "max_total_exposure_pct": 0.60,
+    "min_free_reserve_pct": 0.20
+  },
+  "operations": {
+    "max_open_positions": 5,
+    "max_pending_live_proposals": 1
+  },
+  "execution": {
+    "max_equity_drift_pct": 0.02
   },
   "openclaw": {
     "command": "openclaw",

@@ -5,6 +5,7 @@ from typing import Any
 
 from .config import Settings
 from .policy import PolicyError
+from .risk_policy.limits import uses_absolute_backstop
 from .util import decimal_string, decimal_value
 
 
@@ -60,7 +61,10 @@ def build_fill_risk(
     # the stop is executed after configured adverse slippage, and the exit fee
     # is deducted from proceeds.  Presentation must label it accordingly.
     risk_amount = quote_spent - stop_net
-    if risk_amount <= 0 or risk_amount > settings.paper.max_risk_per_trade_usdt:
+    if risk_amount <= 0 or (
+        uses_absolute_backstop(settings)
+        and risk_amount > settings.paper.max_risk_per_trade_usdt
+    ):
         raise PolicyError("fill-based paper risk exceeds the per-trade risk cap")
 
     minimum_rr = settings.risk.min_reward_risk

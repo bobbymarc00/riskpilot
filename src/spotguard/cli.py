@@ -86,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("check", help="validate config and local safety prerequisites")
     subparsers.add_parser("status", help="show current mode, ledger, MCP, and skill status")
+    policy_parser = subparsers.add_parser(
+        "policy", help="inspect read-only equity-scaled guardrails"
+    )
+    policy_sub = policy_parser.add_subparsers(dest="policy_command", required=True)
+    policy_explain = policy_sub.add_parser(
+        "explain", help="explain equity, effective limits, usage, and rejection reasons"
+    )
+    policy_explain.add_argument("--mode", choices=("paper", "live"))
+    policy_explain.add_argument("--symbol")
+    policy_explain.add_argument("--quote-amount")
+    policy_explain.add_argument("--risk-at-stop")
     subparsers.add_parser("symbols", help="validate and show configured Binance Spot symbols")
     radar_parser = subparsers.add_parser("radar", help="show the latest read-only Smart Radar potential ranking")
     radar_parser.add_argument("--limit", type=int, default=5)
@@ -509,6 +520,15 @@ def _run(args: argparse.Namespace) -> Any:
         return _check_result(service)
     if args.command == "status":
         return service.status()
+    if args.command == "policy":
+        return service.policy_explain(
+            mode=args.mode,
+            symbol=args.symbol,
+            quote_amount=(decimal_value(args.quote_amount, "quote_amount")
+                          if args.quote_amount is not None else None),
+            risk_at_stop=(decimal_value(args.risk_at_stop, "risk_at_stop")
+                          if args.risk_at_stop is not None else None),
+        )
     if args.command == "symbols":
         return service.symbols_status()
     if args.command == "radar":
