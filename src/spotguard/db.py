@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -729,8 +730,25 @@ class Ledger:
 
     def backup(self, label: str) -> Path:
         stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-        target = self.path.with_name(f"spotguard-{label}-{stamp}.sqlite3")
-        if target.exists() or target.resolve().parent != self.path.resolve().parent:
+        source_parent = self.path.resolve().parent
+        target = None
+        for suffix in range(100):
+            filename = f"spotguard-{label}-{stamp}"
+            if suffix:
+                filename += f"-{suffix}"
+            candidate = self.path.with_name(filename + ".sqlite3")
+            if candidate.resolve().parent != source_parent:
+                raise LedgerError("safe SQLite backup target is unavailable")
+            try:
+                descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+                target = candidate
+                break
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise LedgerError("safe SQLite backup target is unavailable") from exc
+        if target is None:
             raise LedgerError("safe SQLite backup target is unavailable")
         source = sqlite3.connect(self.path); destination = sqlite3.connect(target)
         try:

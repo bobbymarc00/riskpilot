@@ -617,17 +617,44 @@ class LiveExecutionAdapter:
 
     @staticmethod
     def _mcp_error_text(response: Mapping[str, Any]) -> str:
+        """Return diagnostics only for MCP error semantics, not result content.
+
+        A successful delegated tool may legitimately return a text content block
+        such as ``{}''.  Content is therefore evidence of an error only when the
+        MCP result marks itself as an error, or when the text has an explicit
+        error signature (for backends that omit ``isError``).
+        """
         parts = []
         error = response.get("error")
         if isinstance(error, Mapping):
-            if error.get("code") is not None: parts.append(f"code={error['code']}")
-            if error.get("message"): parts.append(LiveExecutionAdapter._sanitize_error_text(error["message"]))
-        for row in response.get("content", []) if isinstance(response.get("content"), list) else []:
-            if isinstance(row, Mapping) and isinstance(row.get("text"), str): parts.append(LiveExecutionAdapter._sanitize_error_text(row["text"]))
-        structured = response.get("structuredContent")
-        if isinstance(structured, Mapping) and structured.get("code") not in (None, 0, 200):
-            parts.append(LiveExecutionAdapter._sanitize_error_text(structured.get("msg") or structured.get("message") or structured.get("code")))
+            if error.get("code") is not None:
+                parts.append(f"code={error['code']}")
+            if error.get("message"):
+                parts.append(LiveExecutionAdapter._sanitize_error_text(error["message"]))
+
+        include_content = response.get("isError") is True
+        content = response.get("content")
+        if isinstance(content, list):
+            for row in content:
+                if not isinstance(row, Mapping) or not isinstance(row.get("text"), str):
+                    continue
+                text = row["text"].strip()
+                if include_content or LiveExecutionAdapter._looks_like_mcp_error(text):
+                    parts.append(LiveExecutionAdapter._sanitize_error_text(text))
+
+        for key in ("structuredContent", "structured_content"):
+            structured = response.get(key)
+            if isinstance(structured, Mapping) and structured.get("code") not in (None, 0, 200):
+                parts.append(LiveExecutionAdapter._sanitize_error_text(
+                    structured.get("msg") or structured.get("message") or structured.get("code")))
         return " ".join(parts)
+
+    @staticmethod
+    def _looks_like_mcp_error(text: str) -> bool:
+        lowered = text.lower()
+        return bool(re.search(r"(?:^|\s)-(?:1003|1013|1100|2014|2015)(?:\s|$)", lowered)) or any(
+            term in lowered for term in ("permission denied", "unauthorized", "forbidden", "invalid quantity",
+                                          "invalid price", "rate limit", "too many requests", "ip banned"))
 
     @staticmethod
     def _sanitize_error_text(value: Any) -> str:

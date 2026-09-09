@@ -134,6 +134,43 @@ class LiveSafetyTests(unittest.TestCase):
    result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
    self.assertEqual(result["classification"],"AUTHORIZATION_FAILURE")
 
+ def test_benign_mcp_content_is_not_classified_as_failure(self):
+  for response in ({"isError":False,"content":[{"type":"text","text":"{}"}]},
+                   {"content":[{"type":"text","text":"{}"}]}):
+   with self.subTest(response=response), tempfile.TemporaryDirectory() as d:
+    adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+    schema={"type":"object","required":["symbol","side","type"],"properties":
+            {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+             "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},
+             "price":{"type":"number"},"timeInForce":{"type":"string"}}}
+    wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+             "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+    adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+     {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+     {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}}, response])
+    result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+    self.assertEqual(result["classification"],"SUCCESS")
+
+ def test_mcp_error_content_is_classified_without_leaking_benign_success(self):
+  cases=(("-2015 Invalid API-key, IP, or permissions","AUTHORIZATION_FAILURE"),
+         ("-1100 Illegal characters found in parameter 'quantity'","PAYLOAD_VALIDATION_FAILURE"))
+  for message, expected in cases:
+   with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
+    adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+    schema={"type":"object","required":["symbol","side","type"],"properties":
+             {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+             "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},"price":{"type":"number"},
+             "timeInForce":{"type":"string"}}}
+    wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+             "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+    adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+     {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+     {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+     {"isError":True,"content":[{"type":"text","text":message}]}])
+    result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+    self.assertEqual(result["classification"],expected)
+    self.assertIn(message, result["detail"])
+
  def test_successful_attestation_is_persisted_and_expiry_is_fail_closed(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))

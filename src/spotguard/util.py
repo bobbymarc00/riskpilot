@@ -36,12 +36,18 @@ def parse_time(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def json_default(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=json_default)
 
 
 def pretty_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False)
+    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False, default=json_default)
 
 
 def sha256_text(value: str) -> str:

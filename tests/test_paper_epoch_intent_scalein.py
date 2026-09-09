@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -185,5 +186,17 @@ class PaperEpochIntentScaleInTests(unittest.TestCase):
             self.assertEqual((checked["free_usdt"],checked["open_positions"],checked["active_tranches"]),("1000",0,0))
             workflow=(Path(__file__).parents[1]/"skills/binance-spotguard/references/workflow.md").read_text()
             self.assertNotIn("/spot paper-reset",workflow)
+
+    def test_sqlite_backup_uses_distinct_safe_target_on_timestamp_collision(self):
+        with tempfile.TemporaryDirectory() as d:
+            service=self.service(Path(d))
+            first=service.ledger.backup("pre-paper-reset")
+            second=service.ledger.backup("pre-paper-reset")
+            self.assertNotEqual(first,second)
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+            for path in (first,second):
+                with sqlite3.connect(path) as connection:
+                    self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0],"ok")
 
 if __name__ == "__main__": unittest.main()

@@ -19,7 +19,7 @@ from .policy import PolicyError
 from .security import SecurityError
 from .service import SpotGuard, SpotGuardError
 from .telegram import TelegramError
-from .util import decimal_value, pretty_json, utcnow
+from .util import decimal_value, json_default, pretty_json, utcnow
 
 
 CALLBACK_RE = re.compile(
@@ -37,7 +37,7 @@ def _project_root() -> Path:
 
 def _emit(value: Any, compact: bool = False) -> None:
     if compact:
-        print(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        print(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=json_default))
     else:
         print(pretty_json(value))
 
