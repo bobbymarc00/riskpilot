@@ -474,9 +474,9 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
                 {"asset": "BTC", "free": "1", "locked": "0"},
             ]})
             service.live_executor.read_open_spot_orders = Mock(return_value=[
-                {"symbol": "BTCUSDT", "orderListId": 12, "type": "STOP_LOSS_LIMIT",
+                {"symbol": "BTCUSDT", "orderListId": 12, "orderId": 11, "side": "SELL", "status": "NEW", "type": "STOP_LOSS_LIMIT",
                  "origQty": "1", "stopPrice": "99"},
-                {"symbol": "BTCUSDT", "orderListId": 12, "type": "TAKE_PROFIT_LIMIT",
+                {"symbol": "BTCUSDT", "orderListId": 12, "orderId": 13, "side": "SELL", "status": "NEW", "type": "TAKE_PROFIT_LIMIT",
                  "origQty": "1", "stopPrice": "120"},
             ])
             service.live_executor.read_spot_trades = Mock(return_value=[])

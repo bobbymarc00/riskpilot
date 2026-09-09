@@ -1,10 +1,11 @@
 from __future__ import annotations
 import json, tempfile, unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 from spotguard.config import load_settings
-from spotguard.live_execution import LiveExecutionAdapter
+from spotguard.live_execution import LiveExecutionAdapter, MCPTransportError
 from spotguard.market import SpotMarketSnapshot, scaled_synthetic_klines
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
@@ -18,6 +19,204 @@ def configured(root: Path, *, enabled=False, scheduled="paper"):
  p=root/"config.json"; p.write_text(json.dumps(d)); return load_settings(p)
 
 class LiveSafetyTests(unittest.TestCase):
+ def test_live_status_readiness_uses_backend_proofs_fail_closed(self):
+  symbol_info={"symbol":"BTCUSDT","oto_allowed":True,"opo_allowed":True,"oco_allowed":True,
+               "price_tick_size":"0.01","percent_price_filter":True,"max_num_orders":5,
+               "max_num_algo_orders":5,"max_num_order_lists":5}
+  evidence={"spot_trade_scope_verified":True,"write_tool_discovered":True,"write_schema_verified":True}
+  cases=(("all proofs valid",evidence,True,False),("invalid schema",{**evidence,"write_schema_verified":False},True,False),
+         ("account read failed",evidence,False,False),("not armed",evidence,True,False))
+  for name, probe, account_ok, expected in cases:
+   with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+    service=SpotGuard(configured(Path(d),enabled=True))
+    service.settings=replace(service.settings,
+      codex=replace(service.settings.codex,mcp_server="binance-execution"),
+      live=replace(service.settings.live,protective_orders_available=True))
+    service.live_executor.settings=service.settings
+    service.agent_os.status=Mock(return_value={"authenticated":True,"mcp_configured":True})
+    service.live_arm.status=Mock(return_value=Mock(armed=(name != "not armed")))
+    service.live_executor.read_open_spot_orders=Mock(return_value=[])
+    service.live_executor.read_spot_account=(Mock(return_value={"account_type":"SPOT","can_trade":True})
+      if account_ok else Mock(side_effect=SecurityError("account read failed")))
+    service.live_executor._valid_permission_attestation=Mock(return_value=(name == "all proofs valid"))
+    service.live_executor.readiness_probe=Mock(return_value=probe)
+    with patch("spotguard.service.validate_spot_symbol",return_value=symbol_info):
+     result=service.live_status(check_symbols=True,symbols=["BTCUSDT"])
+    self.assertEqual(result["execution_ready"],expected)
+    self.assertFalse(result["decimal_transport_verified"])
+    self.assertIn("REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER",result["blockers"])
+    if name == "invalid schema": self.assertIn("write_schema_verified",result["blockers"])
+
+ def test_explicit_order_test_attestation_uses_only_fixed_target(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   test_schema={"type":"object","required":["symbol","side","type"],
+                "properties":{"symbol":{"type":"string"},"side":{"type":"string"},
+                              "type":{"type":"string"},"quantity":{"type":"number"},
+                              "quoteOrderQty":{"type":"number"},"price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+            "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+    {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":test_schema}]}},
+    {"structuredContent":{}},
+   ])
+   result=adapter.attest_spot_trade_permission(
+    "BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"SUCCESS")
+   invocation=adapter._direct_mcp_jsonrpc.call_args.args[1]
+   self.assertEqual(invocation["name"],"tool_execute")
+   self.assertEqual(invocation["arguments"]["toolName"],"spot.orderTest")
+   delegated=invocation["arguments"]["arguments"]
+   self.assertTrue(delegated)
+   self.assertEqual(delegated["symbol"],"BTCUSDT")
+   self.assertEqual(delegated["side"],"BUY")
+   self.assertEqual(delegated["type"],"MARKET")
+   self.assertEqual(delegated["quoteOrderQty"],Decimal("5"))
+   self.assertNotIn("quantity",delegated)
+   self.assertNotIn("price",delegated)
+   self.assertNotIn("timeInForce",delegated)
+   self.assertNotRegex(str(delegated),r"(?i)(token|secret|signature|authorization|api[_-]?key)")
+   self.assertNotIn("spot.newOrder", str(adapter._direct_mcp_jsonrpc.call_args_list))
+
+ def test_binance_decimal_wire_encoding_never_uses_exponents(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   for value in ("0.00007","0.00000001","0.001","1.00000000","123.450000","70000.01"):
+    wire=adapter._canonical_wire_json({"quantity":Decimal(value),"price":Decimal(value)})
+    self.assertNotRegex(wire,r":-?[0-9.]+[eE][+-]?[0-9]+")
+    self.assertIn(f'"quantity":{value}',wire)
+    self.assertIn(f'"price":{value}',wire)
+
+ def test_empty_order_test_payload_fails_before_remote_transport(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":{
+    "symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+    "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},"price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,"properties":{
+    "toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}}])
+   adapter._validate_test_order_arguments=Mock(return_value="spot.orderTest payload omits a schema-required field")
+   result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"PAYLOAD_VALIDATION_FAILURE")
+   self.assertEqual(result["stage"],"BEFORE_TOOL_EXECUTE")
+   self.assertEqual(adapter._direct_mcp_jsonrpc.call_count,2)
+
+ def test_remote_transport_error_keeps_sanitized_diagnostics(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":{
+    "symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+    "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},"price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,"properties":{
+    "toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    MCPTransportError("remote error message token=SECRET",stage="REMOTE_JSONRPC",error_code=-2015)])
+   result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"TRANSPORT_FAILURE")
+   self.assertEqual(result["stage"],"REMOTE_JSONRPC")
+   self.assertEqual(result["error_code"],-2015)
+   self.assertNotIn("SECRET",result["detail"])
+
+ def test_order_test_authorization_failure_does_not_attest(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":{
+    "symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},"quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},"price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,"properties":{
+    "toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    {"isError":True,"content":[{"text":"permission denied"}]}])
+   result=adapter.attest_spot_trade_permission("BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"AUTHORIZATION_FAILURE")
+
+ def test_successful_attestation_is_persisted_and_expiry_is_fail_closed(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.read_spot_account=Mock(return_value={"account_type":"SPOT","can_trade":True})
+   service.live_executor.attest_spot_trade_permission=Mock(return_value={
+    "classification":"SUCCESS","schema_fingerprint":"schema-fp","delegated_tool":"spot.orderTest"})
+   service.live_executor.execution_profile_fingerprint=Mock(return_value="profile-fp")
+   with patch("spotguard.service.validate_spot_symbol",return_value={"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}), patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET):
+    result=service.verify_live_trade_permission(operator_confirmed=True)
+   self.assertEqual(result["classification"],"SUCCESS")
+   proof=service.ledger.latest_event("live.trade_permission_attestation")
+   self.assertEqual(proof["delegated_operation"],"spot.orderTest")
+   self.assertTrue(service.live_executor._valid_permission_attestation(proof,"schema-fp"))
+   expired=dict(proof); expired["expires_at"]="2000-01-01T00:00:00+00:00"
+   self.assertFalse(service.live_executor._valid_permission_attestation(expired,"schema-fp"))
+
+ def test_rate_limit_circuit_blocks_readiness_without_transport_calls(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter._activate_rate_limit(reason="BINANCE_-1003")
+   transport=Mock()
+   adapter._direct_mcp_jsonrpc=transport
+   status=adapter.rate_limit_status()
+   self.assertEqual(status["status"],"BLOCKED")
+   self.assertEqual(status["reason"],"BINANCE_-1003")
+   proof=adapter.verify_readiness(connected=True,symbol_flags_verified=True)
+   self.assertFalse(proof["account_read_verified"])
+   self.assertFalse(proof["open_orders_read_verified"])
+   self.assertFalse(proof["spot_trade_scope_verified"])
+   self.assertEqual(transport.call_count,0)
+
+ def test_rate_limit_http_codes_and_unknown_expiry_fail_closed(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   self.assertTrue(adapter._is_rate_limit_error(None,"HTTP 429"))
+   self.assertTrue(adapter._is_rate_limit_error(None,"HTTP 418 IP banned"))
+   self.assertFalse(adapter._is_rate_limit_error(-1100,"invalid quantity"))
+   adapter._activate_rate_limit(reason="HTTP_429")
+   self.assertEqual(adapter.rate_limit_status()["blocked_until"],"UNKNOWN")
+   adapter._activate_rate_limit(reason="HTTP_429",blocked_until="2000-01-01T00:00:00+00:00")
+   self.assertEqual(adapter.rate_limit_status()["status"],"CLEAR")
+   adapter._activate_rate_limit(reason="HTTP_429",blocked_until="2999-01-01T00:00:00+00:00")
+   self.assertEqual(adapter.rate_limit_status()["status"],"BLOCKED")
+
+ def test_decimal_transport_guard_cannot_be_overridden(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   readiness=adapter.readiness(connected=True,armed=True,symbol_flags_verified=True,
+    account_read_verified=True,open_orders_read_verified=True,spot_trade_scope_verified=True,
+    write_tool_discovered=True,write_schema_verified=True)
+   self.assertFalse(readiness.decimal_transport_verified)
+   self.assertFalse(readiness.execution_ready)
+
+ def test_readiness_probe_requires_exact_spot_tools_and_schema(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   def row(name, missing=None):
+    fields=adapter._REQUIRED_WRITE_SCHEMAS.get(name,{"symbol"})
+    props={key:{"type":"number" if key in {"quantity","price","stopPrice","workingPrice","workingQuantity","pendingQuantity","pendingAbovePrice","pendingAboveStopPrice","pendingBelowPrice","pendingBelowStopPrice"} else "integer" if key == "orderId" else "string"}
+           for key in fields if key != missing}
+    enum_values={"side":["SELL"],"type":["MARKET"],"aboveType":["TAKE_PROFIT_LIMIT"],"belowType":["STOP_LOSS_LIMIT"],
+                 "pendingSide":["SELL"],"pendingAboveType":["TAKE_PROFIT_LIMIT"],"pendingBelowType":["STOP_LOSS_LIMIT"],
+                 "workingSide":["BUY"],"workingType":["LIMIT"]}
+    for key, values in enum_values.items():
+     if key in props: props[key]["enum"]=values
+    return {"name":name,"inputSchema":{"type":"object","properties":props,"required":[],"additionalProperties":False}}
+   wrapper={"name":"tool_execute","inputSchema":{"type":"object","properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}},"required":["toolName"],"additionalProperties":False}}
+   def mcp(value): return {"structuredContent":value}
+   names=list(adapter._REQUIRED_WRITE_SCHEMAS)
+   trade=[row(name) for name in names]
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[wrapper]},mcp({"tools":trade[:2],"nextCursor":"page2"}),mcp({"tools":trade[2:]}),mcp({"tools":[]})])
+   result=adapter.readiness_probe()
+   self.assertTrue(result["write_tool_discovered"]); self.assertTrue(result["write_schema_verified"])
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[wrapper]},mcp({"tools":[row(name) for name in names[:3]]})])
+   self.assertFalse(adapter.readiness_probe()["write_tool_discovered"])
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[wrapper]},mcp({"tools":[row(name, "quantity") if name == "spot.orderListOco" else row(name) for name in names]}),mcp({"tools":[]})])
+   self.assertFalse(adapter.readiness_probe()["write_schema_verified"])
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[wrapper]},mcp({"tools":[row("futures.order"),row("margin.order"),row("convert.order")]})])
+   self.assertFalse(adapter.readiness_probe()["write_tool_discovered"])
+
  def test_canonical_limits_and_default_mode(self):
   with tempfile.TemporaryDirectory() as d:
    s=configured(Path(d)); self.assertEqual(s.risk.max_quote_per_trade,Decimal("100")); self.assertEqual(s.paper.max_open_positions,10); self.assertEqual(s.paper.max_quote_per_entry_usdt,Decimal("100"))
@@ -117,10 +316,16 @@ class LiveSafetyTests(unittest.TestCase):
    with self.assertRaises(TypeError): frozen["symbol"]="ETHUSDT"
    request=adapter.protected_request(proposal)
    self.assertEqual(request["toolName"],"spot.orderListOtoco")
+   proposal["canonical"]["toolName"]="futures.order"
+   self.assertEqual(adapter.protected_request(proposal)["toolName"],"spot.orderListOtoco")
+   for delegated in ("futures.order","margin.order","convert.order","arbitrary.operation"):
+    with self.assertRaises(SecurityError): adapter.validate_delegated_write_tool(delegated)
+   for delegated in adapter._ALLOWED_WRITE_TOOLS:
+    adapter.validate_delegated_write_tool(delegated)
    self.assertEqual(request["arguments"]["workingSide"],"BUY")
    self.assertEqual(request["arguments"]["pendingSide"],"SELL")
    self.assertEqual(request["arguments"]["pendingBelowStopPrice"],98.0)
-   self.assertEqual(request["arguments"]["pendingBelowPrice"],97.9)
+   self.assertEqual(request["arguments"]["pendingBelowPrice"],Decimal("97.90"))
    self.assertEqual(request["arguments"]["pendingAbovePrice"],104.0)
    with self.assertRaisesRegex(SecurityError,"exact approved"): adapter.execute(proposal)
    for tool in ("futures.order","margin.order","wallet.withdraw","generic.tool_execute"):
@@ -136,7 +341,7 @@ class LiveSafetyTests(unittest.TestCase):
    proposal={"id":"p-1234567890ab","mode":"live","canonical":{"mode":"live","source":"manual-live-close","product":"SPOT","side":"SELL","order_type":"MARKET","symbol":"BTCUSDT","quote_asset":"USDT","quote_amount":"0","quantity":"0.06","market_step_size":"0.001"}}
    request=adapter.protected_request(proposal)
    self.assertEqual(request["toolName"],"spot.newOrder")
-   self.assertEqual(request["arguments"],{"symbol":"BTCUSDT","side":"SELL","type":"MARKET","quantity":0.06,"newClientOrderId":"sgc-1234567890ab"})
+   self.assertEqual(request["arguments"],{"symbol":"BTCUSDT","side":"SELL","type":"MARKET","quantity":Decimal("0.06"),"newClientOrderId":"sgc-1234567890ab"})
    self.assertEqual(adapter.validate_write_response({"orderId":7,"status":"FILLED"},close=True),"FILLED")
    for status in ("NEW", "PARTIALLY_FILLED"):
     with self.assertRaisesRegex(SecurityError,"reconciliation required"):
@@ -274,10 +479,10 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertEqual(adapter._direct_mcp_result.call_count,3)
    cancel,sell,rearm=[call.args[0] for call in adapter._direct_mcp_result.call_args_list]
    self.assertEqual(cancel["toolName"],"spot.deleteOrder")
-   self.assertEqual(sell["arguments"]["quantity"],0.02)
+   self.assertEqual(sell["arguments"]["quantity"],Decimal("0.02"))
    self.assertEqual(rearm["toolName"],"spot.orderListOco")
-   self.assertEqual(rearm["arguments"]["quantity"],0.04)
-   self.assertEqual(rearm["arguments"]["belowPrice"],97.9)
+   self.assertEqual(rearm["arguments"]["quantity"],Decimal("0.04"))
+   self.assertEqual(rearm["arguments"]["belowPrice"],Decimal("97.90"))
 
  def test_partial_exit_partial_fill_does_not_rearm(self):
   with tempfile.TemporaryDirectory() as d:

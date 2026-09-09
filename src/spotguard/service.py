@@ -1530,19 +1530,10 @@ class SpotGuard:
         exposure_by_symbol: dict[str, Decimal] = {}
         existing_exposure = Decimal("0")
         for (existing_symbol, _), legs in grouped.items():
-            quantities = {Decimal(str(row.get("origQty", "0"))) for row in legs}
-            stop_prices = [
-                Decimal(str(row.get("stopPrice", "0")))
-                for row in legs if Decimal(str(row.get("stopPrice", "0"))) > 0
-            ]
-            if (len(legs) != 2 or len(quantities) != 1
-                    or next(iter(quantities)) <= 0 or len(stop_prices) != 2):
-                raise SecurityError(
-                    "LIVE open protection is incomplete; reconciliation required"
-                )
+            validated = self.live_executor.validate_active_protective_oco(legs, existing_symbol)
             snapshot = fetch_spot_snapshot(self.settings, existing_symbol)
             snapshots[existing_symbol] = snapshot
-            protected_quantity = next(iter(quantities))
+            protected_quantity = validated["quantity"]
             protected_quantities[existing_symbol] = (
                 protected_quantities.get(existing_symbol, Decimal("0"))
                 + protected_quantity
@@ -1553,8 +1544,8 @@ class SpotGuard:
                 exposure_by_symbol.get(existing_symbol, Decimal("0"))
                 + marked_exposure
             )
-            protective_stop = min(stop_prices)
-            protective_target = max(stop_prices)
+            protective_stop = validated["stop"]
+            protective_target = validated["target"]
             ratio = self.settings.risk.min_reward_risk
             inferred_entry = (
                 protective_target + ratio * protective_stop
@@ -1800,19 +1791,16 @@ class SpotGuard:
         if len(grouped) != 1:
             raise PolicyError("exactly one active two-leg Spot OCO protection list is required for a live partial exit")
         order_list_id, legs = next(iter(grouped.items()))
-        if len(legs) != 2 or {row.get("side") for row in legs} != {"SELL"} or not {row.get("status") for row in legs} <= {"NEW", "PENDING_NEW"}:
-            raise PolicyError("active protection is not a safe two-leg SELL OCO")
-        stop_leg = next((row for row in legs if row.get("type") == "STOP_LOSS_LIMIT"), None)
-        target_leg = next((row for row in legs if row.get("type") == "TAKE_PROFIT_LIMIT"), None)
-        if stop_leg is None or target_leg is None or not isinstance(stop_leg.get("orderId"), int):
-            raise PolicyError("active OCO does not contain exact stop and target legs")
-        quantities = {Decimal(str(row.get("origQty", "0"))) for row in legs}
-        if len(quantities) != 1 or next(iter(quantities)) <= 0:
-            raise PolicyError("active OCO legs do not protect one exact quantity")
-        protected_quantity = next(iter(quantities))
         exchange = validate_spot_symbol(self.settings, symbol)
         step = Decimal(exchange["market_step_size"])
         tick = Decimal(exchange["price_tick_size"])
+        try:
+            validated = self.live_executor.validate_active_protective_oco(legs, symbol, tick=tick)
+        except SecurityError as exc:
+            raise PolicyError(str(exc)) from exc
+        order_list_id = validated["order_list_id"]
+        protected_quantity = validated["quantity"]
+        stop_leg, target_leg = validated["stop_leg"], validated["target_leg"]
         market = fetch_spot_snapshot(self.settings, symbol)
         sell_quantity = protected_quantity if percentage == Decimal("100") else floor_to_step(protected_quantity * percentage / Decimal("100"), step)
         remaining_quantity = protected_quantity - sell_quantity
@@ -1820,8 +1808,7 @@ class SpotGuard:
             raise PolicyError("requested partial exit is below Binance minimum notional after LOT_SIZE rounding")
         if percentage < Decimal("100") and (remaining_quantity <= 0 or remaining_quantity * market.bid < Decimal(exchange["min_notional"])):
             raise PolicyError("partial exit would leave unprotectable dust; use sell all instead")
-        stop = Decimal(str(stop_leg.get("stopPrice", "0")))
-        target = Decimal(str(target_leg.get("stopPrice") or target_leg.get("price") or "0"))
+        stop, target = validated["stop"], validated["target"]
         if tick <= 0 or stop <= 0 or target <= stop or stop % tick or target % tick:
             raise PolicyError("active OCO bracket is not valid for safe re-arm")
 
@@ -1905,11 +1892,12 @@ class SpotGuard:
         if len(grouped) != 1:
             raise PolicyError("exactly one active protection order list is required before it can be cancelled")
         order_list_id, legs = next(iter(grouped.items()))
-        if len(legs) != 2 or {row.get("status") for row in legs} != {"NEW"} or {row.get("side") for row in legs} != {"SELL"}:
-            raise PolicyError("active protection order list is not a safe two-leg SELL OCO")
-        anchor = next((row for row in legs if row.get("type") == "STOP_LOSS_LIMIT"), None)
-        if anchor is None or not isinstance(anchor.get("orderId"), int):
-            raise PolicyError("active protection order list has no cancellable stop leg")
+        try:
+            validated = self.live_executor.validate_active_protective_oco(legs, symbol)
+        except SecurityError as exc:
+            raise PolicyError(str(exc)) from exc
+        order_list_id = validated["order_list_id"]
+        anchor = validated["stop_leg"]
         fingerprint = hashlib.sha256(f"manual-live-cancel-protection:{symbol}:{order_list_id}:{time.time_ns()}".encode()).hexdigest()
         signal = Signal(candidate_id=f"c-{fingerprint[:12]}", fingerprint=fingerprint, symbol=symbol, interval=self.settings.market.interval,
             side="BUY", score=0, price=0.0, candle_close_time=int(time.time() * 1000), reasons=("manual live OCO cancellation; approval required",),
@@ -2788,10 +2776,21 @@ class SpotGuard:
                     item = {"symbol": symbol, "protected_live_supported": False, "reason": str(exc)}
                 symbol_checks.append(item)
         flags_ok = bool(symbol_checks) and all(item["protected_live_supported"] for item in symbol_checks)
+        connected = bool(agent.get("authenticated") and agent.get("mcp_configured"))
+        proofs = self.live_executor.verify_readiness(
+            connected=connected, symbol_flags_verified=flags_ok,
+            permission_attestation=self.ledger.latest_event("live.trade_permission_attestation"))
         readiness = self.live_executor.readiness(
-            connected=bool(agent.get("authenticated") and agent.get("mcp_configured")), armed=arm.armed,
-            symbol_flags_verified=flags_ok)
+            connected=connected, armed=arm.armed, symbol_flags_verified=flags_ok,
+            account_read_verified=proofs["account_read_verified"],
+            open_orders_read_verified=proofs["open_orders_read_verified"],
+            spot_trade_scope_verified=proofs["spot_trade_scope_verified"],
+            write_tool_discovered=proofs["write_tool_discovered"],
+            write_schema_verified=proofs["write_schema_verified"])
         result = readiness.to_dict()
+        result["readiness_reasons"] = proofs.get("reasons", [])
+        result["blockers"].extend(reason for reason in result["readiness_reasons"]
+                                   if reason not in result["blockers"])
         minimum_profile_balance = (
             None
             if self.settings.sizing_policy.percentage_based
@@ -2804,6 +2803,7 @@ class SpotGuard:
             else "A 28 USDT account cannot support a 100 USDT entry plus the 8 USDT reserve. This status report does not claim an account-read or write-scope verification; the execution gate requires independent evidence."
         )
         result.update({"arm_expires_at": arm.expires_at,
+            "rate_limit_status": self.live_executor.rate_limit_status(),
             "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
             "max_active_tranches": self.settings.live.max_active_tranches,
             "max_economic_positions": self.settings.live.max_economic_positions,
@@ -2820,6 +2820,32 @@ class SpotGuard:
             "balance_profile_note": balance_note,
             "max_pending_proposals": self.settings.live.max_pending_proposals,
             "allowed_symbols": list(self.settings.live.allowed_symbols), "symbol_checks": symbol_checks})
+        return result
+
+    def verify_live_trade_permission(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Explicitly attest Spot trade permission with one order-test call."""
+        if not operator_confirmed:
+            raise SecurityError("Spot trade permission attestation requires explicit operator confirmation")
+        symbols = tuple(self.settings.live.allowed_symbols)
+        if not symbols:
+            raise SecurityError("no LIVE Spot symbol is allowlisted")
+        account = self.live_executor.read_spot_account()
+        if account.get("account_type") != "SPOT" or account.get("can_trade") is not True:
+            raise SecurityError("authenticated Spot account metadata does not prove trade eligibility")
+        symbol = symbols[0]
+        exchange = validate_spot_symbol(self.settings, symbol, live=True)
+        market = fetch_spot_snapshot(self.settings, symbol)
+        result = self.live_executor.attest_spot_trade_permission(symbol, exchange, market)
+        if result.get("classification") == "SUCCESS":
+            verified_at = utcnow()
+            proof = {"result": "verified", "verified_at": isoformat(verified_at),
+                     "expires_at": isoformat(verified_at + timedelta(seconds=self.live_executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                     "backend": self.settings.codex.mcp_server,
+                     "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
+                     "delegated_operation": "spot.orderTest",
+                     "schema_fingerprint": result["schema_fingerprint"]}
+            self.ledger.add_event("live.trade_permission_attestation", None, proof)
+            result["proof"] = {"result": proof["result"], "verified_at": proof["verified_at"], "expires_at": proof["expires_at"]}
         return result
 
     def arm_live(self, minutes: int) -> dict[str, Any]:

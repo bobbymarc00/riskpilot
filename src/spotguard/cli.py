@@ -318,6 +318,14 @@ def build_parser() -> argparse.ArgumentParser:
         "market", help="read verified live Spot market data through Binance Agent OS"
     )
     agent_os_market.add_argument("--symbol", required=True)
+    permission_parser = subparsers.add_parser(
+        "verify-live-trade-permission", help="explicitly attest Spot trade permission with the non-submitting order test"
+    )
+    permission_parser.add_argument("--owner-id", required=True)
+    rate_limit_clear = subparsers.add_parser(
+        "clear-binance-rate-limit", help="explicitly clear the local Binance rate-limit circuit"
+    )
+    rate_limit_clear.add_argument("--owner-id", required=True)
     analyze_parser = subparsers.add_parser(
         "analyze", help="read one allowlisted closed candle through Binance Agent OS"
     )
@@ -531,6 +539,12 @@ def _run(args: argparse.Namespace) -> Any:
         )
     if args.command == "symbols":
         return service.symbols_status()
+    if args.command == "verify-live-trade-permission":
+        _require_local_admin(service, args.owner_id, "VERIFY RISKPILOT LIVE SPOT TRADE PERMISSION")
+        return service.verify_live_trade_permission(operator_confirmed=True)
+    if args.command == "clear-binance-rate-limit":
+        _require_local_admin(service, args.owner_id, "CLEAR RISKPILOT BINANCE RATE-LIMIT CIRCUIT")
+        return service.live_executor.clear_rate_limit_circuit()
     if args.command == "radar":
         return service.smart_radar(args.limit)
     if args.command == "paper-approve":
