@@ -155,6 +155,11 @@ class LiveSafetyTests(unittest.TestCase):
    service=SpotGuard(configured(Path(d),enabled=True))
    profile=service.live_executor.execution_profile_fingerprint()
    service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-reconcile","status":"RECONCILE","profile_fingerprint":profile})
+   proof={"result":"verified","delegated_operation":"spot.orderTest","profile_fingerprint":profile,"schema_fingerprint":"schema-fp","expires_at":"2999-01-01T00:00:00+00:00"}
+   service.ledger.add_event("live.trade_permission_attestation",None,proof)
+   service.ledger.add_event("live.decimal_transport_attestation",None,{**proof,"wire_mode":"fixed-point-json-number","classification":"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG","scope":"bounded_decimal_domain","tested_fields":["quantity","price"],"minimum_verified_fractional_number":"0.001"})
+   service.live_executor._valid_permission_attestation=Mock(return_value=True)
+   service.live_executor._valid_decimal_transport_attestation=Mock(return_value=True)
    legs=[{"symbol":"BTCUSDT","orderListId":10,"orderId":11,"side":"SELL","status":"NEW","type":"STOP_LOSS_LIMIT","origQty":"0.5","stopPrice":"99"},
          {"symbol":"BTCUSDT","orderListId":10,"orderId":12,"side":"SELL","status":"NEW","type":"TAKE_PROFIT_LIMIT","origQty":"0.5","stopPrice":"105"}]
    service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"SOL","free":"0","locked":"0"}]})
@@ -174,6 +179,21 @@ class LiveSafetyTests(unittest.TestCase):
    service.live_arm.status=Mock(return_value=SimpleNamespace(armed=True,scope="EXIT_ONLY"))
    with self.assertRaisesRegex(SecurityError,"EXIT_ONLY"):
     service.create_manual_buy_proposal("BTCUSDT",Decimal("6"),live=True)
+
+ def test_exit_only_approval_uses_recovery_gate_not_normal_readiness(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-exit","status":"RECONCILE","profile_fingerprint":profile})
+   prepared={"result":"prepared","scope":"EXIT_ONLY","prepared_at":"2999-01-01T00:00:00+00:00","expires_at":"2999-01-01T00:05:00+00:00","target_symbol":"BTCUSDT","epoch_id":"le-exit","profile_fingerprint":profile,"order_list_id":10,"protected_order_ids":[11,12],"protected_quantity":"0.5","permission_proof_valid":True,"decimal_proof_valid":True,"schema_fingerprint":"schema-fp"}
+   service.ledger.add_event("live.recovery_session_prepared",None,prepared)
+   service.live_arm.status=Mock(return_value=SimpleNamespace(armed=True,scope="EXIT_ONLY",binding={"prepared_at":prepared["prepared_at"],"target_symbol":"BTCUSDT"}))
+   proof={"result":"verified","delegated_operation":"spot.orderTest","profile_fingerprint":profile,"schema_fingerprint":"schema-fp","expires_at":"2999-01-01T00:00:00+00:00"}
+   service.ledger.add_event("live.trade_permission_attestation",None,proof)
+   service.ledger.add_event("live.decimal_transport_attestation",None,{**proof,"wire_mode":"fixed-point-json-number","classification":"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG","scope":"bounded_decimal_domain","tested_fields":["quantity","price"],"minimum_verified_fractional_number":"0.001"})
+   service.live_status=Mock(side_effect=AssertionError("recovery approval must not use normal readiness"))
+   proposal={"canonical":{"symbol":"BTCUSDT","side":"SELL","order_type":"PARTIAL_EXIT","order_list_id":10,"protected_order_ids":[11,12],"sell_quantity":"0.058","percentage":"100","remaining_quantity":"0"}}
+   service._validate_exit_only_approval(proposal,service.live_arm.status())
 
  def test_live_status_readiness_uses_backend_proofs_fail_closed(self):
   symbol_info={"symbol":"BTCUSDT","oto_allowed":True,"opo_allowed":True,"oco_allowed":True,

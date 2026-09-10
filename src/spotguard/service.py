@@ -2442,16 +2442,20 @@ class SpotGuard:
             if proposal["mode"] == "paper":
                 self._revalidate_paper_entry_policy(proposal, phase="approval")
             else:
-                # Re-check the exact pair at the final execution gate.
-                readiness = self.live_status(
-                    check_symbols=True, symbols=[proposal["symbol"]]
-                )
-                if not readiness["execution_ready"]:
-                    raise SecurityError(
-                        "live approval fails closed; readiness blockers: "
-                        + ", ".join(readiness["blockers"])
+                arm = self.live_arm.status()
+                if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
+                    self._validate_exit_only_approval(proposal, arm)
+                else:
+                    # Re-check the exact pair at the normal LIVE entry gate.
+                    readiness = self.live_status(
+                        check_symbols=True, symbols=[proposal["symbol"]]
                     )
-                self._revalidate_live_buy_entry(proposal)
+                    if not readiness["execution_ready"]:
+                        raise SecurityError(
+                            "live approval fails closed; readiness blockers: "
+                            + ", ".join(readiness["blockers"])
+                        )
+                    self._revalidate_live_buy_entry(proposal)
         except Exception as exc:
             if proposal["status"] == "PENDING":
                 self._policy_reject(proposal, exc)
@@ -2522,10 +2526,8 @@ class SpotGuard:
             raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
-        if (getattr(arm, "scope", "FULL") == "EXIT_ONLY"
-                and self._is_live_buy_entry(proposal["canonical"] or {})):
-            self.ledger.fail_execution(proposal_id, lease_hash, "EXIT_ONLY recovery scope forbids LIVE BUY")
-            raise SecurityError("EXIT_ONLY recovery scope forbids LIVE BUY")
+        if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
+            self._validate_exit_only_approval(proposal, arm)
         try:
             self._revalidate_live_buy_entry(proposal)
         except Exception as exc:
@@ -3669,12 +3671,21 @@ class SpotGuard:
             if order.get("symbol") == symbol and isinstance(order.get("orderListId"), int) and order["orderListId"] > 0:
                 grouped.setdefault(order["orderListId"], []).append(order)
         protected = False
+        protected_details: dict[str, Any] = {}
         if len(grouped) == 1:
-            self.live_executor.validate_active_protective_oco(next(iter(grouped.values())), symbol,
-                                                               tick=Decimal(exchange["price_tick_size"]))
+            protected_details = self.live_executor.validate_active_protective_oco(
+                next(iter(grouped.values())), symbol, tick=Decimal(exchange["price_tick_size"])
+            )
             protected = True
         if not protected:
             raise SecurityError("LIVE recovery requires an auditable active Spot protection list")
+        permission_proof = self.ledger.latest_event("live.trade_permission_attestation")
+        decimal_proof = self.ledger.latest_event("live.decimal_transport_attestation")
+        schema_fingerprint = permission_proof.get("schema_fingerprint") if isinstance(permission_proof, Mapping) else None
+        permission_valid = self.live_executor._valid_permission_attestation(permission_proof, schema_fingerprint)
+        decimal_valid = self.live_executor._valid_decimal_transport_attestation(decimal_proof, schema_fingerprint)
+        if not permission_valid or not decimal_valid:
+            raise SecurityError("LIVE recovery permission or decimal proof is missing or expired")
         prepared_at = utcnow()
         ticket = {"result": "prepared", "prepared_at": isoformat(prepared_at),
                   "expires_at": isoformat(prepared_at + timedelta(minutes=5)),
@@ -3685,11 +3696,63 @@ class SpotGuard:
                   "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
                   "epoch_id": epoch.get("epoch_id"), "account_read_verified": bool(account),
                   "open_orders_read_verified": True, "protective_order_capability_verified": protected,
+                  "order_list_id": protected_details.get("order_list_id"),
+                  "protected_order_ids": sorted(row["orderId"] for row in next(iter(grouped.values()))),
+                  "protected_quantity": format(protected_details.get("quantity", Decimal("0")), "f"),
+                  "permission_proof_valid": permission_valid, "decimal_proof_valid": decimal_valid,
+                  "schema_fingerprint": schema_fingerprint,
                   "symbol_exchange_flags_verified": True, "rate_limit_status": "CLEAR",
                   "final_blockers": []}
         self.ledger.add_event("live.recovery_session_prepared", None, ticket)
         return {"status": "PREPARED", "scope": "EXIT_ONLY", "target_symbol": symbol,
                 "expires_at": ticket["expires_at"], "execution_ready": False}
+
+    def _validate_exit_only_approval(self, proposal: Mapping[str, Any], arm: Any) -> None:
+        """Validate recovery bindings locally before any risk-reducing write."""
+        canonical = proposal.get("canonical") or {}
+        ticket = self.ledger.latest_event("live.recovery_session_prepared")
+        binding = getattr(arm, "binding", None) or {}
+        epoch = self._effective_live_risk_epoch()
+        if (not getattr(arm, "armed", False) or getattr(arm, "scope", "FULL") != "EXIT_ONLY"
+                or not isinstance(ticket, Mapping) or ticket.get("result") != "prepared"
+                or ticket.get("scope") != "EXIT_ONLY"
+                or ticket.get("prepared_at") != binding.get("prepared_at")
+                or ticket.get("target_symbol") != binding.get("target_symbol")
+                or ticket.get("profile_fingerprint") != self.live_executor.execution_profile_fingerprint()
+                or not isinstance(epoch, Mapping) or epoch.get("epoch_id") != ticket.get("epoch_id")
+                or str(epoch.get("status", "")).upper() != "RECONCILE"):
+            raise SecurityError("EXIT_ONLY recovery preparation is missing or no longer valid")
+        try:
+            if parse_time(ticket.get("expires_at")) <= utcnow():
+                raise SecurityError("EXIT_ONLY recovery preparation has expired")
+        except (TypeError, ValueError):
+            raise SecurityError("EXIT_ONLY recovery preparation is invalid")
+        if canonical.get("symbol") != ticket.get("target_symbol") or canonical.get("side") != "SELL":
+            raise SecurityError("EXIT_ONLY recovery permits only the prepared-symbol SELL")
+        if canonical.get("order_type") not in {"PARTIAL_EXIT", "CANCEL_OCO", "OCO_PROTECTION"}:
+            raise SecurityError("EXIT_ONLY recovery action is not risk-reducing")
+        if canonical.get("order_list_id") != ticket.get("order_list_id"):
+            raise SecurityError("EXIT_ONLY recovery order list does not match prepared protection")
+        if sorted(canonical.get("protected_order_ids", [])) != ticket.get("protected_order_ids"):
+            raise SecurityError("EXIT_ONLY recovery protection provenance does not match")
+        if canonical.get("order_type") == "PARTIAL_EXIT":
+            sell = Decimal(str(canonical.get("sell_quantity", "0")))
+            protected = Decimal(str(ticket.get("protected_quantity", "0")))
+            if sell <= 0 or sell > protected:
+                raise SecurityError("EXIT_ONLY recovery sell quantity exceeds verified protection")
+            if Decimal(str(canonical.get("percentage", "0"))) == Decimal("100") and Decimal(str(canonical.get("remaining_quantity", "-1"))) != 0:
+                raise SecurityError("EXIT_ONLY full exit must have zero remaining quantity")
+            self.live_executor.validate_remote_decimal_domain({"quantity": sell})
+        if ticket.get("permission_proof_valid") is not True or ticket.get("decimal_proof_valid") is not True:
+            raise SecurityError("EXIT_ONLY recovery permission or decimal proof is missing")
+        schema_fingerprint = ticket.get("schema_fingerprint")
+        if (not self.live_executor._valid_permission_attestation(
+                self.ledger.latest_event("live.trade_permission_attestation"), schema_fingerprint)
+                or not self.live_executor._valid_decimal_transport_attestation(
+                    self.ledger.latest_event("live.decimal_transport_attestation"), schema_fingerprint)):
+            raise SecurityError("EXIT_ONLY recovery permission or decimal proof is stale")
+        if self.live_executor.rate_limit_status().get("status") != "CLEAR":
+            raise SecurityError("EXIT_ONLY recovery is blocked by the rate-limit circuit")
 
     def arm_live_recovery(self, minutes: int) -> dict[str, Any]:
         if not self.settings.live.enabled:
@@ -3713,7 +3776,11 @@ class SpotGuard:
             valid = False
         if not valid:
             raise SecurityError("LIVE recovery preparation is missing, expired, or no longer valid; prepare-live-recovery-session again")
-        result = self.live_arm.arm(minutes, scope="EXIT_ONLY").__dict__
+        result = self.live_arm.arm(
+            minutes, scope="EXIT_ONLY",
+            binding={"prepared_at": ticket["prepared_at"], "target_symbol": ticket["target_symbol"],
+                     "profile_fingerprint": ticket["profile_fingerprint"]},
+        ).__dict__
         self.ledger.add_event("live.recovery_session_prepared_consumed", None,
                               {"prepared_at": ticket["prepared_at"], "consumed_at": isoformat()})
         return result
