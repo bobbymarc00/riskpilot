@@ -36,6 +36,20 @@ def snapshot(symbol: str, price: str, step: str) -> SpotMarketSnapshot:
 
 
 class SymbolExpansionTests(unittest.TestCase):
+    def setUp(self):
+        self.exchange_info = patch(
+            "spotguard.service.validate_spot_symbol",
+            return_value={
+                "symbol": "BTCUSDT", "status": "TRADING", "quote_asset": "USDT",
+                "spot_trading_allowed": True, "market_step_size": "0.001",
+                "market_min_qty": "0.001", "min_notional": "5", "price_tick_size": "0.01",
+            },
+        )
+        self.exchange_info.start()
+
+    def tearDown(self):
+        self.exchange_info.stop()
+
     def test_exchange_info_validation_and_market_lot_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = settings_for(Path(directory))

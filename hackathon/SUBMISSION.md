@@ -123,17 +123,17 @@ No unrestricted write interface is exposed to the model.
 ## Public Example Risk Limits
 
 ```text
-Default amount:                 6 USDT
-Maximum LIVE entry:           100 USDT
-Maximum PAPER entry:          100 USDT
-Maximum open exposure:        500 USDT
-Maximum economic positions:     5
-Maximum active tranches:        10
-LIVE free reserve:               8 USDT
-Maximum risk / position:         2 USDT
-Maximum aggregate risk:          4 USDT
-Daily realized-loss cap:         5 USDT
-Weekly LIVE loss cap:           20 USDT
+Default amount (legacy/manual):  6 USDT
+Active position notional:        20% of equity
+Active open exposure:            60% of equity
+Active risk / position:           0.5% of equity
+Active aggregate open risk:       1.5% of equity
+Active free reserve:              20% of equity
+Active daily loss cap:             2% of equity
+Active weekly LIVE loss cap:       5% of equity
+Optional legacy absolute caps:    disabled in example
+Maximum economic positions:        5
+Maximum active tranches:          10
 Maximum successful BUY/day:     10
 Pending LIVE proposals:          1
 ```
@@ -153,7 +153,9 @@ The offline demo uses temporary fixture/PAPER state and performs no real Binance
 
 ## Scanner Status
 
-The scheduled scanner is implemented but currently operationally disabled during Binance public REST rate-limit/IP-ban optimization.
+The Smart Scanner implementation and offline/synthetic coverage are present in
+the repository. Its live timer/deployment state is not claimed here because it
+cannot be verified from the repository alone.
 
 This does not affect the demonstrated manual analysis and owner-approved LIVE execution workflow.
 

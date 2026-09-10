@@ -337,11 +337,16 @@ The public example configuration currently uses:
 | Transfers                              | Disabled                         |
 | Convert / wallet / payment / borrowing | No supported execution route     |
 | Human approval                         | Required for every LIVE write    |
-| Default order size                     | 6 USDT                           |
-| Legacy/PAPER-demo quote floor          | 5 USDT                           |
-| Legacy/backstop LIVE entry             | 100 USDT                         |
-| Legacy/backstop PAPER entry            | 100 USDT                         |
-| Legacy/backstop open exposure          | 500 USDT                         |
+| Default order size (legacy/manual)     | 6 USDT                           |
+| Minimum quote amount (exchange floor)  | 5 USDT                           |
+| Active position notional               | 20% of equity                    |
+| Active open exposure                   | 60% of equity                    |
+| Active risk per position               | 0.5% of equity                   |
+| Active aggregate open risk             | 1.5% of equity                   |
+| Active minimum free reserve            | 20% of equity                    |
+| Active daily realized-loss cap         | 2% of equity                     |
+| Active weekly LIVE loss cap            | 5% of equity                     |
+| Optional legacy absolute safety caps   | Disabled in example              |
 | Maximum economic positions             | 5                                |
 | Maximum active tranches                | 10                               |
 | Legacy/schema-1 LIVE free reserve      | 8 USDT                           |
@@ -375,9 +380,9 @@ scales both down and up. The old USD values become a ceiling only when
 
 For every new LIVE entry, the policy takes a fresh authenticated snapshot of
 Spot balances, open OCO orders, and bounded Spot trade history when the
-proposal is created, claimed, and submitted. It fails closed if the 8 USDT
-reserve in legacy/schema-1 mode—or the equity-percentage reserve in scalable
-mode—plus exposure, tranche/position, per-position/aggregate-risk, or loss
+proposal is created, claimed, and submitted. It fails closed if the
+equity-percentage reserve in Risk Policy v2—or the legacy reserve in a v1
+config—plus exposure, tranche/position, per-position/aggregate-risk, or loss
 limits would be exceeded. A pre-existing base balance without a matching
 OCO, a historical sale whose cost basis cannot be proven from the bounded read,
 or truncated history blocks a new LIVE entry pending reconciliation; RiskPilot
@@ -554,9 +559,9 @@ Natural-language intent alone cannot arm LIVE execution.
 
 ## Scanner Status
 
-> **The scheduled scanner is implemented but currently operationally disabled while Binance public REST request budgeting and rate-limit / IP-ban protection are being optimized.**
-
-The scanner implementation remains in the repository and has offline/synthetic evaluation coverage.
+The Smart Scanner implementation is present in the repository and has
+offline/synthetic evaluation coverage. Its live timer/deployment state is not
+asserted here because it cannot be verified from the repository alone.
 
 When enabled, the intended workflow is:
 

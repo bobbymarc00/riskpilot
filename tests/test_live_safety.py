@@ -707,7 +707,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_status_distinguishes_default_order_size_from_entry_maxima(self):
   with tempfile.TemporaryDirectory() as d:
    service_status=SpotGuard(configured(Path(d))).status()
-   self.assertEqual(service_status["version"],"1.0.1")
+   self.assertEqual(service_status["version"],"1.0.3")
    status=service_status["limits"]
    self.assertEqual(status["default_order_size_usdt"],"6.0")
    self.assertEqual(status["paper"]["max_quote_per_entry_usdt"],"100")

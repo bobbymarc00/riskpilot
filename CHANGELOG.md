@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3 — 2026-09-10
+
+- Stabilized the Risk Policy v2 offline demo and exchangeInfo test fixtures.
+- Closed every SQLite connection created by the ledger, preserving transactions.
+- Synchronized package/runtime version metadata to 1.0.3.
+
 ## 1.0.0 — 2026-09-04
 
 - Established RiskPilot public branding while retaining required SpotGuard compatibility identifiers.

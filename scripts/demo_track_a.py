@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from spotguard.config import load_settings
 from spotguard.market import SpotMarketSnapshot, scaled_synthetic_klines
+from spotguard.risk_policy.limits import limits_for
 from spotguard.service import SpotGuard
 
 MARKET = SpotMarketSnapshot("BTCUSDT", Decimal("99.90"), Decimal("100"), Decimal("100"), Decimal("5"), Decimal("0.001"), "TRADING", 1)
@@ -44,12 +45,21 @@ def main() -> int:
             _, _, position_id, code = command.split()
             closed = service.approve_paper_close_by_position(position_id, code, owner, owner)
             print("5. Partial close:", closed["close"]["requested_percentage"], "% aggregate position")
+            effective_limits = limits_for(
+                service.settings,
+                "paper",
+                service.settings.paper.initial_balance_usdt,
+            )[1]
+            over_limit_amount = effective_limits.max_entry_notional + Decimal("1")
             try:
-                service.create_manual_buy_proposal("ETH", Decimal("101"))
+                service.create_manual_buy_proposal("ETH", over_limit_amount)
             except Exception as exc:
-                if "100" not in str(exc):
+                if "exceed" not in str(exc).lower() and "limit" not in str(exc).lower():
                     raise
-                print("6. Risk rejection: >100 USDT rejected before fill")
+                print(
+                    "6. Risk rejection: >"
+                    f"{effective_limits.max_entry_notional:f} USDT rejected before fill"
+                )
             else:
                 raise RuntimeError("expected over-limit request to fail")
         balance = service.ledger.paper_balance()

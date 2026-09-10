@@ -19,6 +19,16 @@ class LedgerError(RuntimeError):
     pass
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """SQLite connection whose context manager also releases the handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class Ledger:
     def __init__(self, path: Path, initial_paper_balance: Decimal = Decimal("28")) -> None:
         self.path = path
@@ -27,7 +37,9 @@ class Ledger:
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=8.0, isolation_level=None)
+        connection = sqlite3.connect(
+            self.path, timeout=8.0, isolation_level=None, factory=_ClosingConnection
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=8000")
@@ -813,7 +825,8 @@ class Ledger:
                 raise LedgerError("safe SQLite backup target is unavailable") from exc
         if target is None:
             raise LedgerError("safe SQLite backup target is unavailable")
-        source = sqlite3.connect(self.path); destination = sqlite3.connect(target)
+        source = sqlite3.connect(self.path, factory=_ClosingConnection)
+        destination = sqlite3.connect(target, factory=_ClosingConnection)
         try:
             source.backup(destination)
             if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
