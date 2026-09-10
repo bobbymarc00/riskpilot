@@ -36,6 +36,31 @@ class LiveSafetyTests(unittest.TestCase):
   with self.assertRaises(Exception):
    classify_spot_base_balance(Decimal("0.001"),filters,None)
 
+ def test_closed_incomplete_epoch_is_terminal_and_new_epoch_is_clean(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-legacy","status":"active","profile_fingerprint":profile,"started_at":"2026-01-01T00:00:00Z"})
+   service.ledger.add_event("live.risk_fill",None,{"epoch_id":"le-legacy","side":"BUY","quantity":"1","price":"100","fee_quote":"0","executed_at":"2026-01-01T00:00:00Z"})
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-legacy","status":"CLOSED_INCOMPLETE","realized_pnl_verified":False,"accounting_complete":False,"profile_fingerprint":profile})
+   self.assertEqual(service._effective_live_risk_epoch()["status"],"CLOSED_INCOMPLETE")
+   self.assertFalse(service._epoch_blocks_new_live_entry(service._effective_live_risk_epoch()))
+   fresh=service._ensure_live_risk_epoch([{"asset":"USDT","free":"33","locked":"0"}])
+   self.assertNotEqual(fresh["epoch_id"],"le-legacy")
+   self.assertTrue(service._live_session_accounting()[0])
+
+ def test_unresolved_epoch_states_block_new_epoch(self):
+  for state in ("active","RECONCILE","PNL_INCOMPLETE"):
+   with self.subTest(state=state), tempfile.TemporaryDirectory() as d:
+    service=SpotGuard(configured(Path(d),enabled=True))
+    service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-block","status":state,"profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+    self.assertTrue(service._epoch_blocks_new_live_entry(service._effective_live_risk_epoch()))
+    if state == "active":
+     self.assertEqual(service._ensure_live_risk_epoch([])["epoch_id"],"le-block")
+    else:
+     with self.assertRaisesRegex(SecurityError,"requires operator reconciliation"):
+      service._ensure_live_risk_epoch([])
+
  def test_proposal_presentation_uses_canonical_mode_and_order_type(self):
   canonical={"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"SOLUSDT",
              "quote_amount":"6","entry_reference":"102.02000000","stop_reference":"101.35000000",

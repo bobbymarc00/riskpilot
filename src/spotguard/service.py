@@ -2594,7 +2594,7 @@ class SpotGuard:
                 result["accounting_reason"] = accounting_reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"
                 self._mark_live_epoch_reconcile(result["accounting_reason"])
             if is_close and str(status).upper() == "FILLED":
-                epoch = self.ledger.latest_event("live.risk_epoch")
+                epoch = self._effective_live_risk_epoch()
                 if isinstance(epoch, Mapping):
                     self.ledger.add_event("live.session_flat", proposal_id, {
                         "epoch_id": epoch.get("epoch_id"), "symbol": proposal["symbol"],
@@ -2664,7 +2664,7 @@ class SpotGuard:
             return None
         if not isinstance(order_id, int) or order_id <= 0:
             order_id = list_or_order_id
-        return {"epoch_id": (self.ledger.latest_event("live.risk_epoch") or {}).get("epoch_id"),
+        return {"epoch_id": (self._effective_live_risk_epoch() or {}).get("epoch_id"),
                 "proposal_id": proposal["id"], "delegated_order_id": order_id,
                 "symbol": proposal["symbol"], "side": proposal["side"],
                 "quantity": format(quantity, "f"), "price": format(price, "f"),
@@ -2690,7 +2690,7 @@ class SpotGuard:
         proposal = self.ledger.get_proposal(validate_simple_id(proposal_id, "proposal_id"), include_private=True)
         if proposal.get("mode") != "live" or proposal.get("status") != "EXECUTED":
             raise SecurityError("LIVE risk-fill reconciliation requires an EXECUTED LIVE proposal")
-        epoch = self.ledger.latest_event("live.risk_epoch")
+        epoch = self._effective_live_risk_epoch()
         if not isinstance(epoch, Mapping) or epoch.get("status") != "active":
             return {"status": "PNL_INCOMPLETE", "reason": "RISKPILOT_SESSION_PNL_INCOMPLETE"}
         summary = proposal.get("execution_summary") or {}
@@ -2714,7 +2714,7 @@ class SpotGuard:
         """Close an incomplete flat epoch without deleting or resetting history."""
         if not operator_confirmed:
             raise SecurityError("LIVE risk-epoch finalization requires explicit operator confirmation")
-        epoch = self.ledger.latest_event("live.risk_epoch")
+        epoch = self._effective_live_risk_epoch()
         if not isinstance(epoch, Mapping) or epoch.get("status") not in {"ACTIVE", "active", "RECONCILE", "CLOSED_INCOMPLETE", "CLOSED"}:
             raise SecurityError("no incomplete LIVE risk epoch is available for finalization")
         if epoch.get("status") in {"CLOSED_INCOMPLETE", "CLOSED"}:
@@ -2950,7 +2950,7 @@ class SpotGuard:
             summary,
         )
         if final_status == "EXECUTED":
-            epoch = self.ledger.latest_event("live.risk_epoch")
+            epoch = self._effective_live_risk_epoch()
             self.ledger.add_event("live.risk_fill", proposal_id, {
                 "epoch_id": epoch.get("epoch_id") if isinstance(epoch, Mapping) else None,
                 "proposal_id": proposal_id, "order_id": order_id,
@@ -3050,7 +3050,7 @@ class SpotGuard:
             "account_global_realized_loss_reason": "ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE",
             "realized_loss_scope": "riskpilot_session",
             "riskpilot_session_accounting_verified": self._live_session_accounting()[0]
-                if isinstance(self.ledger.latest_event("live.risk_epoch"), Mapping) else False,
+                if isinstance(self._effective_live_risk_epoch(), Mapping) else False,
             "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
             "max_active_tranches": self.settings.live.max_active_tranches,
             "max_economic_positions": self.settings.live.max_economic_positions,
@@ -3262,13 +3262,13 @@ class SpotGuard:
 
     def _ensure_live_risk_epoch(self, balances: list[Mapping[str, Any]]) -> dict[str, Any]:
         profile = self.live_executor.execution_profile_fingerprint()
-        current = self.ledger.latest_event("live.risk_epoch")
-        if (isinstance(current, Mapping) and current.get("status") == "active"
+        current = self._effective_live_risk_epoch()
+        if (isinstance(current, Mapping) and str(current.get("status", "")).upper() == "ACTIVE"
                 and current.get("profile_fingerprint") == profile):
             return dict(current)
-        if isinstance(current, Mapping) and current.get("status") == "active":
+        if isinstance(current, Mapping) and str(current.get("status", "")).upper() == "ACTIVE":
             raise SecurityError("RISKPILOT_SESSION_PNL_INCOMPLETE: active LIVE risk epoch belongs to another execution profile")
-        if isinstance(current, Mapping) and current.get("status") == "RECONCILE":
+        if self._epoch_blocks_new_live_entry(current):
             raise SecurityError("RISKPILOT_SESSION_PNL_INCOMPLETE: LIVE risk epoch requires operator reconciliation")
         quote = sum((Decimal(str(row.get("free", "0"))) for row in balances
                      if row.get("asset") == self.settings.risk.quote_asset), Decimal("0"))
@@ -3279,18 +3279,39 @@ class SpotGuard:
         self.ledger.add_event("live.risk_epoch", None, epoch)
         return epoch
 
+    def _effective_live_risk_epoch(self) -> dict[str, Any] | None:
+        """Resolve the newest state per epoch, then select the newest epoch state."""
+        latest_by_id: dict[str, tuple[int, dict[str, Any]]] = {}
+        for sequence, event in enumerate(self.ledger.events_by_kind("live.risk_epoch")):
+            epoch_id = event.get("epoch_id")
+            if not isinstance(epoch_id, str) or not epoch_id:
+                continue
+            latest_by_id[epoch_id] = (sequence, dict(event))
+        if not latest_by_id:
+            return None
+        return max(latest_by_id.values(), key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _epoch_blocks_new_live_entry(epoch: Mapping[str, Any] | None) -> bool:
+        if not isinstance(epoch, Mapping):
+            return False
+        return str(epoch.get("status", "")).upper() in {
+            "ACTIVE", "RECONCILE", "PNL_INCOMPLETE", "INCOMPLETE",
+        }
+
     def _mark_live_epoch_reconcile(self, reason: str) -> None:
-        current = self.ledger.latest_event("live.risk_epoch")
-        if not isinstance(current, Mapping) or current.get("status") != "active":
+        current = self._effective_live_risk_epoch()
+        if not isinstance(current, Mapping) or str(current.get("status", "")).upper() != "ACTIVE":
             return
         self.ledger.add_event("live.risk_epoch", None, {
             **dict(current), "status": "RECONCILE", "reconcile_reason": bounded_text(reason, "reason", maximum=160),
         })
 
     def _live_session_accounting(self) -> tuple[bool, Decimal, Decimal, str | None]:
-        epoch = self.ledger.latest_event("live.risk_epoch")
+        epoch = self._effective_live_risk_epoch()
         profile = self.live_executor.execution_profile_fingerprint()
-        if not isinstance(epoch, Mapping) or epoch.get("status") != "active" or epoch.get("profile_fingerprint") != profile:
+        if (not isinstance(epoch, Mapping) or str(epoch.get("status", "")).upper() != "ACTIVE"
+                or epoch.get("profile_fingerprint") != profile):
             return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
         # FIFO lots carry fee-inclusive unit cost; BUY fees are part of cost
         # basis, while SELL fees are charged directly to realized PnL.
