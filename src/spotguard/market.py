@@ -142,7 +142,9 @@ def validate_spot_symbol(settings: Settings, symbol: str, *, live: bool = False)
         raise SymbolValidationError(f"{symbol} Spot quantity/notional filters are invalid")
     return {"symbol": symbol, "status": status, "quote_asset": quote,
         "spot_trading_allowed": True, "lot_step_size": str(lot_step),
-        "market_step_size": str(effective_step), "min_notional": str(minimum),
+        "market_step_size": str(effective_step),
+        "market_min_qty": str(market_min if market_step > 0 else lot_min),
+        "min_notional": str(minimum),
         "price_tick_size": str(price_tick), "percent_price_filter": bool(percent_filter),
         "max_num_orders": int(filters.get("MAX_NUM_ORDERS", {}).get("maxNumOrders", 0)),
         "max_num_algo_orders": int(filters.get("MAX_NUM_ALGO_ORDERS", {}).get("maxNumAlgoOrders", 0)),

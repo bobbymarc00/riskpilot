@@ -2582,15 +2582,27 @@ class SpotGuard:
             result["accounting_status"] = "VERIFIED" if accounting_ok else "RECONCILE"
             if not accounting_ok:
                 result["accounting_reason"] = accounting_reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"
+                self._mark_live_epoch_reconcile(result["accounting_reason"])
+            if is_close and str(status).upper() == "FILLED":
+                epoch = self.ledger.latest_event("live.risk_epoch")
+                if isinstance(epoch, Mapping):
+                    self.ledger.add_event("live.session_flat", proposal_id, {
+                        "epoch_id": epoch.get("epoch_id"), "symbol": proposal["symbol"],
+                        "verified": True, "protection_closed": True,
+                    })
         return result
 
     def _verified_live_fill(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
                             list_or_order_id: int) -> dict[str, Any] | None:
         """Extract only exchange-reported fills; never promote request estimates."""
-        reports = response.get("orderReports")
-        candidates = reports if isinstance(reports, list) else [response]
+        fill_response = response
+        partial = response.get("partial_exit")
+        if isinstance(partial, Mapping) and isinstance(partial.get("sell"), Mapping):
+            fill_response = partial["sell"]
+        reports = fill_response.get("orderReports")
+        candidates = reports if isinstance(reports, list) else [fill_response]
         entry = next((row for row in candidates if isinstance(row, Mapping)
-                      and row.get("side") == proposal.get("side") == "BUY"
+                      and row.get("side") == proposal.get("side")
                       and str(row.get("status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"}), None)
         if not isinstance(entry, Mapping):
             return None
@@ -2638,6 +2650,8 @@ class SpotGuard:
             elif fee_asset == proposal["symbol"][:-len(self.settings.risk.quote_asset)]:
                 fee_quote = fee_amount * price
         order_id = entry.get("orderId")
+        if reports is not None and (not isinstance(order_id, int) or order_id <= 0):
+            return None
         if not isinstance(order_id, int) or order_id <= 0:
             order_id = list_or_order_id
         return {"epoch_id": (self.ledger.latest_event("live.risk_epoch") or {}).get("epoch_id"),
@@ -2685,6 +2699,65 @@ class SpotGuard:
         return {"status": "VERIFIED" if ok else "PNL_INCOMPLETE",
                 "reason": None if ok else (reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"),
                 "proposal_id": proposal["id"], "delegated_order_id": fill["delegated_order_id"]}
+
+    def finalize_live_risk_epoch(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Close an incomplete flat epoch without deleting or resetting history."""
+        if not operator_confirmed:
+            raise SecurityError("LIVE risk-epoch finalization requires explicit operator confirmation")
+        epoch = self.ledger.latest_event("live.risk_epoch")
+        if not isinstance(epoch, Mapping) or epoch.get("status") not in {"ACTIVE", "active", "RECONCILE", "CLOSED_INCOMPLETE", "CLOSED"}:
+            raise SecurityError("no incomplete LIVE risk epoch is available for finalization")
+        if epoch.get("status") in {"CLOSED_INCOMPLETE", "CLOSED"}:
+            return {"status": epoch["status"], "epoch_id": epoch.get("epoch_id"), "realized_pnl_verified": False}
+        if self.live_executor.rate_limit_status().get("status") == "BLOCKED":
+            return {"status": "RATE_LIMIT_BLOCKED", "blocked_until": self.live_executor.rate_limit_status().get("blocked_until"),
+                    "epoch_id": epoch.get("epoch_id"), "realized_pnl_verified": False}
+        epoch_id = epoch.get("epoch_id")
+        active = [row for row in self.ledger.active_proposals_status() if row.get("mode") == "live"]
+        if active:
+            raise SecurityError("pending or executing LIVE proposal prevents epoch finalization")
+        proposals = [row for row in self.ledger.list_proposals(limit=1000)
+                     if row.get("mode") == "live" and isinstance(row.get("symbol"), str)
+                     and self._after_epoch_start(row.get("created_at"), epoch.get("started_at"))]
+        symbols = sorted({row["symbol"] for row in proposals})
+        if not symbols:
+            raise SecurityError("LIVE epoch has no durable touched-symbol evidence; finalization refused")
+        account = self.live_executor.read_spot_account()
+        open_orders = self.live_executor.read_open_spot_orders()
+        if any(row.get("symbol") in symbols for row in open_orders):
+            raise SecurityError("active Spot protection/order remains for the legacy LIVE epoch")
+        dust_balances = []
+        quote = self.settings.risk.quote_asset
+        balances = {row.get("asset"): Decimal(str(row.get("free", "0"))) + Decimal(str(row.get("locked", "0")))
+                    for row in account.get("balances", []) if isinstance(row, Mapping)}
+        for symbol in symbols:
+            base = symbol[:-len(quote)]
+            residual = balances.get(base, Decimal("0"))
+            if residual <= 0:
+                continue
+            filters = validate_spot_symbol(self.settings, symbol, live=True)
+            minimum_qty = Decimal(str(filters.get("market_min_qty", filters["lot_step_size"])))
+            if residual >= minimum_qty:
+                raise SecurityError(f"meaningful LIVE base balance remains for {symbol}; finalization refused")
+            dust_balances.append({"symbol": symbol, "asset": base, "quantity": format(residual, "f"),
+                                  "minimum_quantity": format(minimum_qty, "f")})
+        finalized = {**dict(epoch), "status": "CLOSED_INCOMPLETE", "finalized_at": isoformat(),
+                     "previous_status": epoch.get("status"),
+                     "finalization_reason": "LEGACY_FLAT_EPOCH_MISSING_FILL_PROVENANCE",
+                     "realized_pnl_verified": False, "accounting_complete": False,
+                     "closed_at": isoformat(), "touched_symbols": symbols,
+                     "dust_balances": dust_balances, "operator_confirmed": True}
+        self.ledger.add_event("live.risk_epoch", None, finalized)
+        self.ledger.add_event("live.risk_epoch_finalized", None, {"epoch_id": epoch_id, "status": "CLOSED_INCOMPLETE"})
+        return {"status": "CLOSED_INCOMPLETE", "epoch_id": epoch_id,
+                "realized_pnl_verified": False}
+
+    @staticmethod
+    def _after_epoch_start(created_at: Any, started_at: Any) -> bool:
+        try:
+            return parse_time(created_at) >= parse_time(started_at)
+        except (TypeError, ValueError):
+            return False
 
     @localized
     def approve_live_button(self, proposal_id: str, sender_id: str, chat_id: str) -> dict[str, Any]:
@@ -3218,8 +3291,10 @@ class SpotGuard:
         day = now.date()
         week = day - timedelta(days=day.weekday())
         for fill in self.ledger.events_by_kind("live.risk_fill"):
+            # Historical fills belong to their original epoch.  They remain
+            # visible, but must never be imported into a new clean epoch.
             if fill.get("epoch_id") != epoch.get("epoch_id"):
-                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+                continue
             try:
                 qty = Decimal(str(fill["quantity"])); price = Decimal(str(fill["price"]))
                 fee = Decimal(str(fill["fee_quote"]))
