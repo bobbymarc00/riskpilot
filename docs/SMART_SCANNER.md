@@ -1,26 +1,19 @@
 # RiskPilot Smart Scanner
 
 The scanner remains a parallel **read-only discovery/ranking layer**: it never
-adds symbols to the execution allowlist or submits an order. It is no longer an
-“additive-only” patch, however. Subsequent integration work intentionally
+adds symbols to the execution allowlist or submits an order. The original
+scanner patch was described as “additive-only”; that description is historical
+and no longer describes the integrated repository. Subsequent integration work
 updated RiskPilot service, policy, intent, Telegram, CLI, and tests so the
 scanner can persist radar state and hand configured symbols into the existing
 candidate flow. The safety boundary remains unchanged: discovery is not a
 candidate, proposal, or LIVE capability.
 
-## Verified deployment status
+## Deployment status
 
-The Smart Scanner is enabled on the RiskPilot VPS through the user-level
-`riskpilot-smart-scanner.timer`.  Its first enabled cycle completed with
-`status=0/SUCCESS`; the timer then schedules the next cycle approximately five
-minutes later (plus its configured randomized delay).
-
-Observed healthy cycles have covered roughly 480 eligible Spot/USDT symbols,
-kept a 64-symbol watchlist and a 48-symbol active universe, and reported
-`used_weight_1m` in the 116–196 range out of Binance's 6000/minute budget.
-Those values are observations, not static guarantees: the scanner adapts its
-active universe and stops kline work when its own lower safety thresholds are
-reached.
+This document describes the scanner implementation and operating model. It
+does not assert whether a VPS timer is currently enabled, disabled, or running;
+that state must be checked on the target host.
 
 ## Flow
 

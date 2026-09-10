@@ -166,18 +166,18 @@ Unknown or ambiguous financial write results are not automatically retried. The 
 The repository's example configuration includes:
 
 ```text
-Default order size:             6 USDT
-Minimum quote amount:           5 USDT
-Maximum LIVE entry:           100 USDT
-Maximum PAPER entry:          100 USDT
-Maximum open exposure:        500 USDT
-Maximum economic positions:     5
-Maximum active tranches:        10
-Minimum LIVE free reserve:       8 USDT
-Maximum risk / position:         2 USDT
-Maximum aggregate risk:          4 USDT
-Daily realized-loss cap:         5 USDT
-Weekly LIVE loss cap:           20 USDT
+Default order size (legacy/manual):  6 USDT
+Minimum quote amount (exchange floor): 5 USDT
+Active position notional:        20% of equity
+Active open exposure:            60% of equity
+Active risk / position:           0.5% of equity
+Active aggregate open risk:       1.5% of equity
+Active minimum free reserve:      20% of equity
+Active daily realized-loss cap:    2% of equity
+Active weekly LIVE loss cap:       5% of equity
+Optional legacy absolute caps:    disabled in example
+Maximum economic positions:        5
+Maximum active tranches:          10
 Successful BUY entries/day:     10
 Pending LIVE proposals:          1
 Minimum reward:risk:           2.0
@@ -187,7 +187,9 @@ Minimum reward:risk:           2.0
 
 ## Scanner Status
 
-The scheduled scanner implementation remains in the repository but is currently operationally disabled while Binance public REST request budgeting and rate-limit/IP-ban protections are optimized.
+The Smart Scanner implementation and offline/synthetic coverage are present in
+the repository. Its live timer/deployment state is not claimed here because it
+cannot be verified from the repository alone.
 
 The scanner has no independent LIVE execution authority.
 
@@ -217,7 +219,8 @@ The repository maps critical capabilities to implementation files and automated 
 * LIVE execution is experimental.
 * Authenticated LIVE writes require a private local OAuth runtime profile and therefore are not executed by public CI.
 * Generic automatic reconciliation for every ambiguous LIVE write is not implemented; unresolved outcomes remain `RECONCILE` and must not be blindly retried.
-* The scheduled scanner is currently disabled during rate-limit optimization.
+* The live timer/deployment state of the scheduled scanner is not asserted by
+  this repository documentation.
 * LIVE operation depends on Binance account permissions, exchange filters, and supported Agent OS / MCP capabilities.
 * Ambiguous LIVE results require reconciliation rather than automatic retry.
 * RiskPilot provides no guarantee of trading profitability.

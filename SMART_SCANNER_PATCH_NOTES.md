@@ -2,7 +2,9 @@
 
 ## Scope
 
-Additive Smart Scanner / Smart Radar only. No existing source file is replaced.
+The original patch was scoped as an additive Smart Scanner / Smart Radar change
+and did not replace existing source files. “Additive-only” describes that
+original patch scope; it is not a claim about the current integrated repository.
 
 ## New files
 

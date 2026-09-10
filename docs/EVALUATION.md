@@ -8,7 +8,7 @@ The real-funds demo and the repository-to-video evidence bridge are documented i
 
 | Capability | Implementation file | Test proving it | Safe reproduction | Expected output |
 |---|---|---|---|---|
-| Scanner implementation | `src/spotguard/service.py` | `test_symbol_expansion.py` | `./riskpilot --config /path/to/sanitized-config.json --json scan --synthetic --dry-run` | offline configured-symbol scan; production timer is intentionally disabled during rate-limit/IP-ban optimization |
+| Scanner implementation | `src/spotguard/service.py` | `test_symbol_expansion.py` | `./riskpilot --config /path/to/sanitized-config.json --json scan --synthetic --dry-run` | offline configured-symbol scan; VPS timer/deployment status is not asserted by repository tests |
 | Agent OS read-only confirmation | `src/spotguard/codex_bridge.py` | `test_codex_bridge.py` | `./riskpilot --json agent-os status` | read-only boundary |
 | Signal generation | `src/spotguard/strategy.py` | `test_indicators.py` | `./scripts/demo-track-a.sh` | deterministic candidate |
 | PAPER proposal | `src/spotguard/service.py` | `test_manual_flows.py` | `./scripts/demo-track-a.sh` | pending proposal and simulated fill |

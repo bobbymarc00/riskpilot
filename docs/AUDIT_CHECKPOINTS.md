@@ -1,7 +1,7 @@
-# Audit checkpoints — post-v1.0.0
+# Audit checkpoints — v1.0.3
 
-`v1.0.0` is a frozen hackathon baseline. These checkpoints describe changes
-prepared for the next patch release and never require moving that tag.
+`v1.0.3` is the current package/runtime release. These checkpoints summarize
+the current repository state; they do not imply a commit, tag, or deployment.
 
 | Checkpoint | Status | Evidence |
 | --- | --- | --- |
@@ -11,8 +11,8 @@ prepared for the next patch release and never require moving that tag.
 | Legacy PAPER migration | Fixed | Ambiguous historic fills raise `LedgerError`, with a startup regression test. |
 | LIVE exchange metadata | Fixed | LIVE symbol validation accepts at most a five-minute `exchangeInfo` cache; stale refresh failures reject LIVE. |
 | Readiness reporting | Fixed, intentionally restrictive | Profile setup is reported separately from verified account/read/write capabilities. Unprobed write scope/schema cannot make `execution_ready` true. |
-| Runtime/package version | Fixed | Runtime and package metadata are both `1.0.1`. |
-| Smart Scanner integrity/docs | Fixed | Manifest hashes validate; documentation no longer calls the integrated scanner patch additive-only. |
+| Runtime/package version | Fixed | Runtime and package metadata are both `1.0.3`; the v1.0.3 wheel is `riskpilot_agent_os-1.0.3-py3-none-any.whl`. |
+| Smart Scanner integrity/docs | Fixed | Manifest hashes validate; documentation distinguishes the original additive patch scope from the current integrated repository and makes deployment status neutral. |
 
 ## Release gates still outside this working tree
 

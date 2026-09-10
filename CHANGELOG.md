@@ -6,6 +6,16 @@
 - Closed every SQLite connection created by the ledger, preserving transactions.
 - Synchronized package/runtime version metadata to 1.0.3.
 
+## 1.0.2 — 2026-09-09
+
+- Integrated Smart Scanner radar state and configured-symbol candidate handoff while preserving the existing execution boundary.
+- Added offline scanner coverage and synchronized scanner safety documentation.
+
+## 1.0.1 — 2026-09-08
+
+- Added Risk Policy v2 equity-percentage sizing and limits with optional legacy absolute backstops.
+- Added immutable policy snapshots and execution-time conservative equity revalidation.
+
 ## 1.0.0 — 2026-09-04
 
 - Established RiskPilot public branding while retaining required SpotGuard compatibility identifiers.
