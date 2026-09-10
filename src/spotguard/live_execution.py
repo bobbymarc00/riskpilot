@@ -87,7 +87,11 @@ class LiveExecutionAdapter:
     _TOOL_SEARCH_MAX_PAGES = 10
     _TOOL_SEARCH_MAX_ITEMS = 500
     _CATALOG_CACHE_TTL_SECONDS = 300
-    _PERMISSION_ATTESTATION_TTL_SECONDS = 900
+    # These are short-lived operator attestations, bound to the execution
+    # profile and delegated schema.  Account and order reads are never cached
+    # by this TTL.
+    _PERMISSION_ATTESTATION_TTL_SECONDS = 3600
+    _REMOTE_DECIMAL_FLOOR = Decimal("0.001")
     _RATE_LIMIT_STATE_FILE = "binance-rate-limit-circuit.json"
     _DECIMAL_FIELDS = frozenset({
         "quantity", "quoteOrderQty", "price", "stopPrice", "icebergQty",
@@ -105,6 +109,22 @@ class LiveExecutionAdapter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._delegated_catalog_cache: tuple[float, dict[str, Mapping[str, Any]]] | None = None
+        self._tool_execute_schema_cache: tuple[float, Mapping[str, Any]] | None = None
+        self._request_budget: dict[str, int] | None = None
+        self._trade_history_tool_cache: tuple[float, str, Mapping[str, Any]] | None = None
+        self._trade_history_result_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+
+    def begin_request_budget(self) -> None:
+        self._request_budget = {"tools_list": 0, "catalog_search": 0,
+                                "account_read": 0, "open_orders_read": 0,
+                                "permission_order_test": 0, "decimal_order_test": 0}
+
+    def request_budget(self) -> dict[str, int]:
+        return dict(self._request_budget or {})
+
+    def _budget_inc(self, category: str) -> None:
+        if self._request_budget is not None:
+            self._request_budget[category] += 1
 
     def freeze(self, proposal: Mapping[str, Any]) -> Mapping[str, Any]:
         canonical = dict(proposal.get("canonical", {}))
@@ -139,6 +159,11 @@ class LiveExecutionAdapter:
         return MappingProxyType(canonical)
 
     def protected_request(self, proposal: Mapping[str, Any]) -> dict[str, Any]:
+        request = self._protected_request_unvalidated(proposal)
+        self.validate_remote_decimal_domain(request)
+        return request
+
+    def _protected_request_unvalidated(self, proposal: Mapping[str, Any]) -> dict[str, Any]:
         """Build the only write shape RiskPilot permits, without sending it."""
         canonical = self.freeze(proposal)
         if canonical.get("source") == "manual-live-cancel-protection":
@@ -267,7 +292,7 @@ class LiveExecutionAdapter:
     def readiness(self, *, connected: bool, armed: bool, symbol_flags_verified: bool = False,
                   account_read_verified: bool = False, open_orders_read_verified: bool = False,
                   spot_trade_scope_verified: bool = False, write_tool_discovered: bool = False,
-                  write_schema_verified: bool = False) -> LiveReadiness:
+                  write_schema_verified: bool = False, decimal_transport_verified: bool = False) -> LiveReadiness:
         blockers = []
         dedicated_execution_profile = (
             self.settings.codex.mcp_server == self.server
@@ -287,10 +312,7 @@ class LiveExecutionAdapter:
             "spot_trade_scope_verified": spot_trade_scope_verified,
             "write_tool_discovered": write_tool_discovered,
             "write_schema_verified": write_schema_verified,
-            # The current delegated numeric contract has already produced a
-            # Binance -1100 for a valid small decimal.  It is not safe to
-            # attest this capability from schema discovery alone.
-            "decimal_transport_verified": False,
+            "decimal_transport_verified": decimal_transport_verified,
             "protective_order_capability_verified": (
                 self.settings.live.protective_orders_available and symbol_flags_verified
             ),
@@ -315,23 +337,34 @@ class LiveExecutionAdapter:
         return LiveReadiness(**checks, execution_ready=all(checks.values()), blockers=tuple(blockers))
 
     def verify_readiness(self, *, connected: bool, symbol_flags_verified: bool,
-                         permission_attestation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                         permission_attestation: Mapping[str, Any] | None = None,
+                         decimal_transport_attestation: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Collect fresh read-only proofs; unavailable backend metadata fails closed."""
         account_ok = open_orders_ok = False
         account_scope_ok = False
         account_type = None
         can_trade = None
+        account_balances: list[Mapping[str, Any]] = []
         reasons: list[str] = []
         if self.rate_limit_status()["status"] == "BLOCKED":
+            present = self._decimal_attestation_present(decimal_transport_attestation)
             return {"account_read_verified": False, "open_orders_read_verified": False,
                     "spot_trade_scope_verified": False, "write_tool_discovered": False,
                     "write_schema_verified": False, "decimal_transport_verified": False,
                     "reasons": ["binance_rate_limit_blocked"],
                     "symbol_flags_verified": symbol_flags_verified,
-                    "test_order_schema_fingerprint": None, "account_type": None, "can_trade": None}
+                    "test_order_schema_fingerprint": None,
+                    "decimal_transport_attestation_present": present,
+                    "decimal_transport_mode": "bounded" if present else None,
+                    "decimal_transport_remote_refresh_available": False,
+                    "minimum_verified_fractional_number": (
+                        decimal_transport_attestation.get("minimum_verified_fractional_number")
+                        if present and isinstance(decimal_transport_attestation, Mapping) else None),
+                    "account_type": None, "can_trade": None}
         if connected:
             try:
                 account = self.read_spot_account(); account_ok = True
+                account_balances = list(account.get("balances", []))
                 account_type, can_trade = account.get("account_type"), account.get("can_trade")
                 account_scope_ok = account_type == "SPOT" and can_trade is True
             except Exception as exc:
@@ -352,22 +385,46 @@ class LiveExecutionAdapter:
         if not isinstance(evidence_reasons, (list, tuple)): evidence_reasons = []
         attestation_ok = self._valid_permission_attestation(
             permission_attestation, evidence.get("test_order_schema_fingerprint"))
+        decimal_ok = self._valid_decimal_transport_attestation(
+            decimal_transport_attestation, evidence.get("test_order_schema_fingerprint"))
+        readiness_reasons = reasons + list(evidence_reasons)
+        if not decimal_ok:
+            readiness_reasons.append("REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER")
         return {"account_read_verified": account_ok, "open_orders_read_verified": open_orders_ok,
                 "spot_trade_scope_verified": account_scope_ok and attestation_ok,
                 "write_tool_discovered": bool(evidence.get("write_tool_discovered")),
                 "write_schema_verified": bool(evidence.get("write_schema_verified")),
-                "decimal_transport_verified": False,
-                "reasons": reasons + list(evidence_reasons) + ["REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER"],
+                "decimal_transport_verified": decimal_ok,
+                "reasons": readiness_reasons,
                 "symbol_flags_verified": symbol_flags_verified,
                 "test_order_schema_fingerprint": evidence.get("test_order_schema_fingerprint"),
-                "account_type": account_type, "can_trade": can_trade}
+                "minimum_verified_fractional_number": (
+                    decimal_transport_attestation.get("minimum_verified_fractional_number")
+                    if decimal_ok and isinstance(decimal_transport_attestation, Mapping) else None),
+                "decimal_transport_attestation_present": bool(decimal_ok),
+                "decimal_transport_mode": "bounded" if decimal_ok else None,
+                "decimal_transport_remote_refresh_available": True,
+                "account_type": account_type, "can_trade": can_trade,
+                "account_balances": account_balances}
+
+    def _decimal_attestation_present(self, proof: Mapping[str, Any] | None) -> bool:
+        """Diagnostic visibility for a proof while remote refresh is blocked."""
+        if not isinstance(proof, Mapping) or proof.get("result") != "verified":
+            return False
+        if proof.get("delegated_operation") != self.permission_test_tool_name:
+            return False
+        if proof.get("wire_mode") != "fixed-point-json-number":
+            return False
+        if set(proof.get("tested_fields", ())) != {"quantity", "price"}:
+            return False
+        try:
+            return parse_time(proof.get("expires_at")) > utcnow() and Decimal(str(proof.get("minimum_verified_fractional_number"))).is_finite()
+        except (TypeError, ValueError, ArithmeticError):
+            return False
 
     def readiness_probe(self) -> Mapping[str, Any]:
         """Verify the generic wrapper, delegated catalog, and fixed schemas."""
-        top_level = self._direct_mcp_jsonrpc("tools/list", {})
-        tools = top_level.get("tools") if isinstance(top_level, Mapping) else None
-        wrapper = next((row for row in tools or [] if isinstance(row, Mapping)
-                        and row.get("name") == self.tool_name), None)
+        wrapper = self._tool_execute_schema()
         wrapper_error = self._validate_tool_execute_schema(wrapper)
         if wrapper_error:
             return {"reasons": [wrapper_error]}
@@ -392,6 +449,66 @@ class LiveExecutionAdapter:
                 "reasons": list(permission.get("reasons", ())),
                 "delegated_tools": sorted(by_name),
                 "test_order_schema_fingerprint": permission.get("test_order_schema_fingerprint")}
+
+    def _tool_execute_schema(self) -> Mapping[str, Any] | None:
+        """Read and cache the static top-level wrapper schema once per adapter."""
+        now = time.monotonic()
+        if self._tool_execute_schema_cache and now - self._tool_execute_schema_cache[0] <= self._CATALOG_CACHE_TTL_SECONDS:
+            return self._tool_execute_schema_cache[1]
+        self._budget_inc("tools_list")
+        top_level = self._direct_mcp_jsonrpc("tools/list", {})
+        tools = top_level.get("tools") if isinstance(top_level, Mapping) else []
+        wrapper = next((row for row in tools if isinstance(row, Mapping) and row.get("name") == self.tool_name), None)
+        if isinstance(wrapper, Mapping):
+            self._tool_execute_schema_cache = (now, wrapper)
+        return wrapper
+
+    def execution_discovery(self) -> tuple[Mapping[str, Any] | None, dict[str, Mapping[str, Any]]]:
+        """Return the shared wrapper/catalog context for one operator session."""
+        wrapper = self._tool_execute_schema()
+        return wrapper, self._delegated_trade_catalog()
+
+    @classmethod
+    def _trade_history_candidates(cls, catalog: Mapping[str, Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        candidates = []
+        for row in catalog.values():
+            if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+                continue
+            name = row["name"].lower()
+            schema = row.get("inputSchema")
+            props = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+            text = " ".join(str(row.get(key, "")) for key in ("name", "description", "title")).lower()
+            forbidden = ("futures", "margin", "aggtrades", "aggregate trades", "public trades")
+            history = ("mytrades", "my trades", "trade history", "account trade", "account fills", "user trades", "user fills")
+            if any(term in text or term in name for term in forbidden):
+                continue
+            if not any(term in text for term in history):
+                continue
+            if "spot" not in name and "spot" not in text:
+                continue
+            if not isinstance(schema, Mapping) or schema.get("type") != "object" or not isinstance(props, Mapping):
+                continue
+            if "symbol" not in props:
+                continue
+            candidates.append(row)
+        return candidates
+
+    def resolve_spot_trade_history_tool(self) -> tuple[str, Mapping[str, Any]]:
+        now = time.monotonic()
+        if self._trade_history_tool_cache and now - self._trade_history_tool_cache[0] <= self._CATALOG_CACHE_TTL_SECONDS:
+            return self._trade_history_tool_cache[1], self._trade_history_tool_cache[2]
+        _, catalog = self.execution_discovery()
+        candidates = self._trade_history_candidates(catalog)
+        if len(candidates) != 1:
+            raise SecurityError("ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE: no unique verified Spot account trade-history tool")
+        row = candidates[0]
+        self._trade_history_tool_cache = (now, str(row["name"]), row)
+        return str(row["name"]), row
+
+    def discover_spot_trade_history_tools(self) -> list[dict[str, Any]]:
+        _, catalog = self.execution_discovery()
+        return [{"toolName": row["name"], "description": row.get("description"),
+                 "inputSchema": row.get("inputSchema")} for row in self._trade_history_candidates(catalog)]
 
     @classmethod
     def _validate_tool_execute_schema(cls, row: Mapping[str, Any] | None) -> str | None:
@@ -421,6 +538,10 @@ class LiveExecutionAdapter:
         return catalog
 
     def _search_catalog(self, category: str) -> dict[str, Mapping[str, Any]]:
+        # The session budget reports delegated trade discovery separately from
+        # optional account-permission metadata discovery.
+        if category == "trade":
+            self._budget_inc("catalog_search")
         catalog: dict[str, Mapping[str, Any]] = {}
         cursor: str | None = None
         item_count = 0
@@ -496,7 +617,8 @@ class LiveExecutionAdapter:
         verified = response["enableReading"] and response["enableSpotAndMarginTrading"]
         return {"verified": verified, "tool": name,
                 "flags": {field: response[field] for field in sorted(self._API_PERMISSION_FIELDS)},
-                "reasons": [] if verified else ["api_restrictions_spot_trade_not_enabled"]}
+                "reasons": [] if verified else ["api_restrictions_spot_trade_not_enabled"],
+                "test_order_schema_fingerprint": self._schema_fingerprint(trade_catalog.get("spot.orderTest"))}
 
     @classmethod
     def validate_delegated_write_tool(cls, tool_name: str) -> None:
@@ -540,6 +662,35 @@ class LiveExecutionAdapter:
         except (TypeError, ValueError):
             return False
 
+    def _valid_decimal_transport_attestation(self, proof: Mapping[str, Any] | None,
+                                             schema_fingerprint: str | None) -> bool:
+        if not isinstance(proof, Mapping) or proof.get("result") != "verified":
+            return False
+        if proof.get("delegated_operation") != self.permission_test_tool_name:
+            return False
+        if proof.get("profile_fingerprint") != self.execution_profile_fingerprint():
+            return False
+        if not schema_fingerprint or proof.get("schema_fingerprint") != schema_fingerprint:
+            return False
+        if proof.get("wire_mode") != "fixed-point-json-number":
+            return False
+        if proof.get("classification") != "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG":
+            return False
+        try:
+            floor = Decimal(str(proof.get("minimum_verified_fractional_number")))
+            if not floor.is_finite() or floor <= 0:
+                return False
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        if proof.get("scope") != "bounded_decimal_domain":
+            return False
+        if not {"quantity", "price"} <= set(proof.get("tested_fields", ())):
+            return False
+        try:
+            return parse_time(proof.get("expires_at")) > utcnow()
+        except (TypeError, ValueError):
+            return False
+
     def execution_profile_fingerprint(self) -> str:
         identity = {"server": self.settings.codex.mcp_server,
                     "endpoint": "https://agent.binance.com/mcp/agentic",
@@ -548,15 +699,13 @@ class LiveExecutionAdapter:
         return __import__("hashlib").sha256(canonical_json(identity).encode()).hexdigest()
 
     def attest_spot_trade_permission(self, symbol: str, exchange: Mapping[str, Any],
-                                     market: Any) -> dict[str, Any]:
+                                     market: Any, *,
+                                     discovery: tuple[Mapping[str, Any] | None, Mapping[str, Mapping[str, Any]]] | None = None) -> dict[str, Any]:
         """Perform exactly one explicit, non-matching-engine Spot order test."""
         if symbol not in self.settings.live.allowed_symbols:
             raise SecurityError("permission attestation symbol is not allowlisted")
-        top_level = self._direct_mcp_jsonrpc("tools/list", {})
-        tools = top_level.get("tools") if isinstance(top_level, Mapping) else []
-        wrapper = next((row for row in tools if isinstance(row, Mapping) and row.get("name") == self.tool_name), None)
+        wrapper, catalog = discovery or self.execution_discovery()
         wrapper_error = self._validate_tool_execute_schema(wrapper)
-        catalog = self._delegated_trade_catalog()
         row = catalog.get(self.permission_test_tool_name)
         if wrapper_error or not isinstance(row, Mapping) or not self._schema_matches_test_order(row):
             raise SecurityError("spot.orderTest discovery/schema proof is unavailable")
@@ -576,6 +725,7 @@ class LiveExecutionAdapter:
                     "detail": payload_error, "delegated_tool": self.permission_test_tool_name,
                     "symbol": symbol, "payload": payload}
         try:
+            self._budget_inc("permission_order_test")
             response = self._direct_mcp_jsonrpc("tools/call", {"name": self.tool_name,
                 "arguments": {"toolName": self.permission_test_tool_name, "arguments": payload}})
         except MCPTransportError as exc:
@@ -595,6 +745,210 @@ class LiveExecutionAdapter:
                     "symbol": symbol, "payload": payload}
         return {"classification": "SUCCESS", "stage": "REMOTE_DELEGATED_TOOL", "delegated_tool": self.permission_test_tool_name,
                 "symbol": symbol, "payload": payload, "schema_fingerprint": self._schema_fingerprint(row)}
+
+    def attest_decimal_transport(self, symbol: str, exchange: Mapping[str, Any],
+                                 market: Any, *,
+                                 discovery: tuple[Mapping[str, Any] | None, Mapping[str, Mapping[str, Any]]] | None = None) -> dict[str, Any]:
+        """Explicitly attest fractional Spot decimal transport using orderTest only."""
+        if symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("decimal transport attestation symbol is not allowlisted")
+        wrapper, catalog = discovery or self.execution_discovery()
+        row = catalog.get(self.permission_test_tool_name)
+        if self._validate_tool_execute_schema(wrapper) or not isinstance(row, Mapping):
+            return {"classification": "DECIMAL_SCHEMA_MISMATCH", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "spot.orderTest discovery/schema proof is unavailable",
+                    "delegated_tool": self.permission_test_tool_name}
+        schema = row.get("inputSchema")
+        properties = schema.get("properties") if isinstance(schema, Mapping) else {}
+        decimal_fields = {"quantity", "price"}
+        if (not self._schema_matches_test_order(row)
+                or any(not isinstance(properties.get(field), Mapping)
+                       or properties[field].get("type") != "number" for field in decimal_fields)):
+            return {"classification": "DECIMAL_SCHEMA_MISMATCH", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "spot.orderTest quantity/price schema is not numeric",
+                    "delegated_tool": self.permission_test_tool_name}
+        tick = decimal_value(exchange.get("price_tick_size"), "price_tick_size")
+        step = decimal_value(exchange.get("market_step_size"), "market_step_size")
+        minimum = decimal_value(exchange.get("min_notional"), "min_notional")
+        if min(tick, step, minimum) <= 0:
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "fractional filter-aligned decimal payload could not be constructed",
+                    "delegated_tool": self.permission_test_tool_name, "symbol": symbol}
+        price = (Decimal(str(market.ask)) / tick).to_integral_value(rounding="ROUND_CEILING") * tick
+        if price == price.to_integral_value() and tick < 1:
+            price += tick
+        minimum_quantity = max(self._REMOTE_DECIMAL_FLOOR, minimum / price)
+        quantity = (minimum_quantity / step).to_integral_value(rounding="ROUND_CEILING") * step
+        payload = {"symbol": symbol, "side": "BUY", "type": "LIMIT", "timeInForce": "GTC",
+                   "quantity": quantity, "price": price}
+        if (price <= 0 or quantity <= 0
+                or quantity % step != 0 or price % tick != 0 or quantity * price < minimum
+                or quantity == quantity.to_integral_value()):
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "fractional filter-aligned decimal payload could not be constructed",
+                    "delegated_tool": self.permission_test_tool_name, "symbol": symbol}
+        payload_error = self._validate_test_order_arguments(payload, row)
+        if payload_error:
+            return {"classification": "DECIMAL_SCHEMA_MISMATCH", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": payload_error, "delegated_tool": self.permission_test_tool_name,
+                    "symbol": symbol}
+        wire = self._canonical_wire_json(payload)
+        try:
+            parsed = json.loads(wire, parse_float=Decimal, parse_int=Decimal)
+            for field in decimal_fields:
+                token = re.search(rf'"{field}":([^,}}]+)', wire)
+                if (not token or token.group(1).startswith('"') or "e" in token.group(1).lower()
+                        or Decimal(token.group(1)) != payload[field]
+                        or not isinstance(parsed.get(field), Decimal)):
+                    raise ValueError(f"unsafe wire representation for {field}")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": str(exc), "delegated_tool": self.permission_test_tool_name,
+                    "symbol": symbol}
+        try:
+            self._budget_inc("decimal_order_test")
+            response = self._direct_mcp_jsonrpc("tools/call", {"name": self.tool_name,
+                "arguments": {"toolName": self.permission_test_tool_name, "arguments": payload}})
+        except MCPTransportError as exc:
+            return {"classification": "TRANSPORT_FAILURE", "stage": exc.stage,
+                    "error_code": exc.error_code, "http_status": exc.http_status,
+                    "detail": self._sanitize_error_text(exc), "delegated_tool": self.permission_test_tool_name,
+                    "symbol": symbol, "payload": payload}
+        except Exception as exc:
+            return {"classification": "TRANSPORT_FAILURE", "stage": "UNKNOWN", "detail": str(exc)[:240],
+                    "delegated_tool": self.permission_test_tool_name, "symbol": symbol, "payload": payload}
+        detail = self._mcp_error_text(response)
+        if response.get("isError") is True or detail:
+            lowered = detail.lower()
+            if any(term in lowered for term in ("-1003", "http 429", "http 418", "request weight", "rate limit", "ip banned")):
+                classification = "TRANSPORT_FAILURE"
+            elif any(term in lowered for term in ("unauthor", "forbidden", "permission", "-2014", "-2015")):
+                classification = "AUTHORIZATION_FAILURE"
+            elif any(term in lowered for term in ("invalid", "quantity", "price", "filter", "-1100", "-1013")):
+                classification = "REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER"
+            else:
+                classification = "TRANSPORT_FAILURE"
+            return {"classification": classification, "stage": "REMOTE_DELEGATED_TOOL", "detail": detail[:240],
+                    "delegated_tool": self.permission_test_tool_name, "symbol": symbol, "payload": payload}
+        return {"classification": "SUCCESS", "stage": "REMOTE_DELEGATED_TOOL",
+                "delegated_tool": self.permission_test_tool_name, "symbol": symbol, "payload": payload,
+                "schema_fingerprint": self._schema_fingerprint(row),
+                "wire_decimal_fields": {field: format(payload[field], "f") for field in sorted(decimal_fields)},
+                "wire_mode": "fixed-point-json-number"}
+
+    @classmethod
+    def validate_remote_decimal_domain(cls, request: Mapping[str, Any],
+                                       minimum_verified_fractional_number: Decimal | str = _REMOTE_DECIMAL_FLOOR) -> None:
+        """Reject unverified small fractional Binance numbers before MCP transport."""
+        try:
+            floor = Decimal(str(minimum_verified_fractional_number))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise SecurityError("REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG: invalid verified decimal floor") from exc
+        if not floor.is_finite() or floor <= 0:
+            raise SecurityError("REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG: invalid verified decimal floor")
+        arguments = request.get("arguments") if isinstance(request, Mapping) else None
+        if not isinstance(arguments, Mapping):
+            return
+        for field, value in arguments.items():
+            if field not in cls._DECIMAL_FIELDS:
+                continue
+            try:
+                number = value if isinstance(value, Decimal) else Decimal(str(value))
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                raise SecurityError(f"LOCAL_DECIMAL_SERIALIZATION_FAILURE: field {field} is not decimal") from exc
+            if not number.is_finite() or number <= 0:
+                raise SecurityError(f"LOCAL_DECIMAL_SERIALIZATION_FAILURE: field {field} is not positive and finite")
+            if number != number.to_integral_value() and abs(number) < floor:
+                raise SecurityError(
+                    f"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG: field {field} is below remotely verified decimal floor {floor}"
+                )
+        wire = cls._canonical_wire_json(request)
+        try:
+            parsed = json.loads(wire, parse_float=Decimal, parse_int=Decimal)
+            parsed_args = parsed.get("arguments", {})
+            for field in cls._DECIMAL_FIELDS:
+                if field not in arguments:
+                    continue
+                token = re.search(rf'"{field}":([^,}}]+)', wire)
+                if (not token or token.group(1).startswith('"') or "e" in token.group(1).lower()
+                        or Decimal(token.group(1)) != arguments[field]
+                        or not isinstance(parsed_args.get(field), Decimal)):
+                    raise ValueError(f"unsafe wire representation for {field}")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise SecurityError(f"LOCAL_DECIMAL_SERIALIZATION_FAILURE: {exc}") from exc
+
+    def diagnose_decimal_transport(self, symbol: str, exchange: Mapping[str, Any],
+                                   market: Any, *,
+                                   discovery: tuple[Mapping[str, Any] | None, Mapping[str, Mapping[str, Any]]] | None = None) -> dict[str, Any]:
+        """Probe one larger fractional quantity; never creates a readiness proof."""
+        if symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("decimal transport diagnostic symbol is not allowlisted")
+        wrapper, catalog = discovery or self.execution_discovery()
+        row = catalog.get(self.permission_test_tool_name)
+        if self._validate_tool_execute_schema(wrapper) or not isinstance(row, Mapping) or not self._schema_matches_test_order(row):
+            return {"classification": "DECIMAL_SCHEMA_MISMATCH", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "spot.orderTest numeric schema is unavailable", "delegated_tool": self.permission_test_tool_name}
+        tick = decimal_value(exchange.get("price_tick_size"), "price_tick_size")
+        step = decimal_value(exchange.get("market_step_size"), "market_step_size")
+        minimum = decimal_value(exchange.get("min_notional"), "min_notional")
+        if min(tick, step, minimum) <= 0:
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "diagnostic filters are invalid", "delegated_tool": self.permission_test_tool_name}
+        price = (Decimal(str(market.ask)) / tick).to_integral_value(rounding="ROUND_CEILING") * tick
+        if price == price.to_integral_value() and tick < 1:
+            price += tick
+        minimum_quantity = max(Decimal("0.001"), minimum / price)
+        quantity = (minimum_quantity / step).to_integral_value(rounding="ROUND_CEILING") * step
+        if (price <= 0 or quantity <= 0 or quantity % step != 0 or price % tick != 0
+                or quantity * price < minimum or quantity == quantity.to_integral_value()):
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": "no valid fractional diagnostic quantity is available", "delegated_tool": self.permission_test_tool_name,
+                    "symbol": symbol}
+        payload = {"symbol": symbol, "side": "BUY", "type": "LIMIT", "timeInForce": "GTC",
+                   "quantity": quantity, "price": price}
+        payload_error = self._validate_test_order_arguments(payload, row)
+        if payload_error:
+            return {"classification": "DECIMAL_SCHEMA_MISMATCH", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": payload_error, "delegated_tool": self.permission_test_tool_name, "symbol": symbol}
+        wire = self._canonical_wire_json(payload)
+        try:
+            parsed = json.loads(wire, parse_float=Decimal, parse_int=Decimal)
+            for field in ("quantity", "price"):
+                token = re.search(rf'"{field}":([^,}}]+)', wire)
+                if (not token or token.group(1).startswith('"') or "e" in token.group(1).lower()
+                        or Decimal(token.group(1)) != payload[field]
+                        or not isinstance(parsed.get(field), Decimal)):
+                    raise ValueError(f"unsafe wire representation for {field}")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return {"classification": "LOCAL_DECIMAL_SERIALIZATION_FAILURE", "stage": "BEFORE_TOOL_EXECUTE",
+                    "detail": str(exc), "delegated_tool": self.permission_test_tool_name, "symbol": symbol}
+        evidence = {"requested_quantity": format(quantity, "f"), "requested_price": format(price, "f"),
+                    "wire_quantity_fixed_point": format(quantity, "f"),
+                    "wire_price_fixed_point": format(price, "f"),
+                    "delegated_tool": self.permission_test_tool_name}
+        try:
+            response = self._direct_mcp_jsonrpc("tools/call", {"name": self.tool_name,
+                "arguments": {"toolName": self.permission_test_tool_name, "arguments": payload}})
+        except MCPTransportError as exc:
+            return {"classification": "TRANSPORT_FAILURE", "stage": exc.stage, "error_code": exc.error_code,
+                    "http_status": exc.http_status, "detail": self._sanitize_error_text(exc), **evidence}
+        except Exception as exc:
+            return {"classification": "TRANSPORT_FAILURE", "stage": "UNKNOWN", "detail": str(exc)[:240], **evidence}
+        detail = self._mcp_error_text(response)
+        if response.get("isError") is True or detail:
+            lowered = detail.lower()
+            if any(term in lowered for term in ("-1003", "http 429", "http 418", "request weight", "rate limit", "ip banned")):
+                classification = "TRANSPORT_FAILURE"
+            elif any(term in lowered for term in ("unauthor", "forbidden", "permission", "-2014", "-2015")):
+                classification = "AUTHORIZATION_FAILURE"
+            elif any(term in lowered for term in ("-1100", "illegal characters", "quantity", "price")):
+                classification = "REMOTE_MCP_GENERAL_DECIMAL_CONTRACT_BUG"
+            else:
+                classification = "TRANSPORT_FAILURE"
+            return {"classification": classification, "stage": "REMOTE_DELEGATED_TOOL", "detail": detail[:240], **evidence}
+        return {"classification": "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG", "stage": "REMOTE_DELEGATED_TOOL",
+                "detail": "larger fractional decimal succeeded; prior small-decimal failure remains evidence of a size-sensitive remote bug",
+                "remote_result": "SUCCESS", "schema_fingerprint": self._schema_fingerprint(row), **evidence}
 
     @staticmethod
     def _validate_test_order_arguments(payload: Mapping[str, Any], row: Mapping[str, Any]) -> str | None:
@@ -821,6 +1175,7 @@ class LiveExecutionAdapter:
         return result
 
     def _direct_mcp_result(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        self.validate_remote_decimal_domain(request)
         result = self._direct_mcp_jsonrpc("tools/call", {"name": self.tool_name, "arguments": dict(request)})
         if result.get("isError") is True:
             detail = self._mcp_error_text(result)
@@ -924,6 +1279,7 @@ class LiveExecutionAdapter:
             self.validate_protective_legs(response, proposal)
         return dict(response)
     def read_spot_account(self) -> dict[str, Any]:
+        self._budget_inc("account_read")
         response = self._read_exact("account")
         balances = response.get("balances") if isinstance(response, Mapping) else None
         if not isinstance(balances, list):
@@ -947,6 +1303,7 @@ class LiveExecutionAdapter:
                 "spot_trade_scope_verified": scope_verified}
 
     def read_open_spot_orders(self) -> list[dict[str, Any]]:
+        self._budget_inc("open_orders_read")
         response = self._read_exact("open_orders")
         if not isinstance(response, list):
             raise SecurityError("open Spot orders response is malformed")
@@ -957,13 +1314,35 @@ class LiveExecutionAdapter:
         return [{field: row[field] for field in fields if field in row} for row in response]
 
     def read_spot_trades(self, symbol: str, start_time_ms: int) -> list[dict[str, Any]]:
-        """Read fixed Spot trade evidence; callers never control the tool name."""
+        """Read verified Spot account fills; callers never control the tool name."""
         if symbol not in self.settings.live.allowed_symbols or start_time_ms <= 0:
             raise SecurityError("unapproved live trade-history read")
-        request = {"toolName": "spot.getMyTrades", "arguments": {
-            "symbol": symbol, "startTime": start_time_ms, "limit": 1000,
-        }}
-        response = self._decode_mcp_result(self._direct_mcp_result(request))
+        cached = self._trade_history_result_cache.get(symbol)
+        if cached and start_time_ms >= cached[0]:
+            return [row for row in cached[1] if int(row.get("time", 0)) >= start_time_ms]
+        try:
+            tool_name, row = self.resolve_spot_trade_history_tool()
+        except SecurityError:
+            raise
+        schema = row.get("inputSchema")
+        props = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+        required = schema.get("required", []) if isinstance(schema, Mapping) else []
+        arguments: dict[str, Any] = {"symbol": symbol}
+        if "startTime" in props: arguments["startTime"] = start_time_ms
+        elif "start_time" in props: arguments["start_time"] = start_time_ms
+        else: raise SecurityError("ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE: tool has no supported start-time field")
+        if "limit" in props: arguments["limit"] = 1000
+        if isinstance(required, list) and any(field not in arguments for field in required):
+            raise SecurityError("ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE: trade-history schema requires unsupported fields")
+        if schema.get("additionalProperties") is False and any(field not in props for field in arguments):
+            raise SecurityError("ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE: trade-history arguments are schema-incompatible")
+        request = {"toolName": tool_name, "arguments": arguments}
+        try:
+            response = self._decode_mcp_result(self._direct_mcp_result(request))
+        except MCPTransportError as exc:
+            if exc.error_code == -32602:
+                raise SecurityError("DELEGATED_READ_TOOL_UNAVAILABLE: verified Spot trade-history tool is unavailable") from exc
+            raise
         if not isinstance(response, list):
             raise SecurityError("Spot trade history response is malformed")
         if len(response) >= 1000:
@@ -978,6 +1357,7 @@ class LiveExecutionAdapter:
                 raise SecurityError("Spot trade history row is invalid")
             trades.append({"isBuyer": row["isBuyer"], "qty": format(quantity, "f"),
                            "quoteQty": format(quote, "f"), "time": row.get("time")})
+        self._trade_history_result_cache[symbol] = (start_time_ms, trades)
         return trades
 
     def _read_exact(self, kind: str) -> Any:

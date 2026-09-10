@@ -3,12 +3,14 @@ import json, tempfile, unittest
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from spotguard.config import load_settings
 from spotguard.live_execution import LiveExecutionAdapter, MCPTransportError
 from spotguard.market import SpotMarketSnapshot, scaled_synthetic_klines
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
+from spotguard.util import isoformat, utcnow
 from tests.helpers import config_dict
 
 OWNER="123456789"
@@ -19,6 +21,51 @@ def configured(root: Path, *, enabled=False, scheduled="paper"):
  p=root/"config.json"; p.write_text(json.dumps(d)); return load_settings(p)
 
 class LiveSafetyTests(unittest.TestCase):
+ def test_execution_discovery_reuses_wrapper_and_trade_catalog(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   wrapper={"name":"tool_execute","inputSchema":{"type":"object","properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}},"required":["toolName"],"additionalProperties":False}}
+   row={"name":"spot.orderTest","inputSchema":{"type":"object","properties":{},"required":[],"additionalProperties":False}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[{"tools":[wrapper]}, {"structuredContent":{"tools":[row]}}])
+   adapter.execution_discovery()
+   adapter.execution_discovery()
+   self.assertEqual(adapter._direct_mcp_jsonrpc.call_count, 2)
+
+ def test_prepare_live_session_blocked_makes_zero_remote_calls(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor._activate_rate_limit(reason="BINANCE_-1003")
+   service.live_executor._direct_mcp_jsonrpc=Mock(side_effect=AssertionError("blocked preflight must not call MCP"))
+   result=service.prepare_live_session("BTCUSDT",operator_confirmed=True)
+   self.assertFalse(result["execution_ready"])
+   self.assertEqual(result["blockers"],["binance_rate_limit_blocked"])
+   service.live_executor._direct_mcp_jsonrpc.assert_not_called()
+
+ def test_arm_consumes_prepared_session_without_mcp_calls(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.settings=replace(service.settings,codex=replace(service.settings.codex,mcp_server="binance-execution"))
+   service.live_executor.settings=service.settings
+   service.live_executor.execution_profile_fingerprint=Mock(return_value="profile-fp")
+   service.live_executor._direct_mcp_jsonrpc=Mock(side_effect=AssertionError("arm must not call MCP"))
+   common={"result":"verified","delegated_operation":"spot.orderTest","profile_fingerprint":"profile-fp","schema_fingerprint":"schema-fp","expires_at":"2999-01-01T00:00:00+00:00"}
+   service.ledger.add_event("live.trade_permission_attestation",None,dict(common))
+   service.ledger.add_event("live.decimal_transport_attestation",None,{**common,"wire_mode":"fixed-point-json-number","classification":"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG","scope":"bounded_decimal_domain","tested_fields":["quantity","price"],"minimum_verified_fractional_number":"0.001"})
+   service.ledger.add_event("live.session_prepared",None,{"result":"prepared","prepared_at":"2999-01-01T00:00:00+00:00","expires_at":"2999-01-01T00:05:00+00:00","target_symbol":"BTCUSDT","backend":"binance-execution","profile_fingerprint":"profile-fp","schema_fingerprint":"schema-fp","account_read_verified":True,"open_orders_read_verified":True,"spot_trade_scope_verified":True,"write_tool_discovered":True,"write_schema_verified":True,"decimal_transport_verified":True,"decimal_transport_mode":"bounded","minimum_verified_fractional_number":"0.001","protective_order_capability_verified":True,"symbol_exchange_flags_verified":True,"live_limits_valid":True,"live_enabled":True,"rate_limit_status":"CLEAR","final_blockers":["live_armed"]})
+   service.live_arm.arm=Mock(return_value=SimpleNamespace(armed=True,expires_at="2999-01-01T00:30:00+00:00",reason="armed"))
+   result=service.arm_live(30)
+   self.assertTrue(result["armed"])
+   service.live_executor._direct_mcp_jsonrpc.assert_not_called()
+   self.assertEqual(service.ledger.latest_event("live.session_prepared_consumed")["prepared_at"],"2999-01-01T00:00:00+00:00")
+
+ def test_arm_without_prepared_session_fails_closed_without_mcp(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor._direct_mcp_jsonrpc=Mock(side_effect=AssertionError("arm must not call MCP"))
+   with self.assertRaisesRegex(SecurityError,"prepare-live-session"):
+    service.arm_live(30)
+   service.live_executor._direct_mcp_jsonrpc.assert_not_called()
+
  def test_live_status_readiness_uses_backend_proofs_fail_closed(self):
   symbol_info={"symbol":"BTCUSDT","oto_allowed":True,"opo_allowed":True,"oco_allowed":True,
                "price_tick_size":"0.01","percent_price_filter":True,"max_num_orders":5,
@@ -224,6 +271,156 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertFalse(readiness.decimal_transport_verified)
    self.assertFalse(readiness.execution_ready)
 
+ def test_bounded_decimal_domain_accepts_floor_and_rejects_smaller_values_without_rounding(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   for value in ("0.001", "0.001000", "0.005", "1.25", "78219.58"):
+    adapter.validate_remote_decimal_domain({"toolName":"spot.newOrder","arguments":{"quantity":Decimal(value)}})
+   for field, value in (("quantity","0.000999"),("quantity","0.00007000"),("stopPrice","0.00007000")):
+    with self.subTest(field=field,value=value):
+     request={"toolName":"spot.orderListOco","arguments":{field:Decimal(value)}}
+     with self.assertRaisesRegex(SecurityError,"below remotely verified decimal floor 0.001"):
+      adapter.validate_remote_decimal_domain(request)
+     self.assertEqual(request["arguments"][field],Decimal(value))
+
+ def test_unsafe_decimal_is_rejected_before_remote_result_transport(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter._direct_mcp_jsonrpc=Mock()
+   with self.assertRaisesRegex(SecurityError,"field quantity is below remotely verified decimal floor 0.001"):
+    adapter._direct_mcp_result({"toolName":"spot.newOrder","arguments":{"quantity":Decimal("0.00007")}})
+   adapter._direct_mcp_jsonrpc.assert_not_called()
+
+ def test_fractional_decimal_transport_attestation_uses_fixed_json_numbers(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":
+           {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+            "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},
+            "price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+            "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+    {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    {"isError":False,"content":[{"type":"text","text":"{}"}]}])
+   result=adapter.attest_decimal_transport(
+    "BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"SUCCESS")
+   payload=adapter._direct_mcp_jsonrpc.call_args.args[1]["arguments"]["arguments"]
+   self.assertIsInstance(payload["quantity"],Decimal)
+   self.assertIsInstance(payload["price"],Decimal)
+   self.assertGreater(payload["quantity"],0)
+   wire=adapter._canonical_wire_json(payload)
+   self.assertRegex(wire,r'"quantity":[0-9]+\.[0-9]+')
+   self.assertRegex(wire,r'"price":[0-9]+\.[0-9]+')
+   self.assertNotRegex(wire,r'(?i)"(?:quantity|price)":"|"(?:quantity|price)":-?[0-9.]+e')
+   self.assertEqual(json.loads(wire,parse_float=Decimal)["quantity"],payload["quantity"])
+   self.assertEqual(result["wire_mode"],"fixed-point-json-number")
+
+ def test_decimal_attestation_persists_and_readiness_validates_it(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.attest_decimal_transport=Mock(return_value={
+    "classification":"SUCCESS","schema_fingerprint":"decimal-schema",
+    "delegated_tool":"spot.orderTest",
+    "payload":{"quantity":Decimal("0.001"),"price":Decimal("100.01")}})
+   service.live_executor.execution_profile_fingerprint=Mock(return_value="profile-fp")
+   with patch("spotguard.service.validate_spot_symbol",return_value={"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}), \
+        patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET):
+    result=service.verify_live_decimal_transport(operator_confirmed=True)
+   self.assertEqual(result["classification"],"SUCCESS")
+   proof=service.ledger.latest_event("live.decimal_transport_attestation")
+   self.assertTrue(service.live_executor._valid_decimal_transport_attestation(proof,"decimal-schema"))
+   expired=dict(proof); expired["expires_at"]="2000-01-01T00:00:00+00:00"
+   self.assertFalse(service.live_executor._valid_decimal_transport_attestation(expired,"decimal-schema"))
+   wrong_profile=dict(proof); wrong_profile["profile_fingerprint"]="other"
+   self.assertFalse(service.live_executor._valid_decimal_transport_attestation(wrong_profile,"decimal-schema"))
+   missing_fields=dict(proof); missing_fields["tested_fields"]=["quantity"]
+   self.assertFalse(service.live_executor._valid_decimal_transport_attestation(missing_fields,"decimal-schema"))
+
+ def test_valid_bounded_decimal_proof_enables_only_decimal_readiness_proof(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter.read_spot_account=Mock(return_value={"account_type":"SPOT","can_trade":True})
+   adapter.read_open_spot_orders=Mock(return_value=[])
+   adapter.readiness_probe=Mock(return_value={"write_tool_discovered":True,"write_schema_verified":True,
+    "test_order_schema_fingerprint":"schema-fp","reasons":[]})
+   adapter.execution_profile_fingerprint=Mock(return_value="profile-fp")
+   proof={"result":"verified","delegated_operation":"spot.orderTest","profile_fingerprint":"profile-fp",
+          "schema_fingerprint":"schema-fp","wire_mode":"fixed-point-json-number",
+          "tested_fields":["quantity","price"],"minimum_verified_fractional_number":"0.001",
+          "classification":"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG","scope":"bounded_decimal_domain",
+          "expires_at":"2999-01-01T00:00:00+00:00"}
+   result=adapter.verify_readiness(connected=True,symbol_flags_verified=True,
+    permission_attestation=None,decimal_transport_attestation=proof)
+   self.assertTrue(result["decimal_transport_verified"])
+   self.assertEqual(result["minimum_verified_fractional_number"],"0.001")
+
+ def test_decimal_attestation_remote_1100_is_blocker_without_proof(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":
+           {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+            "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},
+            "price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+            "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+    {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    {"isError":True,"content":[{"type":"text","text":"-1100 Illegal characters found in parameter 'quantity'"}]}])
+   result=adapter.attest_decimal_transport(
+    "BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER")
+
+ def test_decimal_diagnostic_uses_larger_fractional_quantity_without_proof(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":
+           {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+            "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},
+            "price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+            "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+    {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    {"isError":False,"content":[{"type":"text","text":"{}"}]}])
+   result=adapter.diagnose_decimal_transport(
+    "BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.00001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG")
+   self.assertEqual(result["remote_result"],"SUCCESS")
+   self.assertGreaterEqual(Decimal(result["requested_quantity"]),Decimal("0.001"))
+   self.assertNotIn("live.decimal_transport_attestation", str(result))
+
+ def test_decimal_diagnostic_quantity_error_is_general_contract_bug(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   schema={"type":"object","required":["symbol","side","type"],"properties":
+           {"symbol":{"type":"string"},"side":{"type":"string"},"type":{"type":"string"},
+            "quantity":{"type":"number"},"quoteOrderQty":{"type":"number"},
+            "price":{"type":"number"},"timeInForce":{"type":"string"}}}
+   wrapper={"type":"object","required":["toolName"],"additionalProperties":False,
+            "properties":{"toolName":{"type":"string"},"arguments":{"type":"object"}}}
+   adapter._direct_mcp_jsonrpc=Mock(side_effect=[
+    {"tools":[{"name":"tool_execute","inputSchema":wrapper}]},
+    {"structuredContent":{"tools":[{"name":"spot.orderTest","inputSchema":schema}]}},
+    {"isError":True,"content":[{"type":"text","text":"-1100 Illegal characters found in parameter 'quantity'"}]}])
+   result=adapter.diagnose_decimal_transport(
+    "BTCUSDT", {"price_tick_size":"0.01","market_step_size":"0.00001","min_notional":"5"}, MARKET)
+   self.assertEqual(result["classification"],"REMOTE_MCP_GENERAL_DECIMAL_CONTRACT_BUG")
+
+ def test_live_status_does_not_refresh_decimal_attestation(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_executor.attest_decimal_transport=Mock(side_effect=AssertionError("must not attest from status"))
+   service.agent_os.status=Mock(return_value={"authenticated":False,"mcp_configured":False})
+   service.live_arm.status=Mock(return_value=Mock(armed=False,expires_at=None))
+   result=service.live_status(check_symbols=False)
+   self.assertFalse(result["decimal_transport_verified"])
+   service.live_executor.attest_decimal_transport.assert_not_called()
+
  def test_readiness_probe_requires_exact_spot_tools_and_schema(self):
   with tempfile.TemporaryDirectory() as d:
    adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
@@ -407,6 +604,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_live_snapshot_enforces_reserve_and_records_projection(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-test","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
    service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"108","locked":"0"}]})
    service.live_executor.read_open_spot_orders=Mock(return_value=[])
    service.live_executor.read_spot_trades=Mock(return_value=[])
@@ -421,10 +619,12 @@ class LiveSafetyTests(unittest.TestCase):
  def test_live_snapshot_refuses_unverified_sale_or_existing_position(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-test","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   service.ledger.add_event("live.risk_fill",None,{"epoch_id":"le-test","side":"SELL","quantity":"1","price":"100","fee_quote":"0","executed_at":"2026-01-01T00:00:00Z"})
    service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"1000","locked":"0"}]})
    service.live_executor.read_open_spot_orders=Mock(return_value=[])
    service.live_executor.read_spot_trades=Mock(return_value=[{"isBuyer":False,"qty":"1","quoteQty":"100","time":1}])
-   with self.assertRaisesRegex(SecurityError,"realized loss"):
+   with self.assertRaisesRegex(SecurityError,"RISKPILOT_SESSION_PNL_INCOMPLETE"):
     service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
 
  def test_live_snapshot_refuses_unprotected_base_balance(self):
@@ -434,6 +634,31 @@ class LiveSafetyTests(unittest.TestCase):
    service.live_executor.read_open_spot_orders=Mock(return_value=[])
    with self.assertRaisesRegex(SecurityError,"not fully protected"):
     service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
+
+ def test_live_session_accounting_uses_fifo_and_verified_fees(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-fifo","status":"active","profile_fingerprint":profile})
+   now=isoformat(utcnow())
+   service.ledger.add_event("live.risk_fill", "proposal-buy-1", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-1","order_id":"order-buy-1","side":"BUY","quantity":"1","price":"100","fee_quote":"0.10","executed_at":now})
+   service.ledger.add_event("live.risk_fill", "proposal-buy-2", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-2","order_id":"order-buy-2","side":"BUY","quantity":"1","price":"110","fee_quote":"0.10","executed_at":now})
+   service.ledger.add_event("live.risk_fill", "proposal-sell-1", {"epoch_id":"le-fifo","proposal_id":"proposal-sell-1","order_id":"order-sell-1","side":"SELL","quantity":"1.5","price":"90","fee_quote":"0.20","executed_at":now})
+   ok, daily, weekly, reason=service._live_session_accounting()
+   self.assertTrue(ok)
+   self.assertIsNone(reason)
+   self.assertEqual(daily, Decimal("20.35"))
+   self.assertEqual(weekly, Decimal("20.35"))
+
+ def test_live_session_accounting_missing_fee_fails_closed(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-incomplete","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   service.ledger.add_event("live.risk_fill", "proposal-1", {"epoch_id":"le-incomplete","proposal_id":"proposal-1","order_id":"order-1","side":"BUY","quantity":"1","price":"100","executed_at":isoformat(utcnow())})
+   ok, daily, weekly, reason=service._live_session_accounting()
+   self.assertFalse(ok)
+   self.assertEqual(reason,"RISKPILOT_SESSION_PNL_INCOMPLETE")
+   self.assertEqual((daily,weekly),(Decimal("0"),Decimal("0")))
 
  @patch("spotguard.service.fetch_klines",return_value=scaled_synthetic_klines(100))
  @patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET)

@@ -258,6 +258,22 @@ class Ledger:
         payload["recorded_at"] = row["created_at"]
         return payload
 
+    def events_by_kind(self, kind: str) -> list[dict[str, Any]]:
+        """Return redacted append-only event payloads for local accounting."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json, created_at FROM events WHERE kind=? ORDER BY id",
+                (kind,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if not isinstance(payload, dict):
+                raise LedgerError("audit event payload is malformed")
+            payload.setdefault("recorded_at", row["created_at"])
+            result.append(payload)
+        return result
+
     def create_candidate(self, signal: Signal, ttl_minutes: int) -> tuple[dict[str, Any], bool]:
         now = utcnow()
         values = (

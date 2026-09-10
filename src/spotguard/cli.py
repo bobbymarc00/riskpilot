@@ -262,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     execution_complete.add_argument("--status", required=True)
     execution_complete.add_argument("--filled-quantity")
     execution_complete.add_argument("--average-price")
+    execution_complete.add_argument("--fee-quote")
     execution_fail = execution_sub.add_parser("fail")
     execution_fail.add_argument("proposal_id")
     execution_fail.add_argument("--lease", required=True)
@@ -322,6 +323,23 @@ def build_parser() -> argparse.ArgumentParser:
         "verify-live-trade-permission", help="explicitly attest Spot trade permission with the non-submitting order test"
     )
     permission_parser.add_argument("--owner-id", required=True)
+    decimal_parser = subparsers.add_parser(
+        "verify-live-decimal-transport", help="explicitly attest fractional Spot decimal transport"
+    )
+    decimal_parser.add_argument("--owner-id", required=True)
+    diagnostic_parser = subparsers.add_parser(
+        "diagnose-live-decimal-transport", help="diagnose size-sensitive Spot decimal transport"
+    )
+    diagnostic_parser.add_argument("--owner-id", required=True)
+    prepare_live = subparsers.add_parser(
+        "prepare-live-session", help="collect one consolidated, read-only LIVE readiness preflight"
+    )
+    prepare_live.add_argument("--symbol", required=True)
+    prepare_live.add_argument("--owner-id", required=True)
+    history_discovery = subparsers.add_parser(
+        "discover-live-trade-history-tool", help="discover the authenticated Spot trade-history read capability"
+    )
+    history_discovery.add_argument("--owner-id", required=True)
     rate_limit_clear = subparsers.add_parser(
         "clear-binance-rate-limit", help="explicitly clear the local Binance rate-limit circuit"
     )
@@ -542,6 +560,18 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command == "verify-live-trade-permission":
         _require_local_admin(service, args.owner_id, "VERIFY RISKPILOT LIVE SPOT TRADE PERMISSION")
         return service.verify_live_trade_permission(operator_confirmed=True)
+    if args.command == "verify-live-decimal-transport":
+        _require_local_admin(service, args.owner_id, "VERIFY RISKPILOT LIVE DECIMAL TRANSPORT")
+        return service.verify_live_decimal_transport(operator_confirmed=True)
+    if args.command == "diagnose-live-decimal-transport":
+        _require_local_admin(service, args.owner_id, "DIAGNOSE RISKPILOT LIVE DECIMAL TRANSPORT")
+        return service.diagnose_live_decimal_transport(operator_confirmed=True)
+    if args.command == "prepare-live-session":
+        _require_local_admin(service, args.owner_id, "PREPARE RISKPILOT LIVE SESSION")
+        return service.prepare_live_session(args.symbol, operator_confirmed=True)
+    if args.command == "discover-live-trade-history-tool":
+        _require_local_admin(service, args.owner_id, "DISCOVER RISKPILOT LIVE TRADE HISTORY TOOL")
+        return service.discover_live_trade_history_tool(operator_confirmed=True)
     if args.command == "clear-binance-rate-limit":
         _require_local_admin(service, args.owner_id, "CLEAR RISKPILOT BINANCE RATE-LIMIT CIRCUIT")
         return service.live_executor.clear_rate_limit_circuit()
@@ -697,6 +727,7 @@ def _run(args: argparse.Namespace) -> Any:
                 args.status,
                 filled_quantity=args.filled_quantity,
                 average_price=args.average_price,
+                fee_quote=args.fee_quote,
             )
         if args.execution_command == "fail":
             return service.fail_execution(args.proposal_id, args.lease, args.reason)
@@ -714,6 +745,7 @@ def _run(args: argparse.Namespace) -> Any:
         if args.live_command in {"pause", "disarm"}:
             _require_local_admin(service, args.owner_id, "DISARM RISK PILOT LIVE")
             result = service.live_arm.disarm().__dict__
+            service.invalidate_prepared_live_session("live_disarmed")
             service.ledger.add_event("admin.live_disarmed", None, {"local_tty": True})
             return result
         if args.live_command == "enable":
@@ -721,6 +753,7 @@ def _run(args: argparse.Namespace) -> Any:
         if args.live_command == "disable":
             result = _local_admin_update(service, args.owner_id, "DISABLE RISK PILOT LIVE", {"live.enabled": False, "live.armed": False})
             service.live_arm.disarm()
+            service.invalidate_prepared_live_session("live_disabled")
             return result
         if args.live_command == "arm":
             if args.owner_id != service.settings.openclaw.telegram_owner_id:

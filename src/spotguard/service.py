@@ -8,7 +8,7 @@ import secrets
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from . import __version__
 from .presentation import detect_locale, error_text, localized, number, render, translate
@@ -1551,6 +1551,7 @@ class SpotGuard:
                 protective_target + ratio * protective_stop
             ) / (Decimal("1") + ratio)
             if not protective_stop < inferred_entry < protective_target:
+                self._mark_live_epoch_reconcile("protected entry basis is not reconstructable")
                 raise SecurityError(
                     "LIVE protected entry basis cannot be reconstructed; reconciliation required"
                 )
@@ -1581,18 +1582,21 @@ class SpotGuard:
             )
             if matching_symbol is None:
                 if self.settings.sizing_policy.enabled:
+                    self._mark_live_epoch_reconcile(f"unvalued Spot asset {asset}")
                     raise SecurityError(
                         f"LIVE Spot asset {asset} cannot be valued in configured {quote_asset}; reconciliation required"
                     )
                 continue
             held_by_symbol[matching_symbol] = held
             if held != protected_quantities.get(matching_symbol, Decimal("0")):
+                self._mark_live_epoch_reconcile(f"unexplained balance for {matching_symbol}")
                 raise SecurityError(
                     "LIVE base balance is not fully protected by an auditable OCO; reconciliation required"
                 )
 
         for protected_symbol, protected_quantity in protected_quantities.items():
             if held_by_symbol.get(protected_symbol, Decimal("0")) != protected_quantity:
+                self._mark_live_epoch_reconcile(f"unexplained balance for {protected_symbol}")
                 raise SecurityError(
                     "LIVE OCO quantity does not match Spot balance; reconciliation required"
                 )
@@ -1612,23 +1616,13 @@ class SpotGuard:
         now = utcnow()
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = day_start - timedelta(days=day_start.weekday())
-        daily_buys = 0
-        has_sale = False
-        for configured_symbol in self.settings.live.allowed_symbols:
-            daily = self.live_executor.read_spot_trades(configured_symbol, int(day_start.timestamp() * 1000))
-            weekly = self.live_executor.read_spot_trades(configured_symbol, int(week_start.timestamp() * 1000))
-            daily_buys += sum(1 for trade in daily if trade["isBuyer"])
-            has_sale = has_sale or any(not trade["isBuyer"] for trade in weekly)
-        committed = self.ledger.committed_live_executions(day_start.date().isoformat())
-        entries_today = max(daily_buys, committed)
+        accounting_ok, daily_loss, weekly_loss, accounting_reason = self._live_session_accounting()
+        if not accounting_ok:
+            raise SecurityError(accounting_reason or "RISKPILOT_SESSION_PNL_INCOMPLETE")
+        entries_today = self.ledger.committed_live_executions(day_start.date().isoformat())
         if entries_today >= self.settings.live.max_successful_entries_per_utc_day:
             raise PolicyError("LIVE daily entry quota reached "
                               f"({self.settings.live.max_successful_entries_per_utc_day})")
-        # Trade history does not carry a complete historical cost basis for a
-        # sale opened before the query window. Treat every sale as unverified
-        # rather than under-reporting daily/weekly realized loss.
-        if has_sale:
-            raise SecurityError("LIVE realized loss cannot be proven from the bounded trade history; reconciliation required")
         raw_equity = (
             free_quote
             + locked_quote
@@ -1650,10 +1644,10 @@ class SpotGuard:
         usage = UsageSnapshot(
             open_exposure=existing_exposure,
             aggregate_open_risk=current_aggregate_risk,
-            daily_realized_loss=Decimal("0"),
+            daily_realized_loss=daily_loss,
             economic_positions=len(active_symbols),
             active_tranches=active_tranches,
-            weekly_realized_loss=Decimal("0"),
+            weekly_realized_loss=weekly_loss,
         )
         hard, effective = limits_for(
             self.settings, "live", equity.equity,
@@ -1717,8 +1711,13 @@ class SpotGuard:
                 "projected_position_risk": str(projected_position_risk),
                 "projected_aggregate_risk": str(projected_aggregate_risk),
                 "live_entries_today": entries_today,
-                "live_daily_realized_loss": "0",
-                "live_weekly_realized_loss": "0",
+                "live_daily_realized_loss": format(daily_loss, "f"),
+                "live_weekly_realized_loss": format(weekly_loss, "f"),
+                "account_trade_history_available": False,
+                "account_global_realized_loss_verified": False,
+                "account_global_realized_loss_reason": "ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE",
+                "realized_loss_scope": "riskpilot_session",
+                "riskpilot_session_accounting_verified": accounting_ok,
                 "active_live_tranches": active_tranches,
                 "active_live_economic_positions": len(active_symbols),
                 "calculated_notional": str(quote_amount),
@@ -2702,6 +2701,7 @@ class SpotGuard:
         execution_status: str,
         filled_quantity: str | None = None,
         average_price: str | None = None,
+        fee_quote: str | None = None,
     ) -> dict[str, Any]:
         if not self.settings.live.enabled:
             raise SecurityError("live completion is disabled locally")
@@ -2719,7 +2719,7 @@ class SpotGuard:
             "filled_quantity": filled_quantity,
             "average_price": average_price,
         }
-        return self.ledger.finish_execution(
+        result = self.ledger.finish_execution(
             proposal_id,
             lease_hash,
             final_status,
@@ -2727,6 +2727,17 @@ class SpotGuard:
             normalized_status,
             summary,
         )
+        if final_status == "EXECUTED":
+            epoch = self.ledger.latest_event("live.risk_epoch")
+            self.ledger.add_event("live.risk_fill", proposal_id, {
+                "epoch_id": epoch.get("epoch_id") if isinstance(epoch, Mapping) else None,
+                "proposal_id": proposal_id, "order_id": order_id,
+                "symbol": proposal["symbol"],
+                "side": proposal["side"], "quantity": filled_quantity,
+                "price": average_price, "fee_quote": fee_quote,
+                "executed_at": isoformat(),
+            })
+        return result
 
     def fail_execution(self, proposal_id: str, lease: str, reason: str) -> dict[str, Any]:
         _, lease_hash = self._verify_execution_lease(proposal_id, lease)
@@ -2779,16 +2790,24 @@ class SpotGuard:
         connected = bool(agent.get("authenticated") and agent.get("mcp_configured"))
         proofs = self.live_executor.verify_readiness(
             connected=connected, symbol_flags_verified=flags_ok,
-            permission_attestation=self.ledger.latest_event("live.trade_permission_attestation"))
+            permission_attestation=self.ledger.latest_event("live.trade_permission_attestation"),
+            decimal_transport_attestation=self.ledger.latest_event("live.decimal_transport_attestation"))
         readiness = self.live_executor.readiness(
             connected=connected, armed=arm.armed, symbol_flags_verified=flags_ok,
             account_read_verified=proofs["account_read_verified"],
             open_orders_read_verified=proofs["open_orders_read_verified"],
             spot_trade_scope_verified=proofs["spot_trade_scope_verified"],
             write_tool_discovered=proofs["write_tool_discovered"],
-            write_schema_verified=proofs["write_schema_verified"])
+            write_schema_verified=proofs["write_schema_verified"],
+            decimal_transport_verified=proofs["decimal_transport_verified"])
         result = readiness.to_dict()
         result["readiness_reasons"] = proofs.get("reasons", [])
+        result["decimal_transport_mode"] = proofs.get("decimal_transport_mode") or ("bounded" if proofs["decimal_transport_verified"] else "blocked")
+        result["minimum_verified_fractional_number"] = proofs.get("minimum_verified_fractional_number")
+        result["decimal_transport_attestation_present"] = proofs.get(
+            "decimal_transport_attestation_present", proofs["decimal_transport_verified"])
+        result["decimal_transport_remote_refresh_available"] = proofs.get(
+            "decimal_transport_remote_refresh_available", True)
         result["blockers"].extend(reason for reason in result["readiness_reasons"]
                                    if reason not in result["blockers"])
         minimum_profile_balance = (
@@ -2804,6 +2823,12 @@ class SpotGuard:
         )
         result.update({"arm_expires_at": arm.expires_at,
             "rate_limit_status": self.live_executor.rate_limit_status(),
+            "account_trade_history_available": False,
+            "account_global_realized_loss_verified": False,
+            "account_global_realized_loss_reason": "ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE",
+            "realized_loss_scope": "riskpilot_session",
+            "riskpilot_session_accounting_verified": self._live_session_accounting()[0]
+                if isinstance(self.ledger.latest_event("live.risk_epoch"), Mapping) else False,
             "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
             "max_active_tranches": self.settings.live.max_active_tranches,
             "max_economic_positions": self.settings.live.max_economic_positions,
@@ -2821,6 +2846,267 @@ class SpotGuard:
             "max_pending_proposals": self.settings.live.max_pending_proposals,
             "allowed_symbols": list(self.settings.live.allowed_symbols), "symbol_checks": symbol_checks})
         return result
+
+    def prepare_live_session(self, symbol: str, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Collect one bounded, operator-confirmed LIVE preflight session.
+
+        The adapter instance owns the wrapper/catalog cache for the complete
+        session.  This method never arms LIVE and never creates a proposal.
+        """
+        if not operator_confirmed:
+            raise SecurityError("LIVE session preparation requires explicit operator confirmation")
+        if symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("LIVE session symbol is not allowlisted")
+        executor = self.live_executor
+        permission_event = self.ledger.latest_event("live.trade_permission_attestation")
+        decimal_event = self.ledger.latest_event("live.decimal_transport_attestation")
+        circuit = executor.rate_limit_status()
+
+        def blocked_result(reason: str = "binance_rate_limit_blocked") -> dict[str, Any]:
+            present = isinstance(decimal_event, Mapping) and decimal_event.get("result") == "verified"
+            mode = "bounded" if present else None
+            floor = decimal_event.get("minimum_verified_fractional_number") if present else None
+            return {"rate_limit_status": circuit, "account_read_verified": False,
+                    "open_orders_read_verified": False, "spot_trade_scope_verified": False,
+                    "write_tool_discovered": False, "write_schema_verified": False,
+                    "decimal_transport_verified": False, "decimal_transport_attestation_present": present,
+                    "decimal_transport_mode": mode, "minimum_verified_fractional_number": floor,
+                    "decimal_transport_remote_refresh_available": False,
+                    "symbol_exchange_flags_verified": False,
+                    "protective_order_capability_verified": False, "live_limits_valid": False,
+                    "live_enabled": self.settings.live.enabled, "live_armed": False,
+                    "execution_ready": False, "blockers": [reason],
+                    "mcp_calls_by_category": executor.request_budget()}
+
+        if circuit["status"] == "BLOCKED":
+            return blocked_result()
+        executor.begin_request_budget()
+        arm = self.live_arm.status()
+        agent = self.agent_os.status()
+        connected = bool(agent.get("authenticated") and agent.get("mcp_configured"))
+        if not connected:
+            return blocked_result("backend_not_connected")
+
+        try:
+            exchange = validate_spot_symbol(self.settings, symbol, live=True)
+            flags_ok = bool(exchange.get("oto_allowed") and exchange.get("opo_allowed")
+                            and exchange.get("oco_allowed") and Decimal(exchange.get("price_tick_size", "0")) > 0
+                            and exchange.get("percent_price_filter") and exchange.get("max_num_orders", 0) > 0
+                            and exchange.get("max_num_algo_orders", 0) > 0 and exchange.get("max_num_order_lists", 0) > 0)
+        except Exception as exc:
+            exchange, flags_ok = {}, False
+            symbol_reason = f"symbol_exchange_flags:{exc}"
+        else:
+            symbol_reason = None
+
+        proofs = executor.verify_readiness(
+            connected=True, symbol_flags_verified=flags_ok,
+            permission_attestation=permission_event,
+            decimal_transport_attestation=decimal_event)
+        if executor.rate_limit_status()["status"] == "BLOCKED":
+            circuit = executor.rate_limit_status()
+            return blocked_result()
+        permission_ok = bool(proofs.get("spot_trade_scope_verified"))
+        decimal_ok = bool(proofs.get("decimal_transport_verified"))
+        decimal_probe_needed = not decimal_ok
+        if decimal_ok and isinstance(decimal_event, Mapping):
+            try:
+                # A valid but weaker historical proof may be strengthened by
+                # the canonical BTCUSDT floor probe.  Never weaken it.
+                decimal_probe_needed = Decimal(str(decimal_event.get(
+                    "minimum_verified_fractional_number"))) > executor._REMOTE_DECIMAL_FLOOR
+            except (ArithmeticError, TypeError, ValueError):
+                decimal_probe_needed = True
+        discovery = None
+        if not permission_ok or decimal_probe_needed:
+            discovery = executor.execution_discovery()
+        market = None
+        permission_result = None
+        decimal_result = None
+        if not permission_ok:
+            market = fetch_spot_snapshot(self.settings, symbol)
+            permission_result = executor.attest_spot_trade_permission(symbol, exchange, market, discovery=discovery)
+            if permission_result.get("classification") == "SUCCESS":
+                now = utcnow()
+                proof = {"result": "verified", "verified_at": isoformat(now),
+                         "expires_at": isoformat(now + timedelta(seconds=executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                         "backend": self.settings.codex.mcp_server,
+                         "profile_fingerprint": executor.execution_profile_fingerprint(),
+                         "delegated_operation": "spot.orderTest",
+                         "schema_fingerprint": permission_result["schema_fingerprint"]}
+                self.ledger.add_event("live.trade_permission_attestation", None, proof)
+                permission_ok = proofs.get("account_type") == "SPOT" and proofs.get("can_trade") is True
+        if executor.rate_limit_status()["status"] == "BLOCKED":
+            circuit = executor.rate_limit_status()
+            return blocked_result()
+        if decimal_probe_needed:
+            # Decimal transport is a backend capability.  It must use the
+            # canonical low-floor symbol, not the requested execution pair's
+            # notional-derived quantity.
+            attestation_symbol = (
+                "BTCUSDT" if "BTCUSDT" in self.settings.live.allowed_symbols else symbol
+            )
+            if attestation_symbol == symbol:
+                decimal_exchange, decimal_market = exchange, market
+            else:
+                decimal_exchange = validate_spot_symbol(self.settings, attestation_symbol, live=True)
+                decimal_market = fetch_spot_snapshot(self.settings, attestation_symbol)
+            decimal_result = executor.attest_decimal_transport(
+                attestation_symbol, decimal_exchange, decimal_market, discovery=discovery)
+            if decimal_result.get("classification") == "SUCCESS":
+                payload = decimal_result.get("payload", {})
+                quantity = Decimal(str(payload.get("quantity", "0")))
+                price = Decimal(str(payload.get("price", "0")))
+                if quantity >= executor._REMOTE_DECIMAL_FLOOR and quantity != quantity.to_integral_value() and price > 0 and price != price.to_integral_value():
+                    now = utcnow()
+                    effective_floor = quantity
+                    if executor._valid_decimal_transport_attestation(
+                            decimal_event, decimal_result["schema_fingerprint"]):
+                        try:
+                            effective_floor = min(effective_floor, Decimal(str(
+                                decimal_event["minimum_verified_fractional_number"])))
+                        except (ArithmeticError, TypeError, ValueError):
+                            pass
+                    proof = {"result": "verified", "verified_at": isoformat(now),
+                             "expires_at": isoformat(now + timedelta(seconds=executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                             "backend": self.settings.codex.mcp_server,
+                             "profile_fingerprint": executor.execution_profile_fingerprint(),
+                             "delegated_operation": "spot.orderTest", "schema_fingerprint": decimal_result["schema_fingerprint"],
+                             "symbol": attestation_symbol, "attestation_symbol": attestation_symbol,
+                             "target_symbol": symbol, "tested_fields": ["quantity", "price"],
+                             "wire_mode": "fixed-point-json-number",
+                             "minimum_verified_fractional_number": format(effective_floor, "f"),
+                             "classification": "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG",
+                             "scope": "bounded_decimal_domain"}
+                    self.ledger.add_event("live.decimal_transport_attestation", None, proof)
+                    decimal_ok = True
+        if executor.rate_limit_status()["status"] == "BLOCKED":
+            circuit = executor.rate_limit_status()
+            return blocked_result()
+        readiness = executor.readiness(
+            connected=True, armed=arm.armed, symbol_flags_verified=flags_ok,
+            account_read_verified=proofs["account_read_verified"],
+            open_orders_read_verified=proofs["open_orders_read_verified"],
+            spot_trade_scope_verified=permission_ok,
+            write_tool_discovered=proofs["write_tool_discovered"],
+            write_schema_verified=proofs["write_schema_verified"],
+            decimal_transport_verified=decimal_ok)
+        result = readiness.to_dict()
+        result.update({"rate_limit_status": executor.rate_limit_status(),
+                       "decimal_transport_mode": "bounded" if decimal_ok else "blocked",
+                       "minimum_verified_fractional_number": (
+                           (decimal_event or {}).get("minimum_verified_fractional_number") if not decimal_result
+                           else (format(Decimal(str(decimal_result.get("payload", {}).get("quantity"))), "f")
+                                 if decimal_result.get("payload", {}).get("quantity") is not None else None)),
+                       "decimal_transport_remote_refresh_available": True,
+                       "mcp_calls_by_category": executor.request_budget(),
+                       "symbol": symbol})
+        # `readiness` is the sole source of execution blockers.  Probe reasons
+        # remain diagnostic, but stale pre-attestation reasons must not survive
+        # after the corresponding final proof has become valid.
+        result["readiness_reasons"] = proofs.get("reasons", [])
+        if decimal_ok:
+            result["upstream_decimal_limitation"] = "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG"
+        if symbol_reason and symbol_reason not in result["blockers"]:
+            result["blockers"].append(symbol_reason)
+        if not result["execution_ready"] and not result["blockers"]:
+            result["blockers"] = ["live_not_ready"]
+        result["permission_attestation"] = permission_result and {"classification": permission_result.get("classification")}
+        result["decimal_attestation"] = decimal_result and {"classification": decimal_result.get("classification")}
+        if (not arm.armed and result["execution_ready"] is False
+                and result["blockers"] == ["live_armed"]):
+            self._ensure_live_risk_epoch(proofs.get("account_balances", []))
+            prepared_at = utcnow()
+            ticket = {"result": "prepared", "prepared_at": isoformat(prepared_at),
+                      "expires_at": isoformat(prepared_at + timedelta(minutes=5)),
+                      "target_symbol": symbol, "backend": self.settings.codex.mcp_server,
+                      "profile_fingerprint": executor.execution_profile_fingerprint(),
+                      "schema_fingerprint": proofs.get("test_order_schema_fingerprint"),
+                      "account_read_verified": result["account_read_verified"],
+                      "open_orders_read_verified": result["open_orders_read_verified"],
+                      "spot_trade_scope_verified": result["spot_trade_scope_verified"],
+                      "write_tool_discovered": result["write_tool_discovered"],
+                      "write_schema_verified": result["write_schema_verified"],
+                      "decimal_transport_verified": result["decimal_transport_verified"],
+                      "decimal_transport_mode": result.get("decimal_transport_mode"),
+                      "minimum_verified_fractional_number": result.get("minimum_verified_fractional_number"),
+                      "protective_order_capability_verified": result["protective_order_capability_verified"],
+                      "symbol_exchange_flags_verified": result["symbol_exchange_flags_verified"],
+                      "live_limits_valid": result["live_limits_valid"],
+                      "live_enabled": result["live_enabled"],
+                      "rate_limit_status": "CLEAR", "final_blockers": ["live_armed"]}
+            self.ledger.add_event("live.session_prepared", None, ticket)
+        return result
+
+    def _ensure_live_risk_epoch(self, balances: list[Mapping[str, Any]]) -> dict[str, Any]:
+        profile = self.live_executor.execution_profile_fingerprint()
+        current = self.ledger.latest_event("live.risk_epoch")
+        if (isinstance(current, Mapping) and current.get("status") == "active"
+                and current.get("profile_fingerprint") == profile):
+            return dict(current)
+        if isinstance(current, Mapping) and current.get("status") == "active":
+            raise SecurityError("RISKPILOT_SESSION_PNL_INCOMPLETE: active LIVE risk epoch belongs to another execution profile")
+        if isinstance(current, Mapping) and current.get("status") == "RECONCILE":
+            raise SecurityError("RISKPILOT_SESSION_PNL_INCOMPLETE: LIVE risk epoch requires operator reconciliation")
+        quote = sum((Decimal(str(row.get("free", "0"))) for row in balances
+                     if row.get("asset") == self.settings.risk.quote_asset), Decimal("0"))
+        epoch = {"epoch_id": f"le-{secrets.token_hex(8)}", "started_at": isoformat(),
+                 "profile_fingerprint": profile, "quote_asset": self.settings.risk.quote_asset,
+                 "initial_free_quote": format(quote, "f"), "initial_equity_snapshot": None,
+                 "status": "active"}
+        self.ledger.add_event("live.risk_epoch", None, epoch)
+        return epoch
+
+    def _mark_live_epoch_reconcile(self, reason: str) -> None:
+        current = self.ledger.latest_event("live.risk_epoch")
+        if not isinstance(current, Mapping) or current.get("status") != "active":
+            return
+        self.ledger.add_event("live.risk_epoch", None, {
+            **dict(current), "status": "RECONCILE", "reconcile_reason": bounded_text(reason, "reason", maximum=160),
+        })
+
+    def _live_session_accounting(self) -> tuple[bool, Decimal, Decimal, str | None]:
+        epoch = self.ledger.latest_event("live.risk_epoch")
+        profile = self.live_executor.execution_profile_fingerprint()
+        if not isinstance(epoch, Mapping) or epoch.get("status") != "active" or epoch.get("profile_fingerprint") != profile:
+            return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+        # FIFO lots carry fee-inclusive unit cost; BUY fees are part of cost
+        # basis, while SELL fees are charged directly to realized PnL.
+        lots: list[list[Decimal]] = []
+        daily_loss = Decimal("0")
+        weekly_loss = Decimal("0")
+        now = utcnow()
+        day = now.date()
+        week = day - timedelta(days=day.weekday())
+        for fill in self.ledger.events_by_kind("live.risk_fill"):
+            if fill.get("epoch_id") != epoch.get("epoch_id"):
+                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            try:
+                qty = Decimal(str(fill["quantity"])); price = Decimal(str(fill["price"]))
+                fee = Decimal(str(fill["fee_quote"]))
+                when = parse_time(fill.get("executed_at"))
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            if qty <= 0 or price <= 0 or fee < 0 or not when:
+                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            if fill.get("side") == "BUY":
+                lots.append([qty, price + (fee / qty)])
+                continue
+            if fill.get("side") != "SELL":
+                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            remaining = qty; pnl = -fee
+            while remaining > 0 and lots:
+                lot_qty, lot_price = lots[0]
+                used = min(remaining, lot_qty)
+                pnl += used * (price - lot_price)
+                remaining -= used; lot_qty -= used
+                if lot_qty == 0: lots.pop(0)
+                else: lots[0][0] = lot_qty
+            if remaining > 0:
+                return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            if when.date() == day and pnl < 0: daily_loss += -pnl
+            if when.date() >= week and pnl < 0: weekly_loss += -pnl
+        return True, daily_loss, weekly_loss, None
 
     def verify_live_trade_permission(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
         """Explicitly attest Spot trade permission with one order-test call."""
@@ -2848,6 +3134,77 @@ class SpotGuard:
             result["proof"] = {"result": proof["result"], "verified_at": proof["verified_at"], "expires_at": proof["expires_at"]}
         return result
 
+    def discover_live_trade_history_tool(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Discover, but never invoke, the authenticated Spot fill-history capability."""
+        if not operator_confirmed:
+            raise SecurityError("trade-history discovery requires explicit operator confirmation")
+        candidates = self.live_executor.discover_spot_trade_history_tools()
+        return {"candidates": candidates, "verified": len(candidates) == 1,
+                "reason": (None if len(candidates) == 1 else "ambiguous_or_missing")}
+
+    def verify_live_decimal_transport(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Explicitly attest fractional decimal transport with one orderTest call."""
+        if not operator_confirmed:
+            raise SecurityError("decimal transport attestation requires explicit operator confirmation")
+        symbols = tuple(self.settings.live.allowed_symbols)
+        if not symbols:
+            raise SecurityError("no LIVE Spot symbol is allowlisted")
+        symbol = "BTCUSDT" if "BTCUSDT" in symbols else symbols[0]
+        exchange = validate_spot_symbol(self.settings, symbol, live=True)
+        market = fetch_spot_snapshot(self.settings, symbol)
+        result = self.live_executor.attest_decimal_transport(symbol, exchange, market)
+        payload = result.get("payload")
+        tested_quantity = Decimal(str(payload.get("quantity"))) if isinstance(payload, Mapping) and payload.get("quantity") is not None else Decimal("0")
+        tested_price = Decimal(str(payload.get("price"))) if isinstance(payload, Mapping) and payload.get("price") is not None else Decimal("0")
+        if (result.get("classification") == "SUCCESS" and tested_quantity >= self.live_executor._REMOTE_DECIMAL_FLOOR
+                and tested_quantity != tested_quantity.to_integral_value()
+                and tested_price > 0 and tested_price != tested_price.to_integral_value()):
+            verified_at = utcnow()
+            proof = {"result": "verified", "verified_at": isoformat(verified_at),
+                     "expires_at": isoformat(verified_at + timedelta(seconds=self.live_executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                     "backend": self.settings.codex.mcp_server,
+                     "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
+                     "delegated_operation": "spot.orderTest",
+                     "schema_fingerprint": result["schema_fingerprint"],
+                     "symbol": symbol, "tested_fields": ["quantity", "price"],
+                     "wire_mode": "fixed-point-json-number",
+                     "minimum_verified_fractional_number": format(tested_quantity, "f"),
+                     "classification": "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG",
+                     "scope": "bounded_decimal_domain"}
+            self.ledger.add_event("live.decimal_transport_attestation", None, proof)
+            result["proof"] = {"result": proof["result"], "verified_at": proof["verified_at"],
+                               "expires_at": proof["expires_at"]}
+        return result
+
+    def diagnose_live_decimal_transport(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Run one explicit diagnostic orderTest without persisting readiness proof."""
+        if not operator_confirmed:
+            raise SecurityError("decimal transport diagnostic requires explicit operator confirmation")
+        symbols = tuple(self.settings.live.allowed_symbols)
+        if not symbols:
+            raise SecurityError("no LIVE Spot symbol is allowlisted")
+        symbol = "BTCUSDT" if "BTCUSDT" in symbols else symbols[0]
+        exchange = validate_spot_symbol(self.settings, symbol, live=True)
+        market = fetch_spot_snapshot(self.settings, symbol)
+        result = self.live_executor.diagnose_decimal_transport(symbol, exchange, market)
+        if result.get("classification") == "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG":
+            verified_at = utcnow()
+            proof = {"result": "verified", "verified_at": isoformat(verified_at),
+                     "expires_at": isoformat(verified_at + timedelta(seconds=self.live_executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                     "backend": self.settings.codex.mcp_server,
+                     "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
+                     "delegated_operation": "spot.orderTest",
+                     "schema_fingerprint": result["schema_fingerprint"],
+                     "symbol": symbol, "tested_fields": ["quantity", "price"],
+                     "wire_mode": "fixed-point-json-number",
+                     "minimum_verified_fractional_number": result["requested_quantity"],
+                     "classification": "REMOTE_MCP_SMALL_DECIMAL_SERIALIZATION_BUG",
+                     "scope": "bounded_decimal_domain"}
+            self.ledger.add_event("live.decimal_transport_attestation", None, proof)
+            result["proof"] = {"result": proof["result"], "verified_at": proof["verified_at"],
+                               "expires_at": proof["expires_at"]}
+        return result
+
     def arm_live(self, minutes: int) -> dict[str, Any]:
         if not self.settings.live.enabled:
             raise SecurityError("enable live locally before arming")
@@ -2855,17 +3212,56 @@ class SpotGuard:
             raise SecurityError(
                 f"arm duration must be between 1 and {self.settings.risk.max_live_arm_minutes} minutes"
             )
-        # Arming does not submit an order. Pair-level OTO/OPO/OCO support is
-        # checked when a proposal is created and again at approval, so an
-        # unrelated scanner symbol cannot prevent the session from being armed.
-        readiness = self.live_status(check_symbols=False)
-        blockers = [item for item in readiness["blockers"]
-                    if item not in {"live_armed", "symbol_exchange_flags_verified"}]
-        if blockers:
-            raise SecurityError("live cannot be armed; readiness blockers: " + ", ".join(blockers))
+        ticket = self.ledger.latest_event("live.session_prepared")
+        error = self._validate_prepared_live_session(ticket)
+        if error:
+            raise SecurityError(error)
         result = self.live_arm.arm(minutes).__dict__
+        self.ledger.add_event("live.session_prepared_consumed", None,
+                              {"prepared_at": ticket["prepared_at"], "consumed_at": isoformat()})
         self.ledger.add_event("admin.live_armed", None, {"minutes": minutes, "local_tty": True})
         return result
+
+    def _validate_prepared_live_session(self, ticket: Mapping[str, Any] | None) -> str | None:
+        """Validate only local, fresh preflight evidence; never refresh MCP."""
+        if not isinstance(ticket, Mapping) or ticket.get("result") != "prepared":
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        try:
+            if parse_time(ticket.get("expires_at")) <= utcnow():
+                return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        except (TypeError, ValueError):
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        if ticket.get("backend") != self.settings.codex.mcp_server or ticket.get("profile_fingerprint") != self.live_executor.execution_profile_fingerprint():
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        if ticket.get("target_symbol") not in self.settings.live.allowed_symbols:
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        required = ("account_read_verified", "open_orders_read_verified", "spot_trade_scope_verified",
+                    "write_tool_discovered", "write_schema_verified", "decimal_transport_verified",
+                    "protective_order_capability_verified", "symbol_exchange_flags_verified",
+                    "live_limits_valid", "live_enabled")
+        if any(ticket.get(name) is not True for name in required) or ticket.get("final_blockers") != ["live_armed"]:
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        if ticket.get("rate_limit_status") != "CLEAR" or self.live_executor.rate_limit_status()["status"] != "CLEAR":
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        schema_fp = ticket.get("schema_fingerprint")
+        permission = self.ledger.latest_event("live.trade_permission_attestation")
+        decimal = self.ledger.latest_event("live.decimal_transport_attestation")
+        if not self.live_executor._valid_permission_attestation(permission, schema_fp):
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        if not self.live_executor._valid_decimal_transport_attestation(decimal, schema_fp):
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        consumed = self.ledger.latest_event("live.session_prepared_consumed")
+        invalidated = self.ledger.latest_event("live.session_prepared_invalidated")
+        if any(isinstance(event, Mapping) and event.get("prepared_at") == ticket.get("prepared_at")
+               for event in (consumed, invalidated)):
+            return "live session preparation is missing, expired, or no longer valid; run prepare-live-session again"
+        return None
+
+    def invalidate_prepared_live_session(self, reason: str) -> None:
+        ticket = self.ledger.latest_event("live.session_prepared")
+        if isinstance(ticket, Mapping) and isinstance(ticket.get("prepared_at"), str):
+            self.ledger.add_event("live.session_prepared_invalidated", None,
+                                  {"prepared_at": ticket["prepared_at"], "reason": reason})
 
     def policy_explain(
         self, *, mode: str | None = None, symbol: str | None = None,

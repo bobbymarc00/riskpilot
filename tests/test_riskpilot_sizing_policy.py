@@ -469,6 +469,14 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = load_settings(sizing_config(Path(directory), live_enabled=True))
             service = SpotGuard(settings)
+            service.ledger.add_event(
+                "live.risk_epoch", None,
+                {
+                    "epoch_id": "le-sizing-test",
+                    "status": "active",
+                    "profile_fingerprint": service.live_executor.execution_profile_fingerprint(),
+                },
+            )
             service.live_executor.read_spot_account = Mock(return_value={"balances": [
                 {"asset": "USDT", "free": "900", "locked": "0"},
                 {"asset": "BTC", "free": "1", "locked": "0"},
