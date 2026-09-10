@@ -2710,14 +2710,15 @@ class SpotGuard:
                 "reason": None if ok else (reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"),
                 "proposal_id": proposal["id"], "delegated_order_id": fill["delegated_order_id"]}
 
-    def finalize_live_risk_epoch(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+    def finalize_live_risk_epoch(self, *, operator_confirmed: bool = False,
+                                 empty_only: bool = False) -> dict[str, Any]:
         """Close an incomplete flat epoch without deleting or resetting history."""
         if not operator_confirmed:
             raise SecurityError("LIVE risk-epoch finalization requires explicit operator confirmation")
         epoch = self._effective_live_risk_epoch()
-        if not isinstance(epoch, Mapping) or epoch.get("status") not in {"ACTIVE", "active", "RECONCILE", "CLOSED_INCOMPLETE", "CLOSED"}:
+        if not isinstance(epoch, Mapping) or epoch.get("status") not in {"ACTIVE", "active", "RECONCILE", "CLOSED_INCOMPLETE", "CLOSED", "ABORTED_EMPTY"}:
             raise SecurityError("no incomplete LIVE risk epoch is available for finalization")
-        if epoch.get("status") in {"CLOSED_INCOMPLETE", "CLOSED"}:
+        if epoch.get("status") in {"CLOSED_INCOMPLETE", "CLOSED", "ABORTED_EMPTY"}:
             return {"status": epoch["status"], "epoch_id": epoch.get("epoch_id"), "realized_pnl_verified": False}
         if self.live_executor.rate_limit_status().get("status") == "BLOCKED":
             return {"status": "RATE_LIMIT_BLOCKED", "blocked_until": self.live_executor.rate_limit_status().get("blocked_until"),
@@ -2731,7 +2732,11 @@ class SpotGuard:
                      and self._after_epoch_start(row.get("created_at"), epoch.get("started_at"))]
         symbols = sorted({row["symbol"] for row in proposals})
         if not symbols:
-            raise SecurityError("LIVE epoch has no durable touched-symbol evidence; finalization refused")
+            if not self._is_proven_empty_live_epoch(epoch):
+                raise SecurityError("LIVE epoch has no durable touched-symbol evidence; finalization refused")
+            return self._finalize_empty_live_epoch(epoch)
+        if empty_only:
+            raise SecurityError("LIVE epoch has durable trading activity; use normal finalization")
         account = self.live_executor.read_spot_account()
         open_orders = self.live_executor.read_open_spot_orders()
         if any(row.get("symbol") in symbols for row in open_orders):
@@ -2761,6 +2766,43 @@ class SpotGuard:
         self.ledger.add_event("live.risk_epoch_finalized", None, {"epoch_id": epoch_id, "status": "CLOSED_INCOMPLETE"})
         return {"status": "CLOSED_INCOMPLETE", "epoch_id": epoch_id,
                 "realized_pnl_verified": False}
+
+    def _is_proven_empty_live_epoch(self, epoch: Mapping[str, Any]) -> bool:
+        """Prove no RiskPilot LIVE activity existed, without exchange access."""
+        epoch_id = epoch.get("epoch_id")
+        for fill in self.ledger.events_by_kind("live.risk_fill"):
+            if fill.get("epoch_id") == epoch_id:
+                return False
+        for event_kind in ("live.risk_accounting", "live.session_flat", "execution.started",
+                           "execution.completed", "execution.result"):
+            for event in self.ledger.events_by_kind(event_kind):
+                if event.get("epoch_id") == epoch_id or self._after_epoch_start(
+                        event.get("recorded_at"), epoch.get("started_at")):
+                    return False
+        # Any LIVE proposal created during the epoch is activity, even if it
+        # never reached execution. Unknown timestamps are not proof of empty.
+        for proposal in self.ledger.list_proposals(limit=1000):
+            if proposal.get("mode") != "live":
+                continue
+            created = proposal.get("created_at")
+            if not isinstance(created, str) or not isinstance(epoch.get("started_at"), str):
+                return False
+            if self._after_epoch_start(created, epoch["started_at"]):
+                return False
+        return True
+
+    def _finalize_empty_live_epoch(self, epoch: Mapping[str, Any]) -> dict[str, Any]:
+        finalized = {**dict(epoch), "status": "ABORTED_EMPTY",
+                     "previous_status": epoch.get("status"),
+                     "finalization_reason": "EMPTY_EPOCH_NO_TRADING_ACTIVITY",
+                     "realized_pnl_verified": False, "accounting_complete": False,
+                     "closed_at": isoformat(), "operator_confirmed": True}
+        self.ledger.add_event("live.risk_epoch", None, finalized)
+        self.ledger.add_event("live.risk_epoch_finalized", None, {
+            "epoch_id": epoch.get("epoch_id"), "status": "ABORTED_EMPTY",
+            "reason": "EMPTY_EPOCH_NO_TRADING_ACTIVITY"})
+        return {"status": "ABORTED_EMPTY", "epoch_id": epoch.get("epoch_id"),
+                "realized_pnl_verified": False, "accounting_complete": False}
 
     @staticmethod
     def _after_epoch_start(created_at: Any, started_at: Any) -> bool:

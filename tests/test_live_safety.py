@@ -58,8 +58,31 @@ class LiveSafetyTests(unittest.TestCase):
     if state == "active":
      self.assertEqual(service._ensure_live_risk_epoch([])["epoch_id"],"le-block")
     else:
-     with self.assertRaisesRegex(SecurityError,"requires operator reconciliation"):
-      service._ensure_live_risk_epoch([])
+      with self.assertRaisesRegex(SecurityError,"requires operator reconciliation"):
+       service._ensure_live_risk_epoch([])
+
+ def test_empty_live_epoch_aborts_locally_and_allows_fresh_epoch(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-empty","status":"RECONCILE","profile_fingerprint":profile,"started_at":"2026-01-01T00:00:00Z","reconcile_reason":"legacy validation"})
+   service.live_executor.read_spot_account=Mock(side_effect=AssertionError("empty epoch must not read account"))
+   service.live_executor.read_open_spot_orders=Mock(side_effect=AssertionError("empty epoch must not read orders"))
+   result=service.finalize_live_risk_epoch(operator_confirmed=True,empty_only=True)
+   self.assertEqual(result["status"],"ABORTED_EMPTY")
+   self.assertFalse(result["realized_pnl_verified"])
+   self.assertEqual(service.ledger.events_by_kind("live.risk_fill"),[])
+   fresh=service._ensure_live_risk_epoch([])
+   self.assertNotEqual(fresh["epoch_id"],"le-empty")
+
+ def test_empty_finalization_refuses_activity_evidence(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-active","status":"ACTIVE","profile_fingerprint":profile,"started_at":"2026-01-01T00:00:00Z"})
+   service.ledger.add_event("execution.completed", "proposal-1", {"epoch_id":"le-active","status":"EXECUTED"})
+   with self.assertRaisesRegex(SecurityError,"touched-symbol evidence"):
+    service.finalize_live_risk_epoch(operator_confirmed=True,empty_only=True)
 
  def test_proposal_presentation_uses_canonical_mode_and_order_type(self):
   canonical={"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"SOLUSDT",
