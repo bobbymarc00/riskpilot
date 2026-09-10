@@ -707,9 +707,14 @@ class LiveSafetyTests(unittest.TestCase):
    claim=service.claim(result["proposal"]["id"],token,OWNER,OWNER)
    self.assertEqual(service._validate_live_entry_limits.call_count,2)
    service.live_arm.status=Mock(return_value=Mock(armed=True))
-   service.live_executor.execute=Mock(return_value={"orderListId":42,"listStatusType":"RESPONSE"})
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-execute","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   service.live_executor.execute=Mock(return_value={"orderListId":42,"listStatusType":"RESPONSE","orderReports":[{"orderId":99,"side":"BUY","status":"FILLED","executedQty":"0.058","price":"101.97","fills":[{"commission":"0.00001","commissionAsset":"BTC"}]}]})
    executed=service.execute_live(result["proposal"]["id"],claim["lease"])
    self.assertEqual(executed["status"],"EXECUTED")
+   self.assertEqual(executed["accounting_status"],"VERIFIED")
+   fills=service.ledger.events_by_kind("live.risk_fill")
+   self.assertEqual(len(fills),1); self.assertEqual(fills[0]["delegated_order_id"],99)
+   self.assertEqual(fills[0]["quantity"],"0.058"); self.assertEqual(fills[0]["price"],"101.97")
    self.assertEqual(service._validate_live_entry_limits.call_count,3)
 
  def test_paper_text_approval_cannot_cross_to_live(self):

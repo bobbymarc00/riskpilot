@@ -2541,11 +2541,150 @@ class SpotGuard:
         if not isinstance(order_id, int):
             return self.uncertain_execution(proposal_id, lease, "protected Spot response has no order identifier")
         status = str(response.get("status" if (is_close or is_partial) else "listStatusType", ""))
-        return self.ledger.finish_execution(
+        fill = None
+        if not is_cancel and not is_restore:
+            fill = self._verified_live_fill(proposal, response, order_id)
+            if fill is None:
+                # The exchange write and protection can be successful while
+                # the response lacks enough fill evidence for session PnL.
+                # Keep the execution outcome, but make the accounting state
+                # explicit and fail closed for subsequent entries.
+                result = self.ledger.finish_execution(
+                    proposal_id, lease_hash, "EXECUTED", str(order_id), status,
+                    {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"],
+                     "accounting_status": "RECONCILE", "accounting_reason": "LIVE_FILL_PROVENANCE_INCOMPLETE",
+                     "protected_order_type": "PARTIAL_EXIT_REARM" if is_partial else ("MARKET_CLOSE" if is_close else "OTOCO"),
+                     "binance_response": dict(response)},
+                )
+                result["accounting_status"] = "RECONCILE"
+                result["accounting_reason"] = "LIVE_FILL_PROVENANCE_INCOMPLETE"
+                return result
+        result = self.ledger.finish_execution(
             proposal_id, lease_hash, "EXECUTED", str(order_id), status,
             {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"],
              "protected_order_type": "PARTIAL_EXIT_REARM" if is_partial else ("OCO_RESTORE" if is_restore else ("OCO_CANCEL" if is_cancel else ("MARKET_CLOSE" if is_close else "OTOCO"))), "binance_response": dict(response)},
         )
+        if fill is not None:
+            try:
+                self._persist_live_risk_fill(fill)
+            except Exception as exc:
+                # The Binance write has already completed; never retry it.
+                try:
+                    self.ledger.add_event("live.risk_accounting", proposal_id, {
+                        "status": "RECONCILE", "reason": "LIVE_RISK_FILL_PERSISTENCE_FAILED",
+                    })
+                except Exception:
+                    pass
+                result["accounting_status"] = "RECONCILE"
+                result["accounting_reason"] = "LIVE_RISK_FILL_PERSISTENCE_FAILED"
+                return result
+            accounting_ok, _, _, accounting_reason = self._live_session_accounting()
+            result["accounting_status"] = "VERIFIED" if accounting_ok else "RECONCILE"
+            if not accounting_ok:
+                result["accounting_reason"] = accounting_reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"
+        return result
+
+    def _verified_live_fill(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
+                            list_or_order_id: int) -> dict[str, Any] | None:
+        """Extract only exchange-reported fills; never promote request estimates."""
+        reports = response.get("orderReports")
+        candidates = reports if isinstance(reports, list) else [response]
+        entry = next((row for row in candidates if isinstance(row, Mapping)
+                      and row.get("side") == proposal.get("side") == "BUY"
+                      and str(row.get("status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"}), None)
+        if not isinstance(entry, Mapping):
+            return None
+        try:
+            quantity = Decimal(str(entry["executedQty"]))
+            price = Decimal(str(entry.get("price") or entry.get("avgPrice") or entry["averagePrice"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        if quantity <= 0 or price <= 0 or not quantity.is_finite() or not price.is_finite():
+            return None
+        fees = entry.get("fills")
+        fee_amount = None
+        fee_asset = None
+        fee_quote = None
+        if isinstance(fees, list) and fees:
+            parsed_fees = []
+            for fee in fees:
+                if not isinstance(fee, Mapping) or fee.get("commission") is None or not isinstance(fee.get("commissionAsset"), str):
+                    return None
+                try:
+                    amount = Decimal(str(fee["commission"]))
+                except (TypeError, ValueError, ArithmeticError):
+                    return None
+                if amount < 0 or not amount.is_finite():
+                    return None
+                parsed_fees.append((amount, fee["commissionAsset"]))
+            if len({asset for _, asset in parsed_fees}) != 1:
+                return None
+            fee_amount = sum((amount for amount, _ in parsed_fees), Decimal("0"))
+            fee_asset = parsed_fees[0][1]
+            if fee_asset == self.settings.risk.quote_asset:
+                fee_quote = fee_amount
+            elif fee_asset == proposal["symbol"][:-len(self.settings.risk.quote_asset)]:
+                fee_quote = fee_amount * price
+        elif entry.get("commission") is not None and isinstance(entry.get("commissionAsset"), str):
+            try:
+                fee_amount = Decimal(str(entry["commission"]))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+            fee_asset = entry["commissionAsset"]
+            if fee_amount < 0 or not fee_amount.is_finite():
+                return None
+            if fee_asset == self.settings.risk.quote_asset:
+                fee_quote = fee_amount
+            elif fee_asset == proposal["symbol"][:-len(self.settings.risk.quote_asset)]:
+                fee_quote = fee_amount * price
+        order_id = entry.get("orderId")
+        if not isinstance(order_id, int) or order_id <= 0:
+            order_id = list_or_order_id
+        return {"epoch_id": (self.ledger.latest_event("live.risk_epoch") or {}).get("epoch_id"),
+                "proposal_id": proposal["id"], "delegated_order_id": order_id,
+                "symbol": proposal["symbol"], "side": proposal["side"],
+                "quantity": format(quantity, "f"), "price": format(price, "f"),
+                "quote_value": format(quantity * price, "f"),
+                "fee_amount": format(fee_amount, "f") if fee_amount is not None else None,
+                "fee_asset": fee_asset, "fee_quote": format(fee_quote, "f") if fee_quote is not None else None,
+                "executed_at": isoformat(), "source": "riskpilot_live_execution",
+                "order_list_id": response.get("orderListId")}
+
+    def _persist_live_risk_fill(self, fill: Mapping[str, Any]) -> None:
+        key = (fill.get("epoch_id"), fill.get("proposal_id"),
+               fill.get("delegated_order_id"), fill.get("side"))
+        for existing in self.ledger.events_by_kind("live.risk_fill"):
+            if (existing.get("epoch_id"), existing.get("proposal_id"),
+                    existing.get("delegated_order_id", existing.get("order_id")), existing.get("side")) == key:
+                return
+        self.ledger.add_event("live.risk_fill", str(fill["proposal_id"]), dict(fill))
+
+    def reconcile_live_risk_fill(self, proposal_id: str, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Reconcile one already-recorded LIVE execution using local evidence only."""
+        if not operator_confirmed:
+            raise SecurityError("LIVE risk-fill reconciliation requires explicit operator confirmation")
+        proposal = self.ledger.get_proposal(validate_simple_id(proposal_id, "proposal_id"), include_private=True)
+        if proposal.get("mode") != "live" or proposal.get("status") != "EXECUTED":
+            raise SecurityError("LIVE risk-fill reconciliation requires an EXECUTED LIVE proposal")
+        epoch = self.ledger.latest_event("live.risk_epoch")
+        if not isinstance(epoch, Mapping) or epoch.get("status") != "active":
+            return {"status": "PNL_INCOMPLETE", "reason": "RISKPILOT_SESSION_PNL_INCOMPLETE"}
+        summary = proposal.get("execution_summary") or {}
+        response = summary.get("binance_response")
+        if not isinstance(response, Mapping):
+            return {"status": "PNL_INCOMPLETE", "reason": "LIVE_FILL_PROVENANCE_INCOMPLETE"}
+        try:
+            order_id = int(proposal.get("execution_order_id"))
+        except (TypeError, ValueError):
+            return {"status": "PNL_INCOMPLETE", "reason": "LIVE_FILL_PROVENANCE_INCOMPLETE"}
+        fill = self._verified_live_fill(proposal, response, order_id)
+        if fill is None:
+            return {"status": "PNL_INCOMPLETE", "reason": "LIVE_FILL_PROVENANCE_INCOMPLETE"}
+        self._persist_live_risk_fill(fill)
+        ok, _, _, reason = self._live_session_accounting()
+        return {"status": "VERIFIED" if ok else "PNL_INCOMPLETE",
+                "reason": None if ok else (reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"),
+                "proposal_id": proposal["id"], "delegated_order_id": fill["delegated_order_id"]}
 
     @localized
     def approve_live_button(self, proposal_id: str, sender_id: str, chat_id: str) -> dict[str, Any]:

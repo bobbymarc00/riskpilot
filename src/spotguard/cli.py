@@ -147,6 +147,9 @@ def build_parser() -> argparse.ArgumentParser:
     live_reject.add_argument("proposal_id")
     live_reject.add_argument("--sender-id", required=True)
     live_reject.add_argument("--chat-id", required=True)
+    live_reconcile_fill = subparsers.add_parser("reconcile-live-risk-fill", help="locally reconcile one verified LIVE fill")
+    live_reconcile_fill.add_argument("proposal_id")
+    live_reconcile_fill.add_argument("--owner-id", required=True)
 
     paper_parser = subparsers.add_parser("paper", help="inspect the virtual paper account")
     paper_sub = paper_parser.add_subparsers(dest="paper_command", required=True)
@@ -599,6 +602,9 @@ def _run(args: argparse.Namespace) -> Any:
         return service.approve_live_button(args.proposal_id, args.sender_id, args.chat_id)
     if args.command == "live-reject":
         return service.reject_live_button(args.proposal_id, args.sender_id, args.chat_id)
+    if args.command == "reconcile-live-risk-fill":
+        _require_local_admin(service, args.owner_id, "RECONCILE RISKPILOT LIVE RISK FILL")
+        return service.reconcile_live_risk_fill(args.proposal_id, operator_confirmed=True)
     if args.command == "paper":
         return service.paper_status() if args.paper_command == "positions" else service.paper_balance_status()
     if args.command in {"paper-intent", "trade-intent"}:
