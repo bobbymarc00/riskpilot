@@ -125,7 +125,12 @@ def proposal_message(proposal: dict[str, Any], token: str, confirmation_code: st
         "proposal.mode.manual" if canonical.get("source") == "manual-paper-test" else "proposal.mode.paper")
     text = translate("proposal.body", locale,
         title=translate("proposal.paper_buy.title", locale), mode=translate(mode, locale),
-        symbol=proposal["symbol"], amount=compact_number(proposal["quote_amount"], locale, 4),
+        # New proposals carry these immutable fields in canonical.  The
+        # proposal-level fallback preserves rendering of legacy PAPER records
+        # created before those fields were stored there.
+        order_type=canonical.get("order_type", proposal.get("order_type", "MARKET")),
+        side=canonical.get("side", proposal.get("side", "BUY")), symbol=proposal["symbol"],
+        amount=compact_number(proposal["quote_amount"], locale, 4),
         entry=compact_number(proposal["entry_reference"], locale, 8), stop=compact_number(proposal["stop_reference"], locale, 8),
         target=compact_number(proposal["take_profit_reference"], locale, 8), ratio=compact_number(proposal["reward_risk"], locale, 2),
         identifier=proposal["id"], expiry=proposal["expires_at"])

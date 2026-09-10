@@ -10,6 +10,8 @@ from spotguard.live_execution import LiveExecutionAdapter, MCPTransportError
 from spotguard.market import SpotMarketSnapshot, scaled_synthetic_klines
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
+from spotguard.presentation import render
+from spotguard.telegram import proposal_message
 from spotguard.util import isoformat, utcnow
 from tests.helpers import config_dict
 
@@ -21,6 +23,27 @@ def configured(root: Path, *, enabled=False, scheduled="paper"):
  p=root/"config.json"; p.write_text(json.dumps(d)); return load_settings(p)
 
 class LiveSafetyTests(unittest.TestCase):
+ def test_proposal_presentation_uses_canonical_mode_and_order_type(self):
+  canonical={"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"SOLUSDT",
+             "quote_amount":"6","entry_reference":"102.02000000","stop_reference":"101.35000000",
+             "take_profit_reference":"103.36000000","reward_risk":"2"}
+  proposal={**canonical,"id":"p-live-1","status":"PENDING","expires_at":"2099-01-01T00:00:00Z","canonical":canonical}
+  cli=render({"proposal":proposal},"en","live-buy")
+  self.assertIn("LIVE proposal created",cli)
+  self.assertNotIn("PAPER",cli)
+  self.assertNotIn("simulated fill",cli)
+  text, buttons=proposal_message(proposal,"token")
+  self.assertIn("Spot LIMIT BUY SOLUSDT",text)
+  self.assertNotIn("Spot MARKET BUY",text)
+  self.assertIn("Entry reference: 102.02\nStop reference: 101.35\nTarget reference: 103.36",text)
+  self.assertNotIn("Eny reference",text)
+  self.assertEqual([button["label"] for button in buttons], ["APPROVE LIVE","REJECT LIVE"])
+  self.assertEqual(canonical["order_type"],"LIMIT")
+
+ def test_paper_proposal_presentation_remains_paper(self):
+  proposal={"mode":"paper","id":"p-paper-1"}
+  self.assertIn("PAPER proposal created",render({"proposal":proposal},"en","paper-buy"))
+
  def test_execution_discovery_reuses_wrapper_and_trade_catalog(self):
   with tempfile.TemporaryDirectory() as d:
    adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))

@@ -234,7 +234,9 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
             return t(key)
         return t("approval.paper.success")
     if "proposal" in result:
-        return t("proposal.paper_buy.created", identifier=result["proposal"].get("id", ""))
+        proposal = result["proposal"]
+        key = "proposal.live_buy.created" if proposal.get("mode") == "live" else "proposal.paper_buy.created"
+        return t(key, identifier=proposal.get("id", ""))
     if "positions" in result or "free_usdt" in result or "balance" in result:
         balance = result.get("balance", result)
         text = t("balance.summary", current=n(balance.get("current_ledger_balance_usdt", 0)), free=n(balance.get("free_usdt", 0)), locked=n(balance.get("locked_cost_basis_usdt", balance.get("locked_usdt", 0))), initial=n(balance.get("initial_reset_balance_usdt", 0)), pnl=n(balance.get("realized_pnl_usdt", balance.get("realized_pnl", 0))), fees=n(balance.get("paid_fees_usdt", 0)), positions=balance.get("open_positions", len(result.get("positions", []))), tranches=balance.get("active_tranches", result.get("active_tranche_count", 0)))
