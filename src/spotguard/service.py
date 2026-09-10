@@ -1259,8 +1259,11 @@ class SpotGuard:
                 raise SecurityError("symbol is not enabled for live Spot intent")
             if not self.settings.live.enabled:
                 raise SecurityError("LIVE_NOT_ENABLED: live trading is disabled")
-            if not self.live_arm.status().armed:
+            arm = self.live_arm.status()
+            if not arm.armed:
                 raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
+            if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
+                raise SecurityError("LIVE recovery arm is EXIT_ONLY; new LIVE entries are forbidden")
             if quote_amount <= 0:
                 raise PolicyError("LIVE quote amount must be positive")
             ceiling = absolute_entry_ceiling(self.settings, "live")
@@ -1410,6 +1413,8 @@ class SpotGuard:
         """
         canonical = values["canonical"]
         symbol = str(canonical["symbol"])
+        if getattr(self.live_arm.status(), "scope", "FULL") == "EXIT_ONLY":
+            raise SecurityError("LIVE recovery arm is EXIT_ONLY; new LIVE entries are forbidden")
         if symbol not in self.settings.live.allowed_symbols:
             raise SecurityError("symbol is not enabled for live Spot intent")
         ceiling = absolute_entry_ceiling(self.settings, "live")
@@ -1788,9 +1793,10 @@ class SpotGuard:
             raise SecurityError("symbol is not enabled for live Spot intent")
         if not self.settings.live.enabled or not self.live_arm.status().armed:
             raise SecurityError("live trading is disabled or not armed on the VPS")
-        readiness = self.live_status(check_symbols=True, symbols=[symbol])
-        if not readiness["execution_ready"]:
-            raise SecurityError("live execution readiness checks have not all passed")
+        if getattr(self.live_arm.status(), "scope", "FULL") != "EXIT_ONLY":
+            readiness = self.live_status(check_symbols=True, symbols=[symbol])
+            if not readiness["execution_ready"]:
+                raise SecurityError("live execution readiness checks have not all passed")
 
         grouped: dict[int, list[dict[str, Any]]] = {}
         for order in self.live_executor.read_open_spot_orders():
@@ -1859,8 +1865,9 @@ class SpotGuard:
         raw = symbol.upper(); symbol = raw if raw.endswith(self.settings.risk.quote_asset) else raw + self.settings.risk.quote_asset
         if symbol not in self.settings.live.allowed_symbols or not self.settings.live.enabled or not self.live_arm.status().armed:
             raise SecurityError("live protection restore is disabled or not armed")
-        if not self.live_status(check_symbols=True, symbols=[symbol])["execution_ready"]:
-            raise SecurityError("live execution readiness checks have not all passed")
+        if getattr(self.live_arm.status(), "scope", "FULL") != "EXIT_ONLY":
+            if not self.live_status(check_symbols=True, symbols=[symbol])["execution_ready"]:
+                raise SecurityError("live execution readiness checks have not all passed")
         if any(row.get("symbol") == symbol and isinstance(row.get("orderListId"), int) and row["orderListId"] > 0 for row in self.live_executor.read_open_spot_orders()):
             raise PolicyError("active Spot OCO protection already exists; restore was not created")
         prior = next((row["canonical"] for row in self.ledger.list_proposals(100)
@@ -1891,9 +1898,10 @@ class SpotGuard:
         symbol = raw_symbol if raw_symbol.endswith(self.settings.risk.quote_asset) else raw_symbol + self.settings.risk.quote_asset
         if symbol not in self.settings.live.allowed_symbols or not self.settings.live.enabled or not self.live_arm.status().armed:
             raise SecurityError("live cancel protection is disabled or not armed")
-        readiness = self.live_status(check_symbols=True, symbols=[symbol])
-        if not readiness["execution_ready"]:
-            raise SecurityError("live execution readiness checks have not all passed")
+        if getattr(self.live_arm.status(), "scope", "FULL") != "EXIT_ONLY":
+            readiness = self.live_status(check_symbols=True, symbols=[symbol])
+            if not readiness["execution_ready"]:
+                raise SecurityError("live execution readiness checks have not all passed")
         grouped: dict[int, list[dict[str, Any]]] = {}
         for order in self.live_executor.read_open_spot_orders():
             if order.get("symbol") == symbol and isinstance(order.get("orderListId"), int) and order["orderListId"] > 0:
@@ -1947,9 +1955,10 @@ class SpotGuard:
         if any(row.get("symbol") == symbol and isinstance(row.get("orderListId"), int) and row["orderListId"] > 0
                for row in self.live_executor.read_open_spot_orders()):
             return self.create_live_partial_exit_proposal(symbol, Decimal("100"), notify=notify, dry_run=dry_run)
-        readiness = self.live_status(check_symbols=True, symbols=[symbol])
-        if not readiness["execution_ready"]:
-            raise SecurityError("live execution readiness checks have not all passed")
+        if getattr(self.live_arm.status(), "scope", "FULL") != "EXIT_ONLY":
+            readiness = self.live_status(check_symbols=True, symbols=[symbol])
+            if not readiness["execution_ready"]:
+                raise SecurityError("live execution readiness checks have not all passed")
         exchange = validate_spot_symbol(self.settings, symbol)
         market = fetch_spot_snapshot(self.settings, symbol)
         quote_asset = self.settings.risk.quote_asset
@@ -2507,11 +2516,16 @@ class SpotGuard:
         if not self.settings.live.enabled:
             self.ledger.fail_execution(proposal_id, lease_hash, "live execution is disabled locally")
             raise SecurityError("LIVE_NOT_ENABLED: live executor is disabled locally")
-        if not self.live_arm.status().armed:
+        arm = self.live_arm.status()
+        if not arm.armed:
             self.ledger.fail_execution(proposal_id, lease_hash, "live arm expired before executor invocation")
             raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
+        if (getattr(arm, "scope", "FULL") == "EXIT_ONLY"
+                and self._is_live_buy_entry(proposal["canonical"] or {})):
+            self.ledger.fail_execution(proposal_id, lease_hash, "EXIT_ONLY recovery scope forbids LIVE BUY")
+            raise SecurityError("EXIT_ONLY recovery scope forbids LIVE BUY")
         try:
             self._revalidate_live_buy_entry(proposal)
         except Exception as exc:
@@ -3633,6 +3647,75 @@ class SpotGuard:
         self.ledger.add_event("live.session_prepared_consumed", None,
                               {"prepared_at": ticket["prepared_at"], "consumed_at": isoformat()})
         self.ledger.add_event("admin.live_armed", None, {"minutes": minutes, "local_tty": True})
+        return result
+
+    def prepare_live_recovery_session(self, symbol: str, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Prepare a short-lived, read-only-verified EXIT_ONLY authorization."""
+        if not operator_confirmed:
+            raise SecurityError("LIVE recovery preparation requires explicit operator confirmation")
+        symbol = symbol.upper()
+        if symbol not in self.settings.live.allowed_symbols:
+            raise SecurityError("LIVE recovery symbol is not allowlisted")
+        if self.live_executor.rate_limit_status().get("status") == "BLOCKED":
+            return {"status": "RATE_LIMIT_BLOCKED", "scope": "EXIT_ONLY", "execution_ready": False}
+        epoch = self._effective_live_risk_epoch()
+        if not isinstance(epoch, Mapping) or str(epoch.get("status", "")).upper() != "RECONCILE":
+            raise SecurityError("LIVE recovery requires a RECONCILE risk epoch")
+        exchange = validate_spot_symbol(self.settings, symbol, live=True)
+        account = self.live_executor.read_spot_account()
+        orders = self.live_executor.read_open_spot_orders()
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for order in orders:
+            if order.get("symbol") == symbol and isinstance(order.get("orderListId"), int) and order["orderListId"] > 0:
+                grouped.setdefault(order["orderListId"], []).append(order)
+        protected = False
+        if len(grouped) == 1:
+            self.live_executor.validate_active_protective_oco(next(iter(grouped.values())), symbol,
+                                                               tick=Decimal(exchange["price_tick_size"]))
+            protected = True
+        if not protected:
+            raise SecurityError("LIVE recovery requires an auditable active Spot protection list")
+        prepared_at = utcnow()
+        ticket = {"result": "prepared", "prepared_at": isoformat(prepared_at),
+                  "expires_at": isoformat(prepared_at + timedelta(minutes=5)),
+                  "scope": "EXIT_ONLY", "target_symbol": symbol,
+                  "allowed_actions": ["LIVE_CLOSE_ALL", "LIVE_EXIT_PERCENT", "PROTECTION_RECONCILE"],
+                  "forbidden_actions": ["LIVE_BUY", "NEW_ENTRY", "INCREASE_EXPOSURE"],
+                  "backend": self.settings.codex.mcp_server,
+                  "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
+                  "epoch_id": epoch.get("epoch_id"), "account_read_verified": bool(account),
+                  "open_orders_read_verified": True, "protective_order_capability_verified": protected,
+                  "symbol_exchange_flags_verified": True, "rate_limit_status": "CLEAR",
+                  "final_blockers": []}
+        self.ledger.add_event("live.recovery_session_prepared", None, ticket)
+        return {"status": "PREPARED", "scope": "EXIT_ONLY", "target_symbol": symbol,
+                "expires_at": ticket["expires_at"], "execution_ready": False}
+
+    def arm_live_recovery(self, minutes: int) -> dict[str, Any]:
+        if not self.settings.live.enabled:
+            raise SecurityError("enable live locally before arming recovery")
+        if not 1 <= minutes <= self.settings.risk.max_live_arm_minutes:
+            raise SecurityError(f"arm duration must be between 1 and {self.settings.risk.max_live_arm_minutes} minutes")
+        ticket = self.ledger.latest_event("live.recovery_session_prepared")
+        try:
+            valid = (isinstance(ticket, Mapping) and ticket.get("result") == "prepared"
+                     and ticket.get("scope") == "EXIT_ONLY"
+                     and parse_time(ticket.get("expires_at")) > utcnow()
+                     and ticket.get("backend") == self.settings.codex.mcp_server
+                     and ticket.get("profile_fingerprint") == self.live_executor.execution_profile_fingerprint()
+                     and ticket.get("account_read_verified") is True
+                     and ticket.get("open_orders_read_verified") is True
+                     and ticket.get("protective_order_capability_verified") is True
+                     and ticket.get("symbol_exchange_flags_verified") is True
+                     and ticket.get("rate_limit_status") == "CLEAR"
+                     and self.live_executor.rate_limit_status().get("status") == "CLEAR")
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise SecurityError("LIVE recovery preparation is missing, expired, or no longer valid; prepare-live-recovery-session again")
+        result = self.live_arm.arm(minutes, scope="EXIT_ONLY").__dict__
+        self.ledger.add_event("live.recovery_session_prepared_consumed", None,
+                              {"prepared_at": ticket["prepared_at"], "consumed_at": isoformat()})
         return result
 
     def _validate_prepared_live_session(self, ticket: Mapping[str, Any] | None) -> str | None:

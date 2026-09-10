@@ -294,6 +294,12 @@ def build_parser() -> argparse.ArgumentParser:
     live_arm = live_sub.add_parser("arm")
     live_arm.add_argument("--minutes", type=int, default=60)
     live_arm.add_argument("--owner-id", required=True)
+    live_recovery_prepare = live_sub.add_parser("prepare-recovery")
+    live_recovery_prepare.add_argument("--symbol", required=True)
+    live_recovery_prepare.add_argument("--owner-id", required=True)
+    live_recovery_arm = live_sub.add_parser("arm-recovery")
+    live_recovery_arm.add_argument("--minutes", type=int, default=15)
+    live_recovery_arm.add_argument("--owner-id", required=True)
     live_disarm = live_sub.add_parser("disarm")
     live_disarm.add_argument("--owner-id", required=True)
     live_enable = live_sub.add_parser("enable")
@@ -780,6 +786,12 @@ def _run(args: argparse.Namespace) -> Any:
             if input().strip() != "ARM SPOT LIVE":
                 raise SecurityError("live arm phrase did not match")
             return service.arm_live(args.minutes)
+        if args.live_command == "prepare-recovery":
+            _require_local_admin(service, args.owner_id, "PREPARE RISKPILOT LIVE RECOVERY SESSION")
+            return service.prepare_live_recovery_session(args.symbol, operator_confirmed=True)
+        if args.live_command == "arm-recovery":
+            _require_local_admin(service, args.owner_id, "ARM RISKPILOT LIVE RECOVERY")
+            return service.arm_live_recovery(args.minutes)
     if args.command == "scheduled-mode":
         phrase = f"SET SCHEDULED PROPOSAL MODE {args.mode.upper()}"
         return _local_admin_update(service, args.owner_id, phrase, {"scheduled_proposal_mode": args.mode})

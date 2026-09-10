@@ -150,6 +150,31 @@ class LiveSafetyTests(unittest.TestCase):
     service.arm_live(30)
    service.live_executor._direct_mcp_jsonrpc.assert_not_called()
 
+ def test_reconcile_recovery_ticket_is_exit_only_and_local_arm_is_scoped(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-reconcile","status":"RECONCILE","profile_fingerprint":profile})
+   legs=[{"symbol":"BTCUSDT","orderListId":10,"orderId":11,"side":"SELL","status":"NEW","type":"STOP_LOSS_LIMIT","origQty":"0.5","stopPrice":"99"},
+         {"symbol":"BTCUSDT","orderListId":10,"orderId":12,"side":"SELL","status":"NEW","type":"TAKE_PROFIT_LIMIT","origQty":"0.5","stopPrice":"105"}]
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"SOL","free":"0","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=legs)
+   with patch("spotguard.service.validate_spot_symbol",return_value={"price_tick_size":"0.01"}):
+    prepared=service.prepare_live_recovery_session("BTCUSDT",operator_confirmed=True)
+   self.assertEqual(prepared["scope"],"EXIT_ONLY")
+   service.live_arm.arm=Mock(return_value=SimpleNamespace(armed=True,expires_at="2099-01-01T00:15:00+00:00",reason="armed",scope="EXIT_ONLY"))
+   armed=service.arm_live_recovery(15)
+   self.assertEqual(armed["scope"],"EXIT_ONLY")
+   self.assertEqual(service.live_executor.read_spot_account.call_count,1)
+   self.assertEqual(service.live_executor.read_open_spot_orders.call_count,1)
+
+ def test_exit_only_scope_rejects_live_buy_before_transport(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.live_arm.status=Mock(return_value=SimpleNamespace(armed=True,scope="EXIT_ONLY"))
+   with self.assertRaisesRegex(SecurityError,"EXIT_ONLY"):
+    service.create_manual_buy_proposal("BTCUSDT",Decimal("6"),live=True)
+
  def test_live_status_readiness_uses_backend_proofs_fail_closed(self):
   symbol_info={"symbol":"BTCUSDT","oto_allowed":True,"opo_allowed":True,"oco_allowed":True,
                "price_tick_size":"0.01","percent_price_filter":True,"max_num_orders":5,

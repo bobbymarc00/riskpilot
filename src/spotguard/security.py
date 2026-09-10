@@ -87,6 +87,7 @@ class ArmStatus:
     armed: bool
     expires_at: str | None
     reason: str
+    scope: str = "FULL"
 
 
 class LiveArm:
@@ -94,16 +95,19 @@ class LiveArm:
         self.path = state_dir / "live-arm.json"
         self.signer = signer
 
-    def arm(self, minutes: int) -> ArmStatus:
+    def arm(self, minutes: int, scope: str = "FULL") -> ArmStatus:
+        if scope not in {"FULL", "EXIT_ONLY"}:
+            raise SecurityError("invalid LIVE arm scope")
         body = {
             "schema": "spotguard.live-arm.v1",
             "created_at": isoformat(),
             "expires_at": isoformat(utcnow() + timedelta(minutes=minutes)),
             "nonce": _urlsafe(secrets.token_bytes(12)),
+            "scope": scope,
         }
         document = {"body": body, "signature": self.signer.sign_object(body)}
         atomic_write_text(self.path, json.dumps(document, sort_keys=True, indent=2) + "\n", mode=0o600)
-        return ArmStatus(True, body["expires_at"], "live execution is armed")
+        return ArmStatus(True, body["expires_at"], "live execution is armed", scope)
 
     def disarm(self) -> ArmStatus:
         try:
@@ -128,6 +132,9 @@ class LiveArm:
             expiry = str(body["expires_at"])
             if parse_time(expiry) <= utcnow():
                 return ArmStatus(False, expiry, "live arm has expired")
-            return ArmStatus(True, expiry, "live execution is armed")
+            scope = body.get("scope", "FULL")
+            if scope not in {"FULL", "EXIT_ONLY"}:
+                return ArmStatus(False, None, "live arm scope is invalid")
+            return ArmStatus(True, expiry, "live execution is armed", scope)
         except (KeyError, ValueError, json.JSONDecodeError):
             return ArmStatus(False, None, "live arm file is invalid")
