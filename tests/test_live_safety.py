@@ -769,14 +769,46 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertEqual(service._validate_live_entry_limits.call_count,2)
    service.live_arm.status=Mock(return_value=Mock(armed=True))
    service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-execute","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
-   service.live_executor.execute=Mock(return_value={"orderListId":42,"listStatusType":"RESPONSE","orderReports":[{"orderId":99,"side":"BUY","status":"FILLED","executedQty":"0.058","price":"101.97","fills":[{"commission":"0.00001","commissionAsset":"BTC"}]}]})
+   service.live_executor.execute=Mock(return_value={"orderListId":42,"listStatusType":"RESPONSE","orderReports":[{"orderId":99,"side":"BUY","status":"FILLED","executedQty":"0.058","price":"101.97","fills":[{"price":"101.97","qty":"0.058","commission":"0.00001","commissionAsset":"BTC"}]}]})
    executed=service.execute_live(result["proposal"]["id"],claim["lease"])
    self.assertEqual(executed["status"],"EXECUTED")
    self.assertEqual(executed["accounting_status"],"VERIFIED")
    fills=service.ledger.events_by_kind("live.risk_fill")
    self.assertEqual(len(fills),1); self.assertEqual(fills[0]["delegated_order_id"],99)
    self.assertEqual(fills[0]["quantity"],"0.058"); self.assertEqual(fills[0]["price"],"101.97")
+   evidence=service.ledger.events_by_kind("live.execution_evidence")
+   self.assertEqual(len(evidence),1)
+   self.assertEqual(evidence[0]["entry"]["order_id"],99)
+   self.assertEqual(evidence[0]["entry"]["order_list_id"],42)
    self.assertEqual(service._validate_live_entry_limits.call_count,3)
+
+ def test_live_fill_uses_verified_weighted_fills_and_preserves_fee_provenance(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-evidence","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   proposal={"id":"p-evidence0001","symbol":"BTCUSDT","side":"BUY"}
+   response={"orderListId":246,"listStatusType":"RESPONSE","orderReports":[
+    {"orderId":135,"side":"BUY","status":"FILLED","executedQty":"0.003","price":"100","fills":[
+     {"price":"100","qty":"0.001","commission":"0.0001","commissionAsset":"USDT"},
+     {"price":"102","qty":"0.002","commission":"0.0002","commissionAsset":"USDT"}]},
+    {"orderId":136,"side":"SELL","status":"NEW","type":"STOP_LOSS_LIMIT"}]}
+   fill=service._verified_live_fill(proposal,response,246)
+   self.assertEqual(fill["delegated_order_id"],135)
+   self.assertEqual(fill["order_list_id"],246)
+   self.assertEqual(fill["price"],"101.3333333333333333333333333")
+   self.assertEqual(fill["fee_amount"],"0.0003")
+   self.assertEqual(fill["fee_asset"],"USDT")
+   evidence=service._live_execution_evidence(proposal,response,246)
+   service._persist_live_execution_evidence(evidence)
+   self.assertEqual(service.ledger.events_by_kind("live.execution_evidence")[0]["entry"]["order_id"],135)
+
+ def test_limit_price_without_fill_price_or_quote_is_not_accounting_price(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-price","status":"active","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   proposal={"id":"p-price000001","symbol":"BTCUSDT","side":"BUY"}
+   response={"orderListId":247,"orderReports":[{"orderId":136,"side":"BUY","status":"FILLED","executedQty":"0.003","price":"100"}]}
+   self.assertIsNone(service._verified_live_fill(proposal,response,247))
 
  def test_paper_text_approval_cannot_cross_to_live(self):
   with tempfile.TemporaryDirectory() as d:

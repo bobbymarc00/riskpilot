@@ -2552,7 +2552,29 @@ class SpotGuard:
             return self.uncertain_execution(proposal_id, lease, "protected Spot response has no order identifier")
         status = str(response.get("status" if (is_close or is_partial) else "listStatusType", ""))
         fill = None
+        evidence = None
         if not is_cancel and not is_restore:
+            evidence = self._live_execution_evidence(proposal, response, order_id)
+            if evidence is not None:
+                try:
+                    self._persist_live_execution_evidence(evidence)
+                except Exception:
+                    # The exchange write completed, but its local evidence
+                    # could not be durably recorded.  Never retry the write.
+                    result = self.ledger.finish_execution(
+                        proposal_id, lease_hash, "RECONCILE", str(order_id), status,
+                        {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"],
+                         "accounting_status": "RECONCILE",
+                         "accounting_reason": "LIVE_EXECUTION_EVIDENCE_PERSISTENCE_FAILED"},
+                    )
+                    result["accounting_status"] = "RECONCILE"
+                    result["accounting_reason"] = "LIVE_EXECUTION_EVIDENCE_PERSISTENCE_FAILED"
+                    return result
+                if isinstance(evidence.get("entry"), Mapping) and isinstance(evidence["entry"].get("order_id"), int):
+                    # Protected responses identify the list and the actual
+                    # entry order separately.  Keep execution provenance on
+                    # the entry order, never on the order-list id.
+                    order_id = evidence["entry"]["order_id"]
             fill = self._verified_live_fill(proposal, response, order_id)
             if fill is None:
                 # The exchange write and protection can be successful while
@@ -2602,9 +2624,9 @@ class SpotGuard:
                     })
         return result
 
-    def _verified_live_fill(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
-                            list_or_order_id: int) -> dict[str, Any] | None:
-        """Extract only exchange-reported fills; never promote request estimates."""
+    def _live_execution_evidence(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
+                                 list_or_order_id: int) -> dict[str, Any] | None:
+        """Keep a bounded, exchange-derived execution record before reduction."""
         fill_response = response
         partial = response.get("partial_exit")
         if isinstance(partial, Mapping) and isinstance(partial.get("sell"), Mapping):
@@ -2614,31 +2636,147 @@ class SpotGuard:
         entry = next((row for row in candidates if isinstance(row, Mapping)
                       and row.get("side") == proposal.get("side")
                       and str(row.get("status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"}), None)
+        if entry is None:
+            # Preserve the actual entry/order-list response even when it did
+            # not contain a verified fill.  Accounting extraction below still
+            # requires a filled status and exchange-derived quantity/price.
+            entry = next((row for row in candidates if isinstance(row, Mapping)
+                          and row.get("side") == proposal.get("side")), None)
         if not isinstance(entry, Mapping):
             return None
+        order_id = entry.get("orderId")
+        if not isinstance(order_id, int) or order_id <= 0:
+            order_id = None
+        entry_evidence: dict[str, Any] = {
+            "order_id": order_id,
+            "order_list_id": response.get("orderListId"),
+            "status": entry.get("status"),
+        }
+        for output, names in {
+            "executed_qty": ("executedQty",),
+            "cumulative_quote_qty": ("cummulativeQuoteQty", "cumulativeQuoteQty"),
+            "limit_price": ("price",),
+            "average_fill_price": ("avgPrice", "averagePrice"),
+        }.items():
+            value = next((entry[name] for name in names if name in entry), None)
+            if value is not None:
+                try:
+                    parsed = Decimal(str(value))
+                    if parsed.is_finite() and parsed >= 0:
+                        entry_evidence[output] = format(parsed, "f")
+                except (TypeError, ValueError, ArithmeticError):
+                    pass
+        fills_evidence = []
+        if isinstance(entry.get("fills"), list):
+            for item in entry["fills"]:
+                if not isinstance(item, Mapping):
+                    continue
+                safe: dict[str, Any] = {}
+                for output, source_key in (("price", "price"), ("qty", "qty"),
+                                           ("commission", "commission"), ("commission_asset", "commissionAsset")):
+                    if item.get(source_key) is not None:
+                        value = item[source_key]
+                        if output == "commission_asset":
+                            if isinstance(value, str):
+                                safe[output] = value
+                        else:
+                            try:
+                                parsed = Decimal(str(value))
+                                if parsed.is_finite() and parsed >= 0:
+                                    safe[output] = format(parsed, "f")
+                            except (TypeError, ValueError, ArithmeticError):
+                                pass
+                if safe:
+                    fills_evidence.append(safe)
+        if fills_evidence:
+            entry_evidence["fills"] = fills_evidence
+        if entry.get("commission") is not None:
+            try:
+                commission = Decimal(str(entry["commission"]))
+                if commission.is_finite() and commission >= 0:
+                    entry_evidence["commission"] = format(commission, "f")
+            except (TypeError, ValueError, ArithmeticError):
+                pass
+        if isinstance(entry.get("commissionAsset"), str):
+            entry_evidence["commission_asset"] = entry["commissionAsset"]
+        protection = []
+        for item in candidates:
+            if not isinstance(item, Mapping) or item is entry:
+                continue
+            if item.get("side") == "SELL":
+                row = {key: item[key] for key in ("orderId", "clientOrderId", "status", "type")
+                       if key in item and (key != "orderId" or isinstance(item[key], int))}
+                if row:
+                    protection.append(row)
+        return {"epoch_id": (self._effective_live_risk_epoch() or {}).get("epoch_id"),
+                "proposal_id": proposal["id"], "symbol": proposal["symbol"],
+                "side": proposal["side"], "entry": entry_evidence,
+                "protection": protection, "executed_at": isoformat(),
+                "source": "riskpilot_live_execution"}
+
+    def _verified_live_fill(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
+                            list_or_order_id: int) -> dict[str, Any] | None:
+        """Extract only exchange-reported fills; never promote request estimates."""
+        evidence = self._live_execution_evidence(proposal, response, list_or_order_id)
+        if evidence is None or not isinstance(evidence.get("entry"), Mapping):
+            return None
+        entry = evidence["entry"]
+        if str(entry.get("status", "")).upper() not in {"FILLED", "PARTIALLY_FILLED"}:
+            return None
+        if not isinstance(entry.get("order_id"), int) or entry["order_id"] <= 0:
+            return None
         try:
-            quantity = Decimal(str(entry["executedQty"]))
-            price = Decimal(str(entry.get("price") or entry.get("avgPrice") or entry["averagePrice"]))
+            quantity = Decimal(str(entry["executed_qty"]))
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return None
+        fills = entry.get("fills")
+        weighted = Decimal("0")
+        filled_qty = Decimal("0")
+        priced_fills = isinstance(fills, list) and fills and all(
+            isinstance(item, Mapping) and item.get("price") is not None and item.get("qty") is not None
+            for item in fills
+        )
+        if priced_fills:
+            try:
+                for item in fills:
+                    fill_price = Decimal(str(item["price"])); fill_qty = Decimal(str(item["qty"]))
+                    if fill_price <= 0 or fill_qty <= 0:
+                        return None
+                    weighted += fill_price * fill_qty
+                    filled_qty += fill_qty
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                return None
+        if filled_qty > 0:
+            price = weighted / filled_qty
+        elif entry.get("average_fill_price") is not None:
+            try:
+                price = Decimal(str(entry["average_fill_price"]))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+        else:
+            try:
+                cumulative = Decimal(str(entry["cumulative_quote_qty"]))
+                price = cumulative / quantity
+            except (KeyError, TypeError, ValueError, ArithmeticError, ZeroDivisionError):
+                return None
         if quantity <= 0 or price <= 0 or not quantity.is_finite() or not price.is_finite():
             return None
-        fees = entry.get("fills")
-        fee_amount = None
-        fee_asset = None
-        fee_quote = None
-        if isinstance(fees, list) and fees:
-            parsed_fees = []
-            for fee in fees:
-                if not isinstance(fee, Mapping) or fee.get("commission") is None or not isinstance(fee.get("commissionAsset"), str):
-                    return None
-                try:
-                    amount = Decimal(str(fee["commission"]))
-                except (TypeError, ValueError, ArithmeticError):
-                    return None
-                if amount < 0 or not amount.is_finite():
-                    return None
-                parsed_fees.append((amount, fee["commissionAsset"]))
+        fees = fills if isinstance(fills, list) and fills else []
+        if not fees and entry.get("commission") is not None:
+            fees = [{"commission": entry.get("commission"), "commission_asset": entry.get("commissionAsset")}]
+        parsed_fees = []
+        for fee in fees:
+            if not isinstance(fee, Mapping) or fee.get("commission") is None or not isinstance(fee.get("commission_asset", fee.get("commissionAsset")), str):
+                return None
+            try:
+                amount = Decimal(str(fee["commission"]))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+            if amount < 0 or not amount.is_finite():
+                return None
+            parsed_fees.append((amount, fee.get("commission_asset", fee.get("commissionAsset"))))
+        fee_amount = fee_quote = fee_asset = None
+        if parsed_fees:
             if len({asset for _, asset in parsed_fees}) != 1:
                 return None
             fee_amount = sum((amount for amount, _ in parsed_fees), Decimal("0"))
@@ -2647,32 +2785,23 @@ class SpotGuard:
                 fee_quote = fee_amount
             elif fee_asset == proposal["symbol"][:-len(self.settings.risk.quote_asset)]:
                 fee_quote = fee_amount * price
-        elif entry.get("commission") is not None and isinstance(entry.get("commissionAsset"), str):
-            try:
-                fee_amount = Decimal(str(entry["commission"]))
-            except (TypeError, ValueError, ArithmeticError):
-                return None
-            fee_asset = entry["commissionAsset"]
-            if fee_amount < 0 or not fee_amount.is_finite():
-                return None
-            if fee_asset == self.settings.risk.quote_asset:
-                fee_quote = fee_amount
-            elif fee_asset == proposal["symbol"][:-len(self.settings.risk.quote_asset)]:
-                fee_quote = fee_amount * price
-        order_id = entry.get("orderId")
-        if reports is not None and (not isinstance(order_id, int) or order_id <= 0):
-            return None
-        if not isinstance(order_id, int) or order_id <= 0:
-            order_id = list_or_order_id
-        return {"epoch_id": (self._effective_live_risk_epoch() or {}).get("epoch_id"),
-                "proposal_id": proposal["id"], "delegated_order_id": order_id,
-                "symbol": proposal["symbol"], "side": proposal["side"],
-                "quantity": format(quantity, "f"), "price": format(price, "f"),
-                "quote_value": format(quantity * price, "f"),
+        quote_value = Decimal(str(entry.get("cumulative_quote_qty", ""))) if entry.get("cumulative_quote_qty") is not None else quantity * price
+        return {"epoch_id": evidence.get("epoch_id"), "proposal_id": proposal["id"], "delegated_order_id": entry.get("order_id", list_or_order_id),
+                "symbol": proposal["symbol"], "side": proposal["side"], "quantity": format(quantity, "f"),
+                "price": format(price, "f"), "quote_value": format(quote_value, "f"),
                 "fee_amount": format(fee_amount, "f") if fee_amount is not None else None,
                 "fee_asset": fee_asset, "fee_quote": format(fee_quote, "f") if fee_quote is not None else None,
-                "executed_at": isoformat(), "source": "riskpilot_live_execution",
-                "order_list_id": response.get("orderListId")}
+                "executed_at": evidence["executed_at"], "source": "riskpilot_live_execution",
+                "order_list_id": evidence["entry"].get("order_list_id")}
+
+    def _persist_live_execution_evidence(self, evidence: Mapping[str, Any]) -> None:
+        key = (evidence.get("epoch_id"), evidence.get("proposal_id"),
+               (evidence.get("entry") or {}).get("order_id"), evidence.get("side"))
+        for existing in self.ledger.events_by_kind("live.execution_evidence"):
+            entry = existing.get("entry") or {}
+            if (existing.get("epoch_id"), existing.get("proposal_id"), entry.get("order_id"), existing.get("side")) == key:
+                return
+        self.ledger.add_event("live.execution_evidence", str(evidence["proposal_id"]), dict(evidence))
 
     def _persist_live_risk_fill(self, fill: Mapping[str, Any]) -> None:
         key = (fill.get("epoch_id"), fill.get("proposal_id"),
@@ -2992,14 +3121,11 @@ class SpotGuard:
             summary,
         )
         if final_status == "EXECUTED":
-            epoch = self._effective_live_risk_epoch()
-            self.ledger.add_event("live.risk_fill", proposal_id, {
-                "epoch_id": epoch.get("epoch_id") if isinstance(epoch, Mapping) else None,
-                "proposal_id": proposal_id, "order_id": order_id,
-                "symbol": proposal["symbol"],
-                "side": proposal["side"], "quantity": filled_quantity,
-                "price": average_price, "fee_quote": fee_quote,
-                "executed_at": isoformat(),
+            # This legacy completion API has no delegated response and cannot
+            # prove actual quantity, fill price, or commission.  Do not turn
+            # caller-supplied estimates into a risk fill.
+            self.ledger.add_event("live.risk_accounting", proposal_id, {
+                "status": "RECONCILE", "reason": "LIVE_FILL_PROVENANCE_INCOMPLETE",
             })
         return result
 
