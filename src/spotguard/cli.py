@@ -150,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
     live_reconcile_fill = subparsers.add_parser("reconcile-live-risk-fill", help="locally reconcile one verified LIVE fill")
     live_reconcile_fill.add_argument("proposal_id")
     live_reconcile_fill.add_argument("--owner-id", required=True)
+    live_reconcile_execution = subparsers.add_parser("reconcile-live-execution", help="read one submitted LIVE execution status")
+    live_reconcile_execution.add_argument("proposal_id")
+    live_reconcile_execution.add_argument("--owner-id", required=True)
     live_finalize_epoch = subparsers.add_parser("finalize-live-risk-epoch", help="finalize a flat incomplete LIVE risk epoch")
     live_finalize_epoch.add_argument("--owner-id", required=True)
     live_finalize_empty = subparsers.add_parser("finalize-empty-live-risk-epoch", help="abort a proven empty LIVE risk epoch")
@@ -615,6 +618,9 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command == "reconcile-live-risk-fill":
         _require_local_admin(service, args.owner_id, "RECONCILE RISKPILOT LIVE RISK FILL")
         return service.reconcile_live_risk_fill(args.proposal_id, operator_confirmed=True)
+    if args.command == "reconcile-live-execution":
+        _require_local_admin(service, args.owner_id, "RECONCILE RISKPILOT LIVE EXECUTION")
+        return service.reconcile_live_execution(args.proposal_id, operator_confirmed=True)
     if args.command == "finalize-live-risk-epoch":
         _require_local_admin(service, args.owner_id, "FINALIZE RISKPILOT INCOMPLETE LIVE RISK EPOCH")
         return service.finalize_live_risk_epoch(operator_confirmed=True)

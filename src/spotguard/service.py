@@ -2724,11 +2724,12 @@ class SpotGuard:
                        if key in item and (key != "orderId" or isinstance(item[key], int))}
                 if row:
                     protection.append(row)
+        phase = "FILLED" if str(entry_evidence.get("status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"} else "SUBMITTED"
         return {"epoch_id": (self._effective_live_risk_epoch() or {}).get("epoch_id"),
                 "proposal_id": proposal["id"], "symbol": proposal["symbol"],
                 "side": proposal["side"], "entry": entry_evidence,
                 "protection": protection, "executed_at": isoformat(),
-                "source": "riskpilot_live_execution"}
+                "source": "riskpilot_live_execution", "phase": phase}
 
     def _verified_live_fill(self, proposal: Mapping[str, Any], response: Mapping[str, Any],
                             list_or_order_id: int) -> dict[str, Any] | None:
@@ -2816,7 +2817,8 @@ class SpotGuard:
         for existing in self.ledger.events_by_kind("live.execution_evidence"):
             entry = existing.get("entry") or {}
             if (existing.get("epoch_id"), existing.get("proposal_id"), entry.get("order_id"), existing.get("side")) == key:
-                return
+                if existing.get("phase") == evidence.get("phase"):
+                    return
         self.ledger.add_event("live.execution_evidence", str(evidence["proposal_id"]), dict(evidence))
 
     def _persist_live_risk_fill(self, fill: Mapping[str, Any]) -> None:
@@ -2854,6 +2856,69 @@ class SpotGuard:
         return {"status": "VERIFIED" if ok else "PNL_INCOMPLETE",
                 "reason": None if ok else (reason or "RISKPILOT_SESSION_PNL_INCOMPLETE"),
                 "proposal_id": proposal["id"], "delegated_order_id": fill["delegated_order_id"]}
+
+    def reconcile_live_execution(self, proposal_id: str, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Reconcile one submitted LIVE order with one bounded read-only query."""
+        if not operator_confirmed:
+            raise SecurityError("LIVE execution reconciliation requires explicit operator confirmation")
+        return self._reconcile_live_execution(proposal_id)
+
+    def _reconcile_live_execution(self, proposal_id: str) -> dict[str, Any]:
+        proposal = self.ledger.get_proposal(validate_simple_id(proposal_id, "proposal_id"), include_private=True)
+        if proposal.get("mode") != "live" or proposal.get("status") != "EXECUTING":
+            raise SecurityError("LIVE execution reconciliation requires an EXECUTING LIVE proposal")
+        evidence = [row for row in self.ledger.events_by_kind("live.execution_evidence")
+                    if row.get("proposal_id") == proposal["id"]]
+        if not evidence:
+            raise SecurityError("LIVE_EXECUTION_EVIDENCE_UNAVAILABLE")
+        submitted = evidence[-1]
+        entry = submitted.get("entry") or {}
+        order_id, order_list_id = entry.get("order_id"), entry.get("order_list_id")
+        if not isinstance(order_id, int) or order_id <= 0 or not isinstance(order_list_id, int) or order_list_id <= 0:
+            raise SecurityError("LIVE_EXECUTION_EVIDENCE_PROVENANCE_INCOMPLETE")
+        response = self.live_executor.read_spot_order_status(proposal["symbol"], order_id, order_list_id)
+        if response.get("orderListId") != order_list_id or response.get("orderId") not in {None, order_id}:
+            raise SecurityError("LIVE execution reconciliation provenance mismatch")
+        reports = response.get("orderReports")
+        if isinstance(reports, list):
+            observed_protection = {row.get("orderId") for row in reports if isinstance(row, Mapping) and row.get("side") == "SELL"}
+            expected_protection = {row.get("order_id") for row in submitted.get("protection", []) if isinstance(row, Mapping)}
+            if observed_protection and expected_protection and observed_protection != expected_protection:
+                raise SecurityError("LIVE execution reconciliation protection provenance mismatch")
+        response.setdefault("orderListId", order_list_id)
+        response.setdefault("orderId", order_id)
+        if not isinstance(response.get("side"), str):
+            response["side"] = proposal.get("side")
+        updated = self._live_execution_evidence(proposal, response, order_id)
+        if updated is None:
+            raise SecurityError("LIVE_EXECUTION_EVIDENCE_PROVENANCE_INCOMPLETE")
+        self._persist_live_execution_evidence(updated)
+        status = str((updated.get("entry") or {}).get("status", response.get("status", ""))).upper()
+        if status in {"NEW", "PENDING_NEW"}:
+            return {"status": "EXECUTING", "fill": "WAITING", "accounting_status": "WAITING_FOR_FILL", "proposal_id": proposal["id"]}
+        if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "NO_FILL", "execution_evidence": updated})
+            return {**result, "accounting_status": "NO_FILL"}
+        if status not in {"FILLED", "PARTIALLY_FILLED"}:
+            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), "UNKNOWN", {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "RECONCILE", "accounting_reason": "AMBIGUOUS_LIVE_ORDER_STATUS", "execution_evidence": updated})
+            return {**result, "accounting_status": "RECONCILE", "accounting_reason": "AMBIGUOUS_LIVE_ORDER_STATUS"}
+        if status == "PARTIALLY_FILLED":
+            return {"status": "EXECUTING", "fill": "PARTIAL", "accounting_status": "WAITING_FOR_FILL", "proposal_id": proposal["id"]}
+        fill = self._verified_live_fill(proposal, response, order_id)
+        result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "EXECUTED", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "execution_evidence": updated})
+        if fill is None:
+            return {**result, "accounting_status": "RECONCILE", "accounting_reason": "LIVE_FILL_PROVENANCE_INCOMPLETE"}
+        self._persist_live_risk_fill(fill)
+        ok, _, _, reason = self._live_session_accounting()
+        return {**result, "accounting_status": "VERIFIED" if ok else "RECONCILE", "accounting_reason": None if ok else (reason or "RISKPILOT_SESSION_PNL_INCOMPLETE")}
+
+    def monitor_live_executions(self) -> dict[str, Any]:
+        """Single-pass monitor hook; no polling loop or automatic retries."""
+        results = []
+        for proposal in self.ledger.active_proposals_status():
+            if proposal.get("mode") == "live" and proposal.get("status") == "EXECUTING":
+                results.append(self._reconcile_live_execution(proposal["id"]))
+        return {"results": results}
 
     def finalize_live_risk_epoch(self, *, operator_confirmed: bool = False,
                                  empty_only: bool = False) -> dict[str, Any]:

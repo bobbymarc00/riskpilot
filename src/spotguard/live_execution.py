@@ -113,6 +113,7 @@ class LiveExecutionAdapter:
         self._request_budget: dict[str, int] | None = None
         self._trade_history_tool_cache: tuple[float, str, Mapping[str, Any]] | None = None
         self._trade_history_result_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+        self._order_query_tool_cache: tuple[float, str, Mapping[str, Any]] | None = None
 
     def begin_request_budget(self) -> None:
         self._request_budget = {"tools_list": 0, "catalog_search": 0,
@@ -509,6 +510,72 @@ class LiveExecutionAdapter:
         _, catalog = self.execution_discovery()
         return [{"toolName": row["name"], "description": row.get("description"),
                  "inputSchema": row.get("inputSchema")} for row in self._trade_history_candidates(catalog)]
+
+    @staticmethod
+    def _spot_order_query_candidates(catalog: Mapping[str, Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        candidates = []
+        for row in catalog.values():
+            if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+                continue
+            name = row["name"].lower()
+            schema = row.get("inputSchema")
+            props = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+            text = " ".join(str(row.get(key, "")) for key in ("name", "description", "title")).lower()
+            if "spot" not in name and "spot" not in text:
+                continue
+            if any(term in text or term in name for term in ("futures", "margin", "aggtrades", "public trades", "open orders", "all orders", "new order", "cancel")):
+                continue
+            if not any(term in text or term in name for term in ("get order", "query order", "order status", "order detail")):
+                continue
+            if not isinstance(schema, Mapping) or schema.get("type") != "object" or not isinstance(props, Mapping):
+                continue
+            if "symbol" not in props or not ({"orderId", "orderListId"} & set(props)):
+                continue
+            if schema.get("additionalProperties") is True:
+                continue
+            candidates.append(row)
+        return candidates
+
+    def resolve_spot_order_query_tool(self) -> tuple[str, Mapping[str, Any]]:
+        now = time.monotonic()
+        if self._order_query_tool_cache and now - self._order_query_tool_cache[0] <= self._CATALOG_CACHE_TTL_SECONDS:
+            return self._order_query_tool_cache[1], self._order_query_tool_cache[2]
+        _, catalog = self.execution_discovery()
+        candidates = self._spot_order_query_candidates(catalog)
+        if len(candidates) != 1:
+            raise SecurityError("LIVE_EXECUTION_READ_CAPABILITY_UNAVAILABLE: no unique Spot order-status tool")
+        row = candidates[0]
+        self._order_query_tool_cache = (now, str(row["name"]), row)
+        return str(row["name"]), row
+
+    def read_spot_order_status(self, symbol: str, order_id: int, order_list_id: int) -> dict[str, Any]:
+        """Read one exact existing Spot order/list; never writes or retries."""
+        if symbol not in self.settings.live.allowed_symbols or not isinstance(order_id, int) or order_id <= 0:
+            raise SecurityError("unapproved LIVE order-status read")
+        tool_name, row = self.resolve_spot_order_query_tool()
+        schema = row.get("inputSchema")
+        props = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+        required = schema.get("required", []) if isinstance(schema, Mapping) else []
+        arguments: dict[str, Any] = {"symbol": symbol}
+        if "orderId" in props:
+            arguments["orderId"] = order_id
+        if "orderListId" in props:
+            arguments["orderListId"] = order_list_id
+        if isinstance(required, list) and any(field not in arguments for field in required):
+            raise SecurityError("LIVE_EXECUTION_READ_CAPABILITY_UNAVAILABLE: order-status schema is incompatible")
+        try:
+            result = self._decode_mcp_result(self._direct_mcp_result({"toolName": tool_name, "arguments": arguments}))
+        except MCPTransportError as exc:
+            if exc.error_code == -32602:
+                raise SecurityError("DELEGATED_READ_TOOL_UNAVAILABLE: Spot order-status tool is unavailable") from exc
+            raise
+        if not isinstance(result, Mapping):
+            raise SecurityError("Spot order-status response is malformed")
+        if result.get("symbol") not in {None, symbol}:
+            raise SecurityError("Spot order-status response symbol mismatch")
+        if result.get("orderId") not in {None, order_id} or result.get("orderListId") not in {None, order_list_id}:
+            raise SecurityError("Spot order-status response provenance mismatch")
+        return dict(result)
 
     @classmethod
     def _validate_tool_execute_schema(cls, row: Mapping[str, Any] | None) -> str | None:
