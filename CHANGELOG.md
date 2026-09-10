@@ -6,15 +6,17 @@
 - Closed every SQLite connection created by the ledger, preserving transactions.
 - Synchronized package/runtime version metadata to 1.0.3.
 
-## 1.0.2 — 2026-09-09
+## 1.0.2 — 2026-09-10
 
-- Integrated Smart Scanner radar state and configured-symbol candidate handoff while preserving the existing execution boundary.
-- Added offline scanner coverage and synchronized scanner safety documentation.
+- Hardened the LIVE Spot execution lifecycle with fail-closed async execution handling.
+- Added execution reconciliation, capability discovery, EXIT_ONLY recovery safeguards, and durable execution evidence.
+- Prevented fabricated fills, fees, and realized PnL when upstream fill provenance is unavailable.
 
 ## 1.0.1 — 2026-09-08
 
-- Added Risk Policy v2 equity-percentage sizing and limits with optional legacy absolute backstops.
-- Added immutable policy snapshots and execution-time conservative equity revalidation.
+- Added Smart Scanner for broader Binance Spot market discovery and ranking.
+- Preserved the configured-symbol execution boundary and human-approved LIVE workflow.
+- Added scanner safety, audit, and offline test coverage.
 
 ## 1.0.0 — 2026-09-04
 
