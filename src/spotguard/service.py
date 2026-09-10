@@ -3689,6 +3689,82 @@ class SpotGuard:
         return {"candidates": candidates, "verified": len(candidates) == 1,
                 "reason": (None if len(candidates) == 1 else "ambiguous_or_missing")}
 
+    def discover_live_execution_read_capabilities(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Discover read capabilities only; never invoke an execution/read tool."""
+        if not operator_confirmed:
+            raise SecurityError("execution read-capability discovery requires explicit operator confirmation")
+        result = self.live_executor.discover_live_execution_read_capabilities(operator_confirmed=True)
+        self.ledger.add_event("live.execution_read_capability_discovery", None, {
+            "individual_order_status_count": result.get("individual_order_status_count", 0),
+            "order_list_status_count": result.get("order_list_status_count", 0),
+            "trade_fill_history_count": result.get("trade_fill_history_count", 0),
+            "individual_order_status": result.get("individual_order_status"),
+            "order_list_status": result.get("order_list_status"),
+            "trade_fill_history": result.get("trade_fill_history"),
+            "tools_list_calls": result.get("tools_list_calls", 0),
+            "catalog_search_calls": result.get("catalog_search_calls", 0),
+        })
+        return result
+
+    def mark_live_execution_unreconcilable(
+        self, proposal_id: str, *, operator_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        """Locally close the accounting path when no safe read capability exists."""
+        if not operator_confirmed:
+            raise SecurityError("marking LIVE execution unreconcilable requires explicit operator confirmation")
+        proposal = self.ledger.get_proposal(validate_simple_id(proposal_id, "proposal_id"), include_private=True)
+        if proposal.get("mode") != "live":
+            raise SecurityError("unreconcilable execution requires a LIVE proposal")
+        if proposal.get("execution_status") not in {"EXEC_STARTED", "EXECUTING"}:
+            raise SecurityError("LIVE execution is not an unresolved submission")
+        evidence = [row for row in self.ledger.events_by_kind("live.execution_evidence")
+                    if row.get("proposal_id") == proposal["id"]]
+        if not evidence:
+            raise SecurityError("LIVE execution evidence is unavailable")
+        latest = evidence[-1]
+        entry = latest.get("entry") or {}
+        entry_status = str(entry.get("status", "")).upper()
+        try:
+            executed_qty = Decimal(str(entry.get("executed_qty", "0")))
+        except (TypeError, ValueError, ArithmeticError):
+            raise SecurityError("LIVE execution evidence has invalid quantity")
+        if str(latest.get("phase", "")).upper() == "FILLED" or (entry_status == "FILLED" and executed_qty > 0):
+            raise SecurityError("verified FILLED evidence must be reconciled, not marked unreconcilable")
+        if entry_status not in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}:
+            raise SecurityError("LIVE execution evidence is not an unresolved parent order")
+        if not isinstance(entry.get("order_id"), int) or entry["order_id"] <= 0:
+            raise SecurityError("LIVE execution evidence has no delegated orderId")
+        if not isinstance(entry.get("order_list_id"), int) or entry["order_list_id"] <= 0:
+            raise SecurityError("LIVE execution evidence has no delegated orderListId")
+        if any(row.get("proposal_id") == proposal["id"] for row in self.ledger.events_by_kind("live.risk_fill")):
+            raise SecurityError("existing LIVE risk fill must be reconciled, not marked unreconcilable")
+        protection = latest.get("protection")
+        if (not isinstance(protection, list) or not protection
+                or not all(isinstance(row, Mapping)
+                           and isinstance(row.get("order_id", row.get("orderId")), int)
+                           and row.get("order_id", row.get("orderId")) > 0
+                           for row in protection)):
+            raise SecurityError("protected OTOCO provenance is unavailable")
+        audit = self.ledger.latest_event("live.execution_read_capability_discovery")
+        counts = {key: audit.get(key) for key in ("individual_order_status_count", "order_list_status_count", "trade_fill_history_count")} if isinstance(audit, Mapping) else {}
+        if counts != {"individual_order_status_count": 0, "order_list_status_count": 0, "trade_fill_history_count": 0}:
+            raise SecurityError("a compatible LIVE execution read capability is available; reconciliation is required")
+        epoch = self._effective_live_risk_epoch()
+        if not isinstance(epoch, Mapping) or epoch.get("epoch_id") != latest.get("epoch_id"):
+            raise SecurityError("LIVE execution epoch provenance is unavailable")
+        reason = "ASYNC_FILL_PROVENANCE_UNRECOVERABLE_UPSTREAM_CAPABILITY"
+        self.ledger.mark_live_execution_unreconcilable(proposal["id"], reason, {
+            "execution_order_id": entry["order_id"], "order_list_id": entry["order_list_id"],
+            "epoch_id": epoch["epoch_id"], "source": "local_capability_fallback",
+        })
+        self.ledger.add_event("live.risk_epoch", None, {
+            **dict(epoch), "status": "RECONCILE", "reconcile_reason": reason,
+            "realized_pnl_verified": False, "accounting_complete": False,
+        })
+        return {"status": "RECONCILE", "proposal_id": proposal["id"], "epoch_id": epoch["epoch_id"],
+                "reason": reason, "accounting_status": "RECONCILE", "realized_pnl_verified": False,
+                "accounting_complete": False}
+
     def verify_live_decimal_transport(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
         """Explicitly attest fractional decimal transport with one orderTest call."""
         if not operator_confirmed:

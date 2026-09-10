@@ -153,6 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
     live_reconcile_execution = subparsers.add_parser("reconcile-live-execution", help="read one submitted LIVE execution status")
     live_reconcile_execution.add_argument("proposal_id")
     live_reconcile_execution.add_argument("--owner-id", required=True)
+    live_mark_unreconcilable = subparsers.add_parser("mark-live-execution-unreconcilable", help="locally mark an async LIVE execution unreconcilable when all read capabilities are unavailable")
+    live_mark_unreconcilable.add_argument("proposal_id")
+    live_mark_unreconcilable.add_argument("--owner-id", required=True)
     live_finalize_epoch = subparsers.add_parser("finalize-live-risk-epoch", help="finalize a flat incomplete LIVE risk epoch")
     live_finalize_epoch.add_argument("--owner-id", required=True)
     live_finalize_empty = subparsers.add_parser("finalize-empty-live-risk-epoch", help="abort a proven empty LIVE risk epoch")
@@ -356,6 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
         "discover-live-trade-history-tool", help="discover the authenticated Spot trade-history read capability"
     )
     history_discovery.add_argument("--owner-id", required=True)
+    read_capability_discovery = subparsers.add_parser(
+        "discover-live-execution-read-capabilities", help="discover read-only LIVE execution capabilities"
+    )
+    read_capability_discovery.add_argument("--owner-id", required=True)
     rate_limit_clear = subparsers.add_parser(
         "clear-binance-rate-limit", help="explicitly clear the local Binance rate-limit circuit"
     )
@@ -588,6 +595,9 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command == "discover-live-trade-history-tool":
         _require_local_admin(service, args.owner_id, "DISCOVER RISKPILOT LIVE TRADE HISTORY TOOL")
         return service.discover_live_trade_history_tool(operator_confirmed=True)
+    if args.command == "discover-live-execution-read-capabilities":
+        _require_local_admin(service, args.owner_id, "DISCOVER RISKPILOT LIVE EXECUTION READ CAPABILITIES")
+        return service.discover_live_execution_read_capabilities(operator_confirmed=True)
     if args.command == "clear-binance-rate-limit":
         _require_local_admin(service, args.owner_id, "CLEAR RISKPILOT BINANCE RATE-LIMIT CIRCUIT")
         return service.live_executor.clear_rate_limit_circuit()
@@ -621,6 +631,9 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command == "reconcile-live-execution":
         _require_local_admin(service, args.owner_id, "RECONCILE RISKPILOT LIVE EXECUTION")
         return service.reconcile_live_execution(args.proposal_id, operator_confirmed=True)
+    if args.command == "mark-live-execution-unreconcilable":
+        _require_local_admin(service, args.owner_id, "MARK RISKPILOT LIVE EXECUTION UNRECONCILABLE")
+        return service.mark_live_execution_unreconcilable(args.proposal_id, operator_confirmed=True)
     if args.command == "finalize-live-risk-epoch":
         _require_local_admin(service, args.owner_id, "FINALIZE RISKPILOT INCOMPLETE LIVE RISK EPOCH")
         return service.finalize_live_risk_epoch(operator_confirmed=True)

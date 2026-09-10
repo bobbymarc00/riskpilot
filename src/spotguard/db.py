@@ -737,6 +737,28 @@ class Ledger:
             )
         return self.get_proposal(proposal_id)
 
+    def mark_live_execution_unreconcilable(
+        self, proposal_id: str, reason: str, summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Record a local, fail-closed accounting state without exchange I/O."""
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+            if row is None:
+                raise LedgerError(f"proposal not found: {proposal_id}")
+            if row["mode"] != "live":
+                raise LedgerError("unreconcilable execution requires a LIVE proposal")
+            connection.execute(
+                "UPDATE proposals SET status='RECONCILE', execution_status='RECONCILE', execution_summary_json=? WHERE id=?",
+                (canonical_json({**(json.loads(row["execution_summary_json"]) if row["execution_summary_json"] else {}),
+                                 **summary, "accounting_status": "RECONCILE", "accounting_reason": reason}), proposal_id),
+            )
+            connection.execute(
+                "INSERT INTO events(kind,entity_id,payload_json,created_at) VALUES(?,?,?,?)",
+                ("execution.reconciliation_required", proposal_id,
+                 canonical_json({"reason": reason, "accounting_status": "RECONCILE"}), isoformat()),
+            )
+        return self.get_proposal(proposal_id)
+
     def fail_execution(self, proposal_id: str, lease_hash: str, reason: str) -> dict[str, Any]:
         with self.transaction() as connection:
             row = connection.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()

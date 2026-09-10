@@ -145,6 +145,92 @@ class LiveSafetyTests(unittest.TestCase):
    adapter.execution_discovery()
    self.assertEqual(adapter._direct_mcp_jsonrpc.call_count, 2)
 
+ def test_read_capability_discovery_reports_no_candidates_without_invocation(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   adapter.execution_discovery=Mock(return_value=({},{}))
+   result=adapter.discover_live_execution_read_capabilities(operator_confirmed=True)
+   self.assertEqual(result["individual_order_status_count"],0)
+   self.assertEqual(result["order_list_status_count"],0)
+   self.assertEqual(result["trade_fill_history_count"],0)
+   self.assertFalse(result["writes_invoked"])
+
+ def test_read_capability_discovery_accepts_one_unique_candidate_per_class(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   output={"type":"object","properties":{"status":{"type":"string"},"executedQty":{"type":"string"},"cumulativeQuoteQty":{"type":"string"}}}
+   catalog={
+    "spot.getOrder":{"name":"spot.getOrder","description":"Read-only Spot individual order status and detail","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"orderId":{"type":"integer"}},"required":["symbol","orderId"],"additionalProperties":False},"outputSchema":output},
+    "spot.getOrderList":{"name":"spot.getOrderList","description":"Read-only Spot OCO/OTOCO order list status","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"orderListId":{"type":"integer"}},"required":["symbol","orderListId"],"additionalProperties":False},"outputSchema":{"type":"object","properties":{"listStatusType":{"type":"string"}}}},
+    "spot.myTrades":{"name":"spot.myTrades","description":"Read-only Spot account trade history and fills","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"orderId":{"type":"integer"}},"required":["symbol"],"additionalProperties":False},"outputSchema":{"type":"array","items":{"type":"object","properties":{"price":{"type":"string"},"qty":{"type":"string"},"quoteQty":{"type":"string"},"commission":{"type":"string"},"commissionAsset":{"type":"string"}}}}},
+   }
+   adapter.execution_discovery=Mock(return_value=({},catalog))
+   result=adapter.discover_live_execution_read_capabilities(operator_confirmed=True)
+   self.assertEqual(result["individual_order_status"]["unique_candidate"],"spot.getOrder")
+   self.assertEqual(result["order_list_status"]["unique_candidate"],"spot.getOrderList")
+   self.assertEqual(result["trade_fill_history"]["unique_candidate"],"spot.myTrades")
+
+ def test_read_capability_discovery_marks_ambiguous_and_rejects_writes_or_non_spot(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   def row(name, description, props):
+    return {"name":name,"description":description,"inputSchema":{"type":"object","properties":props,"required":list(props),"additionalProperties":False}}
+   catalog={
+    "spot.getOrderA":row("spot.getOrderA","Read-only Spot order status",{"symbol":{"type":"string"},"orderId":{"type":"integer"}}),
+    "spot.getOrderB":row("spot.getOrderB","Read-only Spot order status",{"symbol":{"type":"string"},"orderId":{"type":"integer"}}),
+    "spot.newOrder":row("spot.newOrder","Create new Spot order",{"symbol":{"type":"string"},"orderId":{"type":"integer"}}),
+    "futures.getOrder":row("futures.getOrder","Read-only futures order status",{"symbol":{"type":"string"},"orderId":{"type":"integer"}}),
+   }
+   adapter.execution_discovery=Mock(return_value=({},catalog))
+   result=adapter.discover_live_execution_read_capabilities(operator_confirmed=True)
+   self.assertEqual(result["individual_order_status"]["selection"],"AMBIGUOUS")
+   rejected={row["toolName"]:row for row in result["individual_order_status"]["candidates"] if not row["accepted"]}
+   self.assertIn("spot.newOrder",rejected)
+   self.assertIn("futures.getOrder",rejected)
+
+ def test_read_capability_discovery_keeps_order_list_distinct_and_requires_account_history_semantics(self):
+  with tempfile.TemporaryDirectory() as d:
+   adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
+   row={"name":"spot.getOpenOrders","description":"Read-only Spot open orders","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"orderListId":{"type":"integer"}},"required":["symbol"],"additionalProperties":False}}
+   adapter.execution_discovery=Mock(return_value=({}, {row["name"]:row}))
+   result=adapter.discover_live_execution_read_capabilities(operator_confirmed=True)
+   self.assertEqual(result["order_list_status_count"],0)
+   self.assertEqual(result["trade_fill_history_count"],0)
+   self.assertIn("order_list_semantics_not_proven",result["order_list_status"]["candidates"][0]["reason"])
+
+ def test_unreconcilable_async_execution_requires_zero_read_capabilities_and_preserves_state(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   proposal={"id":"p-async0000001","mode":"live","status":"EXECUTED","execution_status":"EXEC_STARTED"}
+   evidence={"proposal_id":proposal["id"],"epoch_id":"le-async","phase":"SUBMITTED",
+             "entry":{"status":"NEW","order_id":101,"order_list_id":202,"executed_qty":"0"},
+             "protection":[{"orderId":203,"status":"PENDING_NEW"},{"orderId":204,"status":"PENDING_NEW"}]}
+   service.ledger.get_proposal=Mock(return_value=proposal)
+   service.ledger.events_by_kind=Mock(side_effect=lambda kind: [evidence] if kind == "live.execution_evidence" else [])
+   service.ledger.latest_event=Mock(return_value={"individual_order_status_count":0,"order_list_status_count":0,"trade_fill_history_count":0})
+   service._effective_live_risk_epoch=Mock(return_value={"epoch_id":"le-async","status":"ACTIVE"})
+   service.ledger.mark_live_execution_unreconcilable=Mock(return_value={"status":"RECONCILE"})
+   result=service.mark_live_execution_unreconcilable(proposal["id"],operator_confirmed=True)
+   self.assertEqual(result["reason"],"ASYNC_FILL_PROVENANCE_UNRECOVERABLE_UPSTREAM_CAPABILITY")
+   service.ledger.mark_live_execution_unreconcilable.assert_called_once()
+
+ def test_unreconcilable_async_execution_refuses_when_read_capability_exists_or_fill_is_verified(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   proposal={"id":"p-async0000002","mode":"live","status":"EXECUTED","execution_status":"EXEC_STARTED"}
+   evidence={"proposal_id":proposal["id"],"epoch_id":"le-async","phase":"SUBMITTED",
+             "entry":{"status":"NEW","order_id":101,"order_list_id":202,"executed_qty":"0"},
+             "protection":[{"orderId":203}]}
+   service.ledger.get_proposal=Mock(return_value=proposal)
+   service.ledger.events_by_kind=Mock(side_effect=lambda kind: [evidence] if kind == "live.execution_evidence" else [])
+   service.ledger.latest_event=Mock(return_value={"individual_order_status_count":1,"order_list_status_count":0,"trade_fill_history_count":0})
+   with self.assertRaisesRegex(SecurityError,"read capability"):
+    service.mark_live_execution_unreconcilable(proposal["id"],operator_confirmed=True)
+   evidence["phase"]="FILLED"; evidence["entry"]["status"]="FILLED"; evidence["entry"]["executed_qty"]="1"
+   service.ledger.latest_event=Mock(return_value={"individual_order_status_count":0,"order_list_status_count":0,"trade_fill_history_count":0})
+   with self.assertRaisesRegex(SecurityError,"verified FILLED"):
+    service.mark_live_execution_unreconcilable(proposal["id"],operator_confirmed=True)
+
  def test_prepare_live_session_blocked_makes_zero_remote_calls(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))

@@ -512,6 +512,140 @@ class LiveExecutionAdapter:
                  "inputSchema": row.get("inputSchema")} for row in self._trade_history_candidates(catalog)]
 
     @staticmethod
+    def _read_capability_text(row: Mapping[str, Any]) -> str:
+        return " ".join(str(row.get(key, "")) for key in
+                        ("name", "title", "description", "readOnly", "read_only", "operation" )).lower()
+
+    @staticmethod
+    def _read_capability_schema(row: Mapping[str, Any], *keys: str) -> Mapping[str, Any] | None:
+        for key in keys:
+            value = row.get(key)
+            if isinstance(value, Mapping):
+                return value
+        return None
+
+    @classmethod
+    def _relevant_schema_metadata(cls, schema: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(schema, Mapping):
+            return None
+        props = schema.get("properties")
+        relevant = {key: value.get("type") if isinstance(value, Mapping) else str(type(value).__name__)
+                    for key, value in (props.items() if isinstance(props, Mapping) else [])
+                    if key in {"symbol", "orderId", "origClientOrderId", "orderListId", "status",
+                               "executedQty", "cummulativeQuoteQty", "cumulativeQuoteQty", "price", "qty",
+                               "quoteQty", "commission", "commissionAsset"}}
+        result = {"type": schema.get("type"), "required": schema.get("required", []),
+                  "properties": relevant}
+        if "additionalProperties" in schema:
+            result["additionalProperties"] = schema["additionalProperties"]
+        return result
+
+    @classmethod
+    def _classify_read_capability(cls, row: Mapping[str, Any], capability: str) -> dict[str, Any]:
+        name = row.get("name")
+        text = cls._read_capability_text(row)
+        schema = row.get("inputSchema")
+        props = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+        output = cls._read_capability_schema(row, "outputSchema", "output_schema", "resultSchema", "result_schema")
+        output_props = output.get("properties", {}) if isinstance(output, Mapping) else {}
+        if isinstance(output, Mapping) and output.get("type") == "array" and isinstance(output.get("items"), Mapping):
+            output_props = output["items"].get("properties", {})
+        forbidden = ("futures", "margin", "convert", "wallet", "transfer", "withdraw", "payment", "borrow")
+        write_words = ("new order", "create order", "place order", "cancel", "delete order", "modify order", "withdraw")
+        read_words = ("get", "query", "status", "detail", "history", "trades", "fills", "read")
+        reasons: list[str] = []
+        if not isinstance(name, str):
+            reasons.append("missing_tool_name")
+        if any(word in text for word in forbidden):
+            reasons.append("non_spot_or_forbidden_product")
+        if not isinstance(schema, Mapping) or schema.get("type") != "object" or not isinstance(props, Mapping):
+            reasons.append("input_schema_not_object")
+        if any(word in text for word in write_words):
+            reasons.append("write_capability")
+        if not any(word in text for word in read_words):
+            reasons.append("read_semantics_not_proven")
+        if "spot" not in text:
+            reasons.append("spot_semantics_not_proven")
+
+        if capability == "INDIVIDUAL_ORDER_STATUS":
+            if "symbol" not in props:
+                reasons.append("missing_symbol_input")
+            if not ({"orderId", "origClientOrderId"} & set(props)):
+                reasons.append("missing_individual_order_identifier")
+            if "orderlist" in text or "order list" in text or "oco" in text or "otoco" in text:
+                reasons.append("order_list_semantics_not_individual")
+            if not ({"status", "order status", "orderstate"} & set(output_props)) and not any(term in text for term in ("order status", "order detail", "individual order")):
+                reasons.append("individual_status_result_not_proven")
+        elif capability == "ORDER_LIST_STATUS":
+            if "symbol" not in props:
+                reasons.append("missing_symbol_input")
+            if "orderListId" not in props:
+                reasons.append("missing_order_list_id_input")
+            if not any(term in text for term in ("order list", "orderlist", "oco", "otoco", "list status")):
+                reasons.append("order_list_semantics_not_proven")
+        else:
+            history_terms = ("my trades", "mytrades", "trade history", "account trade", "account fills", "user trades", "user fills", "fills")
+            public_terms = ("public trades", "aggtrades", "aggregate trades", "market trades")
+            if not any(term in text for term in history_terms):
+                reasons.append("account_trade_history_semantics_not_proven")
+            if any(term in text for term in public_terms):
+                reasons.append("public_trade_history_not_account_history")
+            if "symbol" not in props:
+                reasons.append("missing_symbol_input")
+            if not ({"price", "qty"} <= set(output_props)):
+                reasons.append("fill_price_qty_output_not_proven")
+            if not ({"commission", "commissionAsset"} <= set(output_props)):
+                reasons.append("commission_output_not_proven")
+
+        accepted = not reasons
+        return {
+            "toolName": name,
+            "description": row.get("description") or row.get("title"),
+            "read_write": "read-only" if accepted else ("write" if "write_capability" in reasons else "unverified"),
+            "input_schema": cls._relevant_schema_metadata(schema),
+            "output_schema": cls._relevant_schema_metadata(output),
+            "accepted": accepted,
+            "reason": "accepted_verified_read_capability" if accepted else ";".join(reasons),
+        }
+
+    def discover_live_execution_read_capabilities(self, *, operator_confirmed: bool = False) -> dict[str, Any]:
+        """Inspect read-only execution capabilities without invoking any delegated tool."""
+        if not operator_confirmed:
+            raise SecurityError("execution read-capability discovery requires explicit operator confirmation")
+        _, catalog = self.execution_discovery()
+        reports: dict[str, list[dict[str, Any]]] = {}
+        for capability in ("INDIVIDUAL_ORDER_STATUS", "ORDER_LIST_STATUS", "TRADE_FILL_HISTORY"):
+            rows = []
+            for row in catalog.values():
+                if not isinstance(row, Mapping):
+                    continue
+                text = self._read_capability_text(row)
+                if ("spot" not in text and "order" not in text and "trade" not in text and "fill" not in text):
+                    continue
+                rows.append(self._classify_read_capability(row, capability))
+            reports[capability] = rows
+
+        def summary(capability: str) -> dict[str, Any]:
+            accepted = [row for row in reports[capability] if row["accepted"]]
+            return {"candidates": reports[capability], "count": len(accepted),
+                    "unique_candidate": accepted[0]["toolName"] if len(accepted) == 1 else None,
+                    "availability": "AVAILABLE" if accepted else "UNAVAILABLE",
+                    "selection": "AMBIGUOUS" if len(accepted) > 1 else ("UNIQUE" if accepted else "NONE")}
+
+        result = {key: summary(key) for key in reports}
+        return {
+            "individual_order_status": result["INDIVIDUAL_ORDER_STATUS"],
+            "order_list_status": result["ORDER_LIST_STATUS"],
+            "trade_fill_history": result["TRADE_FILL_HISTORY"],
+            "individual_order_status_count": result["INDIVIDUAL_ORDER_STATUS"]["count"],
+            "order_list_status_count": result["ORDER_LIST_STATUS"]["count"],
+            "trade_fill_history_count": result["TRADE_FILL_HISTORY"]["count"],
+            "tools_list_calls": self.request_budget().get("tools_list", 0),
+            "catalog_search_calls": self.request_budget().get("catalog_search", 0),
+            "writes_invoked": False,
+        }
+
+    @staticmethod
     def _spot_order_query_candidates(catalog: Mapping[str, Mapping[str, Any]]) -> list[Mapping[str, Any]]:
         candidates = []
         for row in catalog.values():
