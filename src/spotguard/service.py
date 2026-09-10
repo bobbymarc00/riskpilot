@@ -17,7 +17,7 @@ from .config import Settings, openclaw_available
 from .db import Ledger, LedgerError
 from .indicators import analyze
 from .live_execution import LiveExecutionAdapter
-from .market import Kline, MarketError, SymbolValidationError, fetch_1m_candles_since, fetch_klines, fetch_spot_snapshot, floor_to_step, load_fixture, scaled_synthetic_klines, synthetic_bullish_klines, validate_spot_symbol
+from .market import Kline, MarketError, SymbolValidationError, classify_spot_base_balance, fetch_1m_candles_since, fetch_klines, fetch_spot_snapshot, floor_to_step, load_fixture, scaled_synthetic_klines, synthetic_bullish_klines, validate_spot_symbol
 from .policy import PolicyError, build_proposal, entry_policy_terms, execution_intent, validate_claim
 from .risk_policy.capital import AssetValuation, UsageSnapshot, build_equity_snapshot
 from .risk_policy.evaluator import PolicyContext, evaluate_entry
@@ -1526,6 +1526,7 @@ class SpotGuard:
 
         protected_quantities: dict[str, Decimal] = {}
         snapshots: dict[str, Any] = {}
+        balance_classifications: list[dict[str, Any]] = []
         risk_by_symbol: dict[str, Decimal] = {}
         exposure_by_symbol: dict[str, Decimal] = {}
         existing_exposure = Decimal("0")
@@ -1588,6 +1589,14 @@ class SpotGuard:
                     )
                 continue
             held_by_symbol[matching_symbol] = held
+            filters = validate_spot_symbol(self.settings, matching_symbol, live=True)
+            if matching_symbol not in snapshots:
+                snapshots[matching_symbol] = fetch_spot_snapshot(self.settings, matching_symbol)
+            balance_state = classify_spot_base_balance(held, filters, snapshots[matching_symbol].bid)
+            balance_classifications.append({"symbol": matching_symbol, "balance": format(held, "f"), **balance_state})
+            if not balance_state["tradable"]:
+                held_by_symbol.pop(matching_symbol, None)
+                continue
             if held != protected_quantities.get(matching_symbol, Decimal("0")):
                 self._mark_live_epoch_reconcile(f"unexplained balance for {matching_symbol}")
                 raise SecurityError(
@@ -1718,6 +1727,7 @@ class SpotGuard:
                 "account_global_realized_loss_reason": "ACCOUNT_TRADE_HISTORY_CAPABILITY_UNAVAILABLE",
                 "realized_loss_scope": "riskpilot_session",
                 "riskpilot_session_accounting_verified": accounting_ok,
+                "existing_base_balance_classifications": balance_classifications,
                 "active_live_tranches": active_tranches,
                 "active_live_economic_positions": len(active_symbols),
                 "calculated_notional": str(quote_amount),
@@ -2736,11 +2746,11 @@ class SpotGuard:
             if residual <= 0:
                 continue
             filters = validate_spot_symbol(self.settings, symbol, live=True)
-            minimum_qty = Decimal(str(filters.get("market_min_qty", filters["lot_step_size"])))
-            if residual >= minimum_qty:
+            balance_state = classify_spot_base_balance(residual, filters, None)
+            if balance_state["tradable"]:
                 raise SecurityError(f"meaningful LIVE base balance remains for {symbol}; finalization refused")
             dust_balances.append({"symbol": symbol, "asset": base, "quantity": format(residual, "f"),
-                                  "minimum_quantity": format(minimum_qty, "f")})
+                                  "minimum_quantity": balance_state["minimum_quantity"]})
         finalized = {**dict(epoch), "status": "CLOSED_INCOMPLETE", "finalized_at": isoformat(),
                      "previous_status": epoch.get("status"),
                      "finalization_reason": "LEGACY_FLAT_EPOCH_MISSING_FILL_PROVENANCE",

@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from decimal import Decimal
 
 from .config import Settings
@@ -149,6 +149,39 @@ def validate_spot_symbol(settings: Settings, symbol: str, *, live: bool = False)
         "max_num_orders": int(filters.get("MAX_NUM_ORDERS", {}).get("maxNumOrders", 0)),
         "max_num_algo_orders": int(filters.get("MAX_NUM_ALGO_ORDERS", {}).get("maxNumAlgoOrders", 0)),
         "max_num_order_lists": int(filters.get("MAX_NUM_ORDER_LISTS", {}).get("maxNumOrderLists", 0)), **live_flags}
+
+
+def classify_spot_base_balance(balance: Decimal, filters: Mapping[str, Any],
+                               reference_price: Decimal | None) -> dict[str, Any]:
+    """Classify a base balance using only current exchange sell constraints."""
+    if not isinstance(balance, Decimal) or not balance.is_finite() or balance < 0:
+        raise SymbolValidationError("Spot base balance is invalid")
+    if balance == 0:
+        return {"classification": "ZERO", "tradable": False, "tradable_quantity": "0"}
+    try:
+        step = Decimal(str(filters["market_step_size"]))
+        minimum_qty = Decimal(str(filters["market_min_qty"]))
+        minimum_notional = Decimal(str(filters["min_notional"]))
+        status = filters["status"]
+        price = reference_price if reference_price is not None else None
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise SymbolValidationError("required Spot dust filters are unavailable") from exc
+    if status != "TRADING" or step <= 0 or minimum_qty <= 0 or minimum_notional <= 0:
+        raise SymbolValidationError("required Spot dust filters are invalid")
+    tradable_quantity = floor_to_step(balance, step)
+    if tradable_quantity < minimum_qty:
+        return {"classification": "EXCHANGE_DUST", "tradable": False,
+                "tradable_quantity": format(tradable_quantity, "f"),
+                "minimum_quantity": format(minimum_qty, "f"),
+                "minimum_notional": format(minimum_notional, "f")}
+    if price is None or not price.is_finite() or price <= 0:
+        raise SymbolValidationError("verified Spot reference price is required for dust validation")
+    tradable = tradable_quantity * price >= minimum_notional
+    return {"classification": "TRADABLE" if tradable else "EXCHANGE_DUST",
+            "tradable": tradable, "tradable_quantity": format(tradable_quantity, "f"),
+            "reference_price": format(price, "f"),
+            "minimum_quantity": format(minimum_qty, "f"),
+            "minimum_notional": format(minimum_notional, "f")}
 
 
 def fetch_spot_snapshot(settings: Settings, symbol: str) -> SpotMarketSnapshot:

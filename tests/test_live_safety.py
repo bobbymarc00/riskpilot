@@ -12,6 +12,7 @@ from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
 from spotguard.presentation import render
 from spotguard.telegram import proposal_message
+from spotguard.market import classify_spot_base_balance
 from spotguard.util import isoformat, utcnow
 from tests.helpers import config_dict
 
@@ -23,6 +24,18 @@ def configured(root: Path, *, enabled=False, scheduled="paper"):
  p=root/"config.json"; p.write_text(json.dumps(d)); return load_settings(p)
 
 class LiveSafetyTests(unittest.TestCase):
+ def test_exchange_dust_predicate_uses_filters_not_fixed_floor(self):
+  filters={"status":"TRADING","market_step_size":"0.001","market_min_qty":"0.001","min_notional":"5"}
+  dust=classify_spot_base_balance(Decimal("0.000942"),filters,Decimal("100"))
+  self.assertEqual(dust["classification"],"EXCHANGE_DUST")
+  self.assertFalse(dust["tradable"])
+  tradable=classify_spot_base_balance(Decimal("0.001"),filters,Decimal("6000"))
+  self.assertTrue(tradable["tradable"])
+  low_notional=classify_spot_base_balance(Decimal("0.001"),filters,Decimal("100"))
+  self.assertEqual(low_notional["classification"],"EXCHANGE_DUST")
+  with self.assertRaises(Exception):
+   classify_spot_base_balance(Decimal("0.001"),filters,None)
+
  def test_proposal_presentation_uses_canonical_mode_and_order_type(self):
   canonical={"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"SOLUSDT",
              "quote_amount":"6","entry_reference":"102.02000000","stop_reference":"101.35000000",
