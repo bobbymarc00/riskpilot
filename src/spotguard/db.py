@@ -688,6 +688,7 @@ class Ledger:
         order_id: str,
         execution_status: str,
         summary: dict[str, Any],
+        allow_legacy_unresolved: bool = False,
     ) -> dict[str, Any]:
         if final_status not in {"EXECUTED", "RECONCILE"}:
             raise LedgerError("invalid final execution status")
@@ -695,7 +696,9 @@ class Ledger:
             row = connection.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
             if row is None:
                 raise LedgerError(f"proposal not found: {proposal_id}")
-            if row["status"] != "EXECUTING":
+            if row["status"] != "EXECUTING" and not (
+                    allow_legacy_unresolved and row["status"] == "EXECUTED"
+                    and row["execution_status"] in {"EXEC_STARTED", "EXECUTING"}):
                 raise LedgerError(f"proposal is not executing: {row['status']}")
             if row["execution_lease_hash"] != lease_hash:
                 raise LedgerError("invalid execution lease")
@@ -709,6 +712,28 @@ class Ledger:
             connection.execute(
                 "INSERT INTO events(kind,entity_id,payload_json,created_at) VALUES(?,?,?,?)",
                 ("execution.completed", proposal_id, canonical_json({"status": final_status, "order_id": order_id}), isoformat()),
+            )
+        return self.get_proposal(proposal_id)
+
+    def record_execution_submitted(
+        self, proposal_id: str, lease_hash: str, order_id: str,
+        execution_status: str, summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist exchange acceptance while the parent order is not filled."""
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+            if row is None:
+                raise LedgerError(f"proposal not found: {proposal_id}")
+            if row["status"] != "EXECUTING" or row["execution_lease_hash"] != lease_hash:
+                raise LedgerError("proposal is not executing")
+            now = isoformat()
+            connection.execute(
+                "UPDATE proposals SET execution_order_id=?, execution_status=?, execution_summary_json=? WHERE id=?",
+                (order_id, execution_status, canonical_json(summary), proposal_id),
+            )
+            connection.execute(
+                "INSERT INTO events(kind,entity_id,payload_json,created_at) VALUES(?,?,?,?)",
+                ("execution.submitted", proposal_id, canonical_json({"status": "EXECUTING", "order_id": order_id}), now),
             )
         return self.get_proposal(proposal_id)
 

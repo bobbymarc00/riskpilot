@@ -888,7 +888,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_async_live_reconciliation_filled_uses_one_read_and_creates_fill(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))
-   proposal={"id":"p-async000001","mode":"live","status":"EXECUTING","symbol":"BTCUSDT","side":"BUY","execution_lease_hash":"lease-hash","canonical":{"symbol":"BTCUSDT"}}
+   proposal={"id":"p-async000001","mode":"live","status":"EXECUTING","execution_status":"EXEC_STARTED","symbol":"BTCUSDT","side":"BUY","execution_lease_hash":"lease-hash","canonical":{"symbol":"BTCUSDT"}}
    evidence={"proposal_id":proposal["id"],"epoch_id":"le-async","side":"BUY","phase":"SUBMITTED","entry":{"order_id":501,"order_list_id":601,"status":"NEW"},"protection":[{"order_id":502},{"order_id":503}]}
    response={"symbol":"BTCUSDT","orderId":501,"orderListId":601,"status":"FILLED","side":"BUY","executedQty":"0.06","cummulativeQuoteQty":"6.06","fills":[{"price":"101","qty":"0.03","commission":"0.001","commissionAsset":"USDT"},{"price":"101","qty":"0.03","commission":"0.001","commissionAsset":"USDT"}]}
    service.ledger.get_proposal=Mock(return_value=proposal)
@@ -907,7 +907,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_async_live_reconciliation_pending_stays_executing_without_fill(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))
-   proposal={"id":"p-async000002","mode":"live","status":"EXECUTING","symbol":"BTCUSDT","side":"BUY","execution_lease_hash":"lease-hash","canonical":{"symbol":"BTCUSDT"}}
+   proposal={"id":"p-async000002","mode":"live","status":"EXECUTING","execution_status":"EXEC_STARTED","symbol":"BTCUSDT","side":"BUY","execution_lease_hash":"lease-hash","canonical":{"symbol":"BTCUSDT"}}
    evidence={"proposal_id":proposal["id"],"epoch_id":"le-async","side":"BUY","phase":"SUBMITTED","entry":{"order_id":501,"order_list_id":601,"status":"NEW"}}
    service.ledger.get_proposal=Mock(return_value=proposal)
    service.ledger.events_by_kind=Mock(side_effect=lambda kind: [evidence] if kind == "live.execution_evidence" else [])
@@ -916,6 +916,25 @@ class LiveSafetyTests(unittest.TestCase):
    result=service.reconcile_live_execution(proposal["id"],operator_confirmed=True)
    self.assertEqual(result["status"],"EXECUTING")
    self.assertEqual(result["accounting_status"],"WAITING_FOR_FILL")
+
+ def test_legacy_executed_exec_started_submission_is_reconcilable(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   proposal={"id":"p-async000003","mode":"live","status":"EXECUTED","symbol":"BTCUSDT","side":"BUY","execution_status":"EXEC_STARTED","execution_lease_hash":"lease-hash","canonical":{"symbol":"BTCUSDT"}}
+   evidence={"proposal_id":proposal["id"],"epoch_id":"le-async","side":"BUY","phase":"SUBMITTED","entry":{"order_id":501,"order_list_id":601,"status":"NEW"},"protection":[]}
+   response={"symbol":"BTCUSDT","orderId":501,"orderListId":601,"status":"FILLED","side":"BUY","executedQty":"0.06","cumulativeQuoteQty":"6.06","fills":[{"price":"101","qty":"0.06","commission":"0.001","commissionAsset":"USDT"}]}
+   service.ledger.get_proposal=Mock(return_value=proposal)
+   service.ledger.events_by_kind=Mock(side_effect=lambda kind: [evidence] if kind == "live.execution_evidence" else [])
+   service.live_executor.read_spot_order_status=Mock(return_value=response)
+   service._persist_live_execution_evidence=Mock()
+   service.ledger.finish_execution=Mock(return_value={"status":"EXECUTED"})
+   service._persist_live_risk_fill=Mock()
+   service._live_session_accounting=Mock(return_value=(True,Decimal("0"),Decimal("0"),None))
+   self.assertTrue(service._is_unresolved_live_execution(proposal))
+   result=service.reconcile_live_execution(proposal["id"],operator_confirmed=True)
+   self.assertEqual(result["status"],"EXECUTED")
+   service.ledger.finish_execution.assert_called_once()
+   self.assertTrue(service.ledger.finish_execution.call_args.kwargs["allow_legacy_unresolved"])
 
  def test_paper_text_approval_cannot_cross_to_live(self):
   with tempfile.TemporaryDirectory() as d:

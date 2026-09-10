@@ -2593,6 +2593,17 @@ class SpotGuard:
                     order_id = evidence["entry"]["order_id"]
             fill = self._verified_live_fill(proposal, response, order_id)
             if fill is None:
+                entry_status = str((evidence or {}).get("entry", {}).get("status", "")).upper()
+                if (not is_close and not is_partial and not is_cancel and not is_restore
+                        and entry_status in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}):
+                    result = self.ledger.record_execution_submitted(
+                        proposal_id, lease_hash, str(order_id), "EXEC_STARTED",
+                        {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"],
+                         "accounting_status": "WAITING_FOR_FILL", "execution_evidence": evidence},
+                    )
+                    result["accounting_status"] = "WAITING_FOR_FILL"
+                    result["fill"] = "WAITING"
+                    return result
                 # The exchange write and protection can be successful while
                 # the response lacks enough fill evidence for session PnL.
                 # Keep the execution outcome, but make the accounting state
@@ -2863,10 +2874,30 @@ class SpotGuard:
             raise SecurityError("LIVE execution reconciliation requires explicit operator confirmation")
         return self._reconcile_live_execution(proposal_id)
 
+    def _is_unresolved_live_execution(self, proposal: Mapping[str, Any]) -> bool:
+        if proposal.get("mode") != "live" or proposal.get("execution_status") not in {"EXEC_STARTED", "EXECUTING"}:
+            return False
+        if proposal.get("status") in {"REJECTED", "FAILED", "EXPIRED", "RECONCILE"}:
+            return False
+        evidence = [row for row in self.ledger.events_by_kind("live.execution_evidence")
+                    if row.get("proposal_id") == proposal.get("id")]
+        if not evidence:
+            return False
+        latest = evidence[-1]
+        entry = latest.get("entry") or {}
+        if str(latest.get("phase", "")).upper() == "FILLED" or (
+                str(entry.get("status", "")).upper() == "FILLED"
+                and Decimal(str(entry.get("executed_qty", "0"))) > 0):
+            return False
+        return (str(entry.get("status", "")).upper() in {"NEW", "PENDING_NEW", "PARTIALLY_FILLED"}
+                and isinstance(entry.get("order_id"), int) and entry["order_id"] > 0
+                and isinstance(entry.get("order_list_id"), int) and entry["order_list_id"] > 0
+                and not any(row.get("proposal_id") == proposal.get("id") for row in self.ledger.events_by_kind("live.risk_fill")))
+
     def _reconcile_live_execution(self, proposal_id: str) -> dict[str, Any]:
         proposal = self.ledger.get_proposal(validate_simple_id(proposal_id, "proposal_id"), include_private=True)
-        if proposal.get("mode") != "live" or proposal.get("status") != "EXECUTING":
-            raise SecurityError("LIVE execution reconciliation requires an EXECUTING LIVE proposal")
+        if not self._is_unresolved_live_execution(proposal):
+            raise SecurityError("LIVE execution reconciliation requires an unresolved LIVE submission")
         evidence = [row for row in self.ledger.events_by_kind("live.execution_evidence")
                     if row.get("proposal_id") == proposal["id"]]
         if not evidence:
@@ -2897,15 +2928,15 @@ class SpotGuard:
         if status in {"NEW", "PENDING_NEW"}:
             return {"status": "EXECUTING", "fill": "WAITING", "accounting_status": "WAITING_FOR_FILL", "proposal_id": proposal["id"]}
         if status in {"CANCELED", "EXPIRED", "REJECTED"}:
-            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "NO_FILL", "execution_evidence": updated})
+            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "NO_FILL", "execution_evidence": updated}, allow_legacy_unresolved=True)
             return {**result, "accounting_status": "NO_FILL"}
         if status not in {"FILLED", "PARTIALLY_FILLED"}:
-            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), "UNKNOWN", {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "RECONCILE", "accounting_reason": "AMBIGUOUS_LIVE_ORDER_STATUS", "execution_evidence": updated})
+            result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "RECONCILE", str(order_id), "UNKNOWN", {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "accounting_status": "RECONCILE", "accounting_reason": "AMBIGUOUS_LIVE_ORDER_STATUS", "execution_evidence": updated}, allow_legacy_unresolved=True)
             return {**result, "accounting_status": "RECONCILE", "accounting_reason": "AMBIGUOUS_LIVE_ORDER_STATUS"}
         if status == "PARTIALLY_FILLED":
             return {"status": "EXECUTING", "fill": "PARTIAL", "accounting_status": "WAITING_FOR_FILL", "proposal_id": proposal["id"]}
         fill = self._verified_live_fill(proposal, response, order_id)
-        result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "EXECUTED", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "execution_evidence": updated})
+        result = self.ledger.finish_execution(proposal["id"], proposal["execution_lease_hash"], "EXECUTED", str(order_id), status, {"simulated": False, "symbol": proposal["symbol"], "side": proposal["side"], "execution_evidence": updated}, allow_legacy_unresolved=True)
         if fill is None:
             return {**result, "accounting_status": "RECONCILE", "accounting_reason": "LIVE_FILL_PROVENANCE_INCOMPLETE"}
         self._persist_live_risk_fill(fill)
