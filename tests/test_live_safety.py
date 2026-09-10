@@ -84,6 +84,36 @@ class LiveSafetyTests(unittest.TestCase):
    with self.assertRaisesRegex(SecurityError,"touched-symbol evidence"):
     service.finalize_live_risk_epoch(operator_confirmed=True,empty_only=True)
 
+ def test_legacy_finalization_uses_one_verified_price_for_notional_dust(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-price-dust","status":"RECONCILE","started_at":"2026-01-01T00:00:00Z","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   service.ledger.active_proposals_status=Mock(return_value=[])
+   service.ledger.list_proposals=Mock(return_value=[{"mode":"live","symbol":"BTCUSDT","created_at":"2026-01-02T00:00:00Z"}])
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"BTC","free":"0.001883","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=[])
+   filters={"status":"TRADING","market_step_size":"0.001","market_min_qty":"0.001","min_notional":"5"}
+   snapshot=SimpleNamespace(symbol="BTCUSDT",bid=Decimal("100"),observed_at_ms=123)
+   with patch("spotguard.service.validate_spot_symbol",return_value=filters), patch("spotguard.service.fetch_spot_snapshot",return_value=snapshot) as price:
+    result=service.finalize_live_risk_epoch(operator_confirmed=True)
+   self.assertEqual(result["status"],"CLOSED_INCOMPLETE")
+   price.assert_called_once()
+   dust=service.ledger.latest_event("live.risk_epoch")["dust_balances"][0]
+   self.assertEqual(dust["classification"],"EXCHANGE_DUST")
+   self.assertEqual(dust["reference_price_used"],"100")
+
+ def test_legacy_finalization_refuses_tradable_residual_at_verified_price(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-price-tradable","status":"RECONCILE","started_at":"2026-01-01T00:00:00Z","profile_fingerprint":service.live_executor.execution_profile_fingerprint()})
+   service.ledger.active_proposals_status=Mock(return_value=[])
+   service.ledger.list_proposals=Mock(return_value=[{"mode":"live","symbol":"BTCUSDT","created_at":"2026-01-02T00:00:00Z"}])
+   service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"BTC","free":"0.001883","locked":"0"}]})
+   service.live_executor.read_open_spot_orders=Mock(return_value=[])
+   with patch("spotguard.service.validate_spot_symbol",return_value={"status":"TRADING","market_step_size":"0.001","market_min_qty":"0.001","min_notional":"5"}), patch("spotguard.service.fetch_spot_snapshot",return_value=SimpleNamespace(symbol="BTCUSDT",bid=Decimal("6000"),observed_at_ms=123)):
+    with self.assertRaisesRegex(SecurityError,"meaningful LIVE base balance"):
+     service.finalize_live_risk_epoch(operator_confirmed=True)
+
  def test_proposal_presentation_uses_canonical_mode_and_order_type(self):
   canonical={"mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"SOLUSDT",
              "quote_amount":"6","entry_reference":"102.02000000","stop_reference":"101.35000000",

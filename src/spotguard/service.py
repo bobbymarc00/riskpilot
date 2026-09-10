@@ -2896,11 +2896,33 @@ class SpotGuard:
             if residual <= 0:
                 continue
             filters = validate_spot_symbol(self.settings, symbol, live=True)
-            balance_state = classify_spot_base_balance(residual, filters, None)
+            rounded = floor_to_step(residual, Decimal(str(filters["market_step_size"])))
+            reference_price = None
+            observed_at = None
+            if rounded >= Decimal(str(filters["market_min_qty"])):
+                if self.live_executor.rate_limit_status().get("status") == "BLOCKED":
+                    return {"status": "RATE_LIMIT_BLOCKED", "blocked_until": self.live_executor.rate_limit_status().get("blocked_until")}
+                # This is the only current-price read for this symbol.  Its
+                # exact-symbol validation and fresh timestamp are retained as
+                # provenance for the dust decision.
+                snapshot = fetch_spot_snapshot(self.settings, symbol)
+                if snapshot.symbol != symbol or snapshot.bid <= 0 or not snapshot.bid.is_finite():
+                    raise SecurityError("verified Spot reference price is invalid")
+                reference_price = snapshot.bid
+                observed_at = snapshot.observed_at_ms
+            balance_state = classify_spot_base_balance(residual, filters, reference_price)
             if balance_state["tradable"]:
                 raise SecurityError(f"meaningful LIVE base balance remains for {symbol}; finalization refused")
             dust_balances.append({"symbol": symbol, "asset": base, "quantity": format(residual, "f"),
-                                  "minimum_quantity": balance_state["minimum_quantity"]})
+                                  "classification": balance_state["classification"],
+                                  "reference_price_used": format(reference_price, "f") if reference_price is not None else None,
+                                  "price_observed_at_ms": observed_at,
+                                  "minimum_quantity": balance_state.get("minimum_quantity"),
+                                  "minimum_notional": balance_state.get("minimum_notional"),
+                                  "classification_reason": (
+                                      "below_exchange_minimum_quantity" if rounded < Decimal(str(filters["market_min_qty"]))
+                                      else "below_exchange_minimum_notional" if balance_state["classification"] == "EXCHANGE_DUST"
+                                      else "valid_exchange_sell_quantity_and_notional")})
         finalized = {**dict(epoch), "status": "CLOSED_INCOMPLETE", "finalized_at": isoformat(),
                      "previous_status": epoch.get("status"),
                      "finalization_reason": "LEGACY_FLAT_EPOCH_MISSING_FILL_PROVENANCE",
