@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fixed deterministic LIVE approval/rejection presentation so native LIVE actions can no longer fall through to PAPER wording.
+- Full protected exits (`remaining_quantity = 0`) are now labeled as FULL EXIT; partial exits retain PARTIAL EXIT wording.
+- LIVE protected entries now use an exchange-aligned marketable BUY LIMIT with a configurable hard slippage cap (`live.entry_slippage_cap_pct`, default `0.20`).
+- LIVE OTOCO writes request `newOrderRespType=FULL` so immediate fill/commission evidence can be captured from the initial Binance response when available.
+- Fresh ask prices above the immutable cap are rejected before any LIVE write; verified BUY fill evidence above the approved cap is rejected into reconciliation.
+
 ## 1.0.3 — 2026-09-10
 
 - Stabilized the Risk Policy v2 offline demo and exchangeInfo test fixtures.

@@ -135,6 +135,21 @@ class LiveSafetyTests(unittest.TestCase):
   proposal={"mode":"paper","id":"p-paper-1"}
   self.assertIn("PAPER proposal created",render({"proposal":proposal},"en","paper-buy"))
 
+ def test_live_approval_presentation_never_uses_paper_wording(self):
+  result={"mode":"live","status":"EXECUTED","canonical":{"mode":"live","source":"manual-live","symbol":"BTCUSDT","side":"BUY"}}
+  text=render(result,"en","approve_live_button")
+  self.assertEqual(text,"LIVE approval executed successfully.")
+  self.assertNotIn("PAPER",text)
+  self.assertEqual(render(result,"en","reject_live_button"),"LIVE proposal rejected.")
+
+ def test_live_exit_presentation_distinguishes_partial_and_full(self):
+  base={"mode":"live","status":"EXECUTED","canonical":{"mode":"live","source":"manual-live-partial-exit","symbol":"PEOPLEUSDT","side":"SELL","order_type":"PARTIAL_EXIT"}}
+  partial={**base,"canonical":{**base["canonical"],"remaining_quantity":"351.7","sell_quantity":"287.7","percentage":"45"}}
+  full={**base,"canonical":{**base["canonical"],"remaining_quantity":"0","sell_quantity":"351.7","percentage":"100"}}
+  self.assertEqual(render(partial,"en","approve_live_button"),"LIVE partial exit executed successfully.")
+  self.assertEqual(render(full,"en","approve_live_button"),"LIVE full exit executed successfully.")
+  self.assertEqual(render(full,"id","approve_live_button"),"Full exit LIVE berhasil dieksekusi.")
+
  def test_execution_discovery_reuses_wrapper_and_trade_catalog(self):
   with tempfile.TemporaryDirectory() as d:
    adapter=LiveExecutionAdapter(configured(Path(d),enabled=True))
@@ -702,7 +717,7 @@ class LiveSafetyTests(unittest.TestCase):
    self.assertEqual(s.live.max_quote_per_entry_usdt,Decimal("100")); self.assertEqual(s.live.max_active_tranches,10); self.assertEqual(s.live.max_economic_positions,5)
    self.assertEqual(s.live.max_open_exposure_usdt,Decimal("500")); self.assertEqual(s.live.min_free_reserve_usdt,Decimal("8"))
    self.assertEqual(s.live.max_risk_per_position_usdt,Decimal("2")); self.assertEqual(s.live.max_aggregate_risk_usdt,Decimal("4"))
-   self.assertEqual(s.live.daily_realized_loss_cap_usdt,Decimal("5")); self.assertEqual(s.live.max_successful_entries_per_utc_day,10); self.assertEqual(s.scheduled_proposal_mode,"paper")
+   self.assertEqual(s.live.daily_realized_loss_cap_usdt,Decimal("5")); self.assertEqual(s.live.max_successful_entries_per_utc_day,10); self.assertEqual(s.live.entry_slippage_cap_pct,Decimal("0.2")); self.assertEqual(s.scheduled_proposal_mode,"paper")
 
  def test_status_distinguishes_default_order_size_from_entry_maxima(self):
   with tempfile.TemporaryDirectory() as d:
@@ -784,8 +799,38 @@ class LiveSafetyTests(unittest.TestCase):
    service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={})
    proposal=service.create_manual_buy_proposal("BTC",Decimal("6"),live=True)["proposal"]
    self.assertEqual(proposal["mode"],"live"); self.assertEqual(proposal["order_type"],"LIMIT"); self.assertEqual(proposal["status"],"PENDING")
+   self.assertEqual(proposal["canonical"]["entry_market_ask"],"100")
+   self.assertEqual(proposal["canonical"]["entry_slippage_cap_pct"],"0.2")
+   self.assertEqual(Decimal(proposal["canonical"]["entry_limit_price"]),Decimal("100.2"))
+   self.assertEqual(proposal["canonical"]["entry_execution_style"],"MARKETABLE_LIMIT_HARD_CAP")
    self.assertIsNone(proposal["execution_status"])
    with self.assertRaises(SecurityError): service.execute_paper(proposal["id"],"invalid")
+
+ def test_live_revalidation_blocks_fresh_ask_above_immutable_slippage_cap_before_write(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service._validate_stored_policy_snapshot=Mock()
+   service._validate_live_entry_limits=Mock(side_effect=AssertionError("must block before live risk/account reads"))
+   proposal={"id":"p-1234567890ab","mode":"live","symbol":"BTCUSDT","canonical":{
+    "mode":"live","product":"SPOT","side":"BUY","order_type":"LIMIT","symbol":"BTCUSDT",
+    "quote_amount":"6","quantity":"0.059","risk_at_stop":"0.12","entry_limit_price":"100.20",
+    "entry_slippage_cap_price":"100.20","stop_reference":"98.20","take_profit_reference":"104.20"}}
+   fresh=SpotMarketSnapshot("BTCUSDT",Decimal("100.19"),Decimal("100.21"),Decimal("100.20"),Decimal("5"),Decimal("0.001"),"TRADING",2)
+   with patch("spotguard.service.fetch_spot_snapshot",return_value=fresh):
+    with self.assertRaisesRegex(Exception,"SLIPPAGE_CAP_EXCEEDED"):
+     service._revalidate_live_buy_entry(proposal)
+   service._validate_live_entry_limits.assert_not_called()
+
+ def test_verified_live_fill_rejects_price_above_approved_hard_cap(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   proposal={"id":"p-1234567890ab","mode":"live","symbol":"BTCUSDT","side":"BUY","canonical":{
+    "entry_limit_price":"100.20","entry_slippage_cap_price":"100.20"}}
+   response={"orderListId":246,"orderReports":[{
+    "orderId":135,"side":"BUY","status":"FILLED","executedQty":"0.003",
+    "cummulativeQuoteQty":"0.30063","fills":[{
+     "price":"100.21","qty":"0.003","commission":"0.0003","commissionAsset":"USDT"}]}]}
+   self.assertIsNone(service._verified_live_fill(proposal,response,246))
 
  def test_adapter_is_immutable_and_only_builds_protected_otoco(self):
   with tempfile.TemporaryDirectory() as d:
@@ -802,6 +847,7 @@ class LiveSafetyTests(unittest.TestCase):
    for delegated in adapter._ALLOWED_WRITE_TOOLS:
     adapter.validate_delegated_write_tool(delegated)
    self.assertEqual(request["arguments"]["workingSide"],"BUY")
+   self.assertEqual(request["arguments"]["newOrderRespType"],"FULL")
    self.assertEqual(request["arguments"]["pendingSide"],"SELL")
    self.assertEqual(request["arguments"]["pendingBelowStopPrice"],98.0)
    self.assertEqual(request["arguments"]["pendingBelowPrice"],Decimal("97.90"))
@@ -877,8 +923,11 @@ class LiveSafetyTests(unittest.TestCase):
    service=SpotGuard(configured(Path(d),enabled=True))
    service.live_executor.read_spot_account=Mock(return_value={"balances":[{"asset":"USDT","free":"1000","locked":"0"},{"asset":"BTC","free":"0.1","locked":"0"}]})
    service.live_executor.read_open_spot_orders=Mock(return_value=[])
-   with self.assertRaisesRegex(SecurityError,"not fully protected"):
-    service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
+   filters={"status":"TRADING","market_step_size":"0.001","market_min_qty":"0.001","min_notional":"5"}
+   with patch("spotguard.service.validate_spot_symbol",return_value=filters), \
+        patch("spotguard.service.fetch_spot_snapshot",return_value=MARKET):
+    with self.assertRaisesRegex(SecurityError,"not fully protected"):
+     service._validate_live_entry_limits("BTCUSDT",Decimal("6"),Decimal("0.06"),Decimal("1"),Decimal("100"))
 
  def test_live_session_accounting_uses_fifo_and_verified_fees(self):
   with tempfile.TemporaryDirectory() as d:
@@ -919,7 +968,11 @@ class LiveSafetyTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True,scheduled="live")); service.live_status=Mock(return_value={"execution_ready":True}); service._validate_live_entry_limits=Mock(return_value={"live_risk_snapshot_verified":True,"projected_free_balance":"994","projected_total_exposure":"6","projected_aggregate_risk":"1","live_entries_today":0,"live_daily_realized_loss":"0","live_weekly_realized_loss":"0","active_live_tranches":0,"active_live_economic_positions":0})
    candidate=service.scan(symbols=["BTCUSDT"],synthetic=True)["results"][0]["candidate"]
-   result=service.create_proposal(candidate["id"],Decimal(str(candidate["price"]))*Decimal("0.999"),Decimal(str(candidate["price"])),Decimal("6"),"scheduled")
+   candidate_price=Decimal(str(candidate["price"]))
+   # Keep the exchange snapshot consistent with the scheduled signal. The
+   # marketable-LIMIT patch must not silently rebase a stale technical stop.
+   market.return_value=MARKET.__class__("BTCUSDT",candidate_price*Decimal("0.999"),candidate_price,candidate_price,Decimal("5"),Decimal("0.001"),"TRADING",1,Decimal("0.00000001"))
+   result=service.create_proposal(candidate["id"],candidate_price*Decimal("0.999"),candidate_price,Decimal("6"),"scheduled")
    self.assertEqual(result["proposal"]["mode"],"live"); self.assertEqual(result["proposal"]["status"],"PENDING"); self.assertIsNone(result["proposal"]["execution_status"])
    canonical=result["proposal"]["canonical"]
    self.assertIn("quantity",canonical); self.assertIn("pending_quantity",canonical)

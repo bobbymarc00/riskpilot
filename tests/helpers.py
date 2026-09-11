@@ -74,7 +74,7 @@ def config_dict(root: Path, mode: str = "paper") -> dict:
             "allow_transfer": False,
         },
         "paper": {"initial_balance_usdt": 1000, "max_quote_per_entry_usdt": 100, "max_active_tranches": 10, "max_economic_positions": 5, "max_open_exposure_usdt": 500, "max_successful_entries_per_utc_day": 10, "max_risk_per_position_usdt": 2, "max_aggregate_risk_usdt": 4, "daily_realized_loss_cap_usdt": 5, "close_proposal_ttl_seconds": 300, "slippage_pct": 0.05},
-        "live": {"enabled": False, "armed": False, "max_quote_per_entry_usdt": 100, "max_active_tranches": 10, "max_economic_positions": 5, "max_open_exposure_usdt": 500, "min_free_reserve_usdt": 8, "max_risk_per_position_usdt": 2, "max_aggregate_risk_usdt": 4, "max_successful_entries_per_utc_day": 10, "max_pending_proposals": 1, "approval_ttl_seconds": 60, "daily_realized_loss_cap_usdt": 5, "weekly_loss_cap_usdt": 20, "protective_orders_available": False},
+        "live": {"enabled": False, "armed": False, "max_quote_per_entry_usdt": 100, "max_active_tranches": 10, "max_economic_positions": 5, "max_open_exposure_usdt": 500, "min_free_reserve_usdt": 8, "max_risk_per_position_usdt": 2, "max_aggregate_risk_usdt": 4, "max_successful_entries_per_utc_day": 10, "max_pending_proposals": 1, "approval_ttl_seconds": 60, "daily_realized_loss_cap_usdt": 5, "weekly_loss_cap_usdt": 20, "protective_orders_available": False, "entry_slippage_cap_pct": 0.20},
     }
 
 

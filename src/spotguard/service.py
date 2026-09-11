@@ -1422,7 +1422,17 @@ class SpotGuard:
             ceiling is not None and quote_amount > ceiling
         ):
             raise PolicyError("LIVE quote amount exceeds the applicable entry limit")
-        limit_price = floor_to_step(Decimal(values["entry_reference"]), market.price_tick_size)
+        market_ask = Decimal(str(market.ask))
+        slippage_cap_pct = self.settings.live.entry_slippage_cap_pct
+        theoretical_cap = market_ask * (Decimal("1") + slippage_cap_pct / Decimal("100"))
+        # Floor, never ceil: the exchange-aligned LIMIT must never exceed the
+        # configured percentage cap. A BUY LIMIT at/above the observed ask is
+        # marketable while still bounding the worst executable price.
+        limit_price = floor_to_step(theoretical_cap, market.price_tick_size)
+        if limit_price < market_ask:
+            raise PolicyError(
+                "LIVE slippage cap is too tight for the exchange tick; create a new proposal"
+            )
         stop_price = floor_to_step(Decimal(values["stop_reference"]), market.price_tick_size)
         reward_risk = Decimal(values["reward_risk"])
         target_price = limit_price + reward_risk * (limit_price - stop_price)
@@ -1463,6 +1473,10 @@ class SpotGuard:
         values.update({"entry_reference": str(limit_price), "stop_reference": str(stop_price),
                        "take_profit_reference": str(target_price)})
         canonical.update({"entry_reference": str(limit_price), "entry_limit_price": str(limit_price),
+            "entry_market_ask": str(market_ask),
+            "entry_slippage_cap_pct": str(slippage_cap_pct),
+            "entry_slippage_cap_price": str(limit_price),
+            "entry_execution_style": "MARKETABLE_LIMIT_HARD_CAP",
             "stop_reference": str(stop_price), "take_profit_reference": str(target_price),
             "quantity": str(live_quantity), "pending_quantity": str(pending_quantity),
             "price_tick_size": str(market.price_tick_size), "market_step_size": str(market.step_size),
@@ -1489,6 +1503,10 @@ class SpotGuard:
             "strategy_or_signal_reference": canonical.get("candidate_id"),
             "source": canonical.get("source"),
             "entry_price": str(limit_price),
+            "market_ask_at_proposal": str(market_ask),
+            "entry_slippage_cap_pct": str(slippage_cap_pct),
+            "entry_slippage_cap_price": str(limit_price),
+            "entry_execution_style": "MARKETABLE_LIMIT_HARD_CAP",
             "stop_price": str(stop_price),
             "target_price": str(target_price),
             "stop_distance_pct": sizing_snapshot.get("stop_distance_pct"),
@@ -1762,6 +1780,14 @@ class SpotGuard:
         market = fetch_spot_snapshot(self.settings, proposal["symbol"])
         quantity = Decimal(str(canonical["quantity"]))
         entry = Decimal(str(canonical["entry_limit_price"]))
+        cap = Decimal(str(canonical.get("entry_slippage_cap_price", canonical["entry_limit_price"])))
+        if cap != entry:
+            raise SecurityError("LIVE BUY immutable slippage cap does not match entry LIMIT")
+        if market.ask > cap:
+            raise PolicyError(
+                "SLIPPAGE_CAP_EXCEEDED: fresh ask is above the approved marketable LIMIT; "
+                "no order was submitted, request a requote"
+            )
         stop = Decimal(str(canonical["stop_reference"]))
         target = Decimal(str(canonical["take_profit_reference"]))
         if (quantity <= 0 or quantity % market.step_size != 0
@@ -2789,6 +2815,27 @@ class SpotGuard:
                 return None
         if quantity <= 0 or price <= 0 or not quantity.is_finite() or not price.is_finite():
             return None
+        if proposal.get("side") == "BUY":
+            canonical = proposal.get("canonical", {})
+            cap_raw = canonical.get(
+                "entry_slippage_cap_price", canonical.get("entry_limit_price")
+            ) if isinstance(canonical, Mapping) else None
+            # Legacy reconciliation evidence predating the marketable-LIMIT patch
+            # has no immutable cap. Keep it reconcilable; every newly created LIVE
+            # BUY proposal carries the cap and is therefore enforced here.
+            if cap_raw is not None:
+                try:
+                    approved_cap = Decimal(str(cap_raw))
+                except (TypeError, ValueError, ArithmeticError):
+                    return None
+                if approved_cap <= 0 or not approved_cap.is_finite() or price > approved_cap:
+                    return None
+                if priced_fills:
+                    try:
+                        if any(Decimal(str(item["price"])) > approved_cap for item in fills):
+                            return None
+                    except (TypeError, ValueError, ArithmeticError):
+                        return None
         fees = fills if isinstance(fills, list) and fills else []
         if not fees and entry.get("commission") is not None:
             fees = [{"commission": entry.get("commission"), "commission_asset": entry.get("commissionAsset")}]
@@ -3354,6 +3401,7 @@ class SpotGuard:
             "riskpilot_session_accounting_verified": self._live_session_accounting()[0]
                 if isinstance(self._effective_live_risk_epoch(), Mapping) else False,
             "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
+            "entry_slippage_cap_pct": str(self.settings.live.entry_slippage_cap_pct),
             "max_active_tranches": self.settings.live.max_active_tranches,
             "max_economic_positions": self.settings.live.max_economic_positions,
             "max_open_exposure_usdt": str(self.settings.live.max_open_exposure_usdt),
@@ -4119,6 +4167,7 @@ class SpotGuard:
                 "live": {
                     "max_quote_per_entry_usdt": str(self.settings.live.max_quote_per_entry_usdt),
                     "max_open_exposure_usdt": str(self.settings.live.max_open_exposure_usdt),
+                    "entry_slippage_cap_pct": str(self.settings.live.entry_slippage_cap_pct),
                 },
             },
             "database": str(self.settings.database_path),

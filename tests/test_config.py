@@ -57,6 +57,17 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.live.min_free_reserve_usdt, Decimal("8"))
             self.assertEqual(json.loads(path.read_text())["risk"]["max_quote_per_trade"], 20.0)
 
+    def test_live_entry_slippage_cap_is_hard_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = config_dict(root)
+            path = root / "config.json"
+            for invalid in ("-0.01", "1.01"):
+                raw["live"]["entry_slippage_cap_pct"] = invalid
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaisesRegex(ConfigError, "live limits are invalid"):
+                    load_settings(path, create_state=False)
+
     def test_embedded_exchange_secret_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

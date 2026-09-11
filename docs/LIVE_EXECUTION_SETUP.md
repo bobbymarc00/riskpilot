@@ -60,6 +60,10 @@ A successful OAuth login alone is **not** execution readiness.
 
 Review RiskPilot's LIVE status and configured limits before any real-money use. LIVE still requires the dedicated profile, supported Binance Spot capabilities, local time-limited arm state, an immutable approved proposal, and owner confirmation.
 
+Protected BUY entries use a marketable `LIMIT`, not an unbounded `MARKET` order. At proposal creation RiskPilot snapshots the current ask and fixes the working LIMIT at no more than `live.entry_slippage_cap_pct` above that ask (default `0.20%`, exchange-tick aligned). Before the write, a fresh ask is read again. If it is already above the immutable approved LIMIT, execution fails closed with `SLIPPAGE_CAP_EXCEEDED` and requires a new proposal/requote.
+
+The protected OTOCO request asks for `newOrderRespType=FULL`. If Binance and the MCP transport return an immediately filled working order in the first response, RiskPilot records exchange-reported `executedQty`, weighted `fills[]`, `commission`, and `commissionAsset`. If fill provenance is incomplete or asynchronous, the existing reconciliation path remains authoritative; RiskPilot does not invent a fill or retry the write blindly.
+
 Do not fund or arm LIVE if the permission screen or readiness output is broader than expected.
 
 ## Current repository state

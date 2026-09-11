@@ -56,7 +56,7 @@ The current public implementation contains the authenticated LIVE transport and 
 
 - `src/spotguard/live_execution.py`
   - direct OAuth-authenticated Binance Agent OS/MCP `tools/call` transport;
-  - protected `spot.orderListOtoco` entry construction;
+  - protected `spot.orderListOtoco` entry construction with `newOrderRespType=FULL`;
   - exact protected-OCO cancellation;
   - approved `spot.newOrder` MARKET SELL exit;
   - SELL OCO protection restore;
@@ -64,6 +64,8 @@ The current public implementation contains the authenticated LIVE transport and 
   - response and protective-leg validation.
 - `src/spotguard/service.py`
   - immutable proposal/approval path;
+  - marketable BUY LIMIT pricing with an immutable ask-relative hard slippage cap and pre-write fresh-ask rejection;
+  - exchange fill/commission provenance capture and cap verification;
   - execution lease handling;
   - ambiguous write outcomes transition to `RECONCILE` instead of blind retry.
 - `tests/test_live_safety.py`

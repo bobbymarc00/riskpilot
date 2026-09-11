@@ -101,6 +101,7 @@
     "daily_realized_loss_cap_usdt": 5,
     "weekly_loss_cap_usdt": 20,
     "protective_orders_available": false,
+    "entry_slippage_cap_pct": 0.20,
     "armed": false
   },
   "security": {

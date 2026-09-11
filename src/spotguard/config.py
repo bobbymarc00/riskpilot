@@ -121,6 +121,7 @@ class LiveSettings:
     daily_realized_loss_cap_usdt: Decimal
     weekly_loss_cap_usdt: Decimal
     protective_orders_available: bool
+    entry_slippage_cap_pct: Decimal
 
     @property
     def max_live_trade_usdt(self) -> Decimal:
@@ -494,7 +495,8 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
         approval_ttl_seconds=int(live_raw.get("approval_ttl_seconds", 60)),
         daily_realized_loss_cap_usdt=Decimal(str(live_raw.get("daily_realized_loss_cap_usdt", live_raw.get("daily_loss_cap_usdt", "5")))),
         weekly_loss_cap_usdt=Decimal(str(live_raw.get("weekly_loss_cap_usdt", "20"))),
-        protective_orders_available=live_raw.get("protective_orders_available", False))
+        protective_orders_available=live_raw.get("protective_orders_available", False),
+        entry_slippage_cap_pct=Decimal(str(live_raw.get("entry_slippage_cap_pct", "0.20"))))
     if not isinstance(live.enabled, bool) or not isinstance(live.arm, bool):
         raise ConfigError("live.enabled and live.armed must be true or false")
     live_numbers = (live.max_quote_per_entry_usdt, live.max_open_exposure_usdt, live.min_free_reserve_usdt,
@@ -505,7 +507,10 @@ def load_settings(path: str | Path | None = None, create_state: bool = True) -> 
             or live.max_successful_entries_per_utc_day < 1 or live.max_pending_proposals < 1
             or live.max_open_exposure_usdt < live.max_quote_per_entry_usdt
             or live.max_aggregate_risk_usdt < live.max_risk_per_position_usdt
-            or live.weekly_loss_cap_usdt < live.daily_realized_loss_cap_usdt):
+            or live.weekly_loss_cap_usdt < live.daily_realized_loss_cap_usdt
+            or not live.entry_slippage_cap_pct.is_finite()
+            or live.entry_slippage_cap_pct < 0
+            or live.entry_slippage_cap_pct > Decimal("1.0")):
         raise ConfigError("live limits are invalid")
     if not 1 <= live.approval_ttl_seconds <= 180:
         raise ConfigError("live approval TTL must be no more than 180 seconds")

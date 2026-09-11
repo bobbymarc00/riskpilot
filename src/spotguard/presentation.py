@@ -225,6 +225,18 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
                  stop=compact_number(summary["stop_loss"], locale, 8),
                  target=compact_number(summary["take_profit"], locale, 8),
                  order_id=summary["paper_order_id"], position_id=summary["position_id"])
+    # LIVE approvals/rejections must never fall through to PAPER wording.
+    # The native live button wraps execute_live(), so classify the immutable
+    # proposal here and keep full protected exits distinct from partial exits.
+    if operation in {"approve_live_button", "execute_live"}:
+        proposal = result.get("proposal") if isinstance(result.get("proposal"), dict) else result
+        canonical = proposal.get("canonical", {}) if isinstance(proposal, dict) else {}
+        if canonical.get("source") == "manual-live-partial-exit":
+            remaining = Decimal(str(canonical.get("remaining_quantity", "0")))
+            return t("approval.live.full_exit" if remaining == 0 else "approval.live.partial_exit")
+        return t("approval.live.success")
+    if operation == "reject_live_button":
+        return t("approval.live.rejected")
     if "reject" in operation:
         return t("approval.paper.rejected")
     if "approve" in operation or operation == "execute_paper":

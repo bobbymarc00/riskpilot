@@ -488,7 +488,12 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
                  "origQty": "1", "stopPrice": "120"},
             ])
             service.live_executor.read_spot_trades = Mock(return_value=[])
-            with patch("spotguard.service.fetch_spot_snapshot", return_value=MARKET):
+            filters = {
+                "status": "TRADING", "market_step_size": "0.001",
+                "market_min_qty": "0.001", "min_notional": "5",
+            }
+            with patch("spotguard.service.fetch_spot_snapshot", return_value=MARKET), \
+                 patch("spotguard.service.validate_spot_symbol", return_value=filters):
                 result = service._validate_live_entry_limits(
                     "ETHUSDT", Decimal("6"), Decimal("0.06"),
                     Decimal("0.06"), Decimal("100"),

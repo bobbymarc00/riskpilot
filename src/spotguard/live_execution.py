@@ -79,7 +79,7 @@ class LiveExecutionAdapter:
         "open_orders": ("spot.getOpenOrders", {}),
     }
     _REQUIRED_WRITE_SCHEMAS = {
-        "spot.orderListOtoco": {"symbol", "workingType", "workingSide", "workingPrice", "workingQuantity", "workingTimeInForce", "workingClientOrderId", "pendingSide", "pendingQuantity", "pendingAboveType", "pendingAbovePrice", "pendingAboveStopPrice", "pendingAboveTimeInForce", "pendingAboveClientOrderId", "pendingBelowType", "pendingBelowStopPrice", "pendingBelowPrice", "pendingBelowTimeInForce", "pendingBelowClientOrderId", "listClientOrderId"},
+        "spot.orderListOtoco": {"symbol", "newOrderRespType", "workingType", "workingSide", "workingPrice", "workingQuantity", "workingTimeInForce", "workingClientOrderId", "pendingSide", "pendingQuantity", "pendingAboveType", "pendingAbovePrice", "pendingAboveStopPrice", "pendingAboveTimeInForce", "pendingAboveClientOrderId", "pendingBelowType", "pendingBelowStopPrice", "pendingBelowPrice", "pendingBelowTimeInForce", "pendingBelowClientOrderId", "listClientOrderId"},
         "spot.orderListOco": {"symbol", "side", "quantity", "aboveType", "abovePrice", "aboveStopPrice", "aboveTimeInForce", "aboveClientOrderId", "belowType", "belowStopPrice", "belowPrice", "belowTimeInForce", "belowClientOrderId", "listClientOrderId"},
         "spot.newOrder": {"symbol", "side", "type", "quantity", "newClientOrderId"},
         "spot.deleteOrder": {"symbol", "orderId", "newClientOrderId"},
@@ -221,7 +221,8 @@ class LiveExecutionAdapter:
         return {
             "toolName": self.delegated_tool_name,
             "arguments": {
-                "symbol": canonical["symbol"], "workingType": "LIMIT", "workingSide": "BUY",
+                "symbol": canonical["symbol"], "newOrderRespType": "FULL",
+                "workingType": "LIMIT", "workingSide": "BUY",
                 "workingPrice": entry, "workingQuantity": quantity,
                 "workingTimeInForce": "GTC", "workingClientOrderId": ids["working_client_order_id"],
                 "pendingSide": "SELL", "pendingQuantity": pending_quantity,
@@ -779,13 +780,13 @@ class LiveExecutionAdapter:
         if schema.get("additionalProperties") is True: return False
         expected_types = {"symbol":"string", "side":"string", "type":"string", "quantity":"number",
                           "price":"number", "stopPrice":"number", "timeInForce":"string",
-                          "newClientOrderId":"string", "orderId":"integer"}
+                          "newClientOrderId":"string", "orderId":"integer", "newOrderRespType":"string"}
         for field, field_type in expected_types.items():
             if field in expected and properties[field].get("type") != field_type: return False
         expected_values = {"side":{"SELL"}, "type":{"MARKET"}, "aboveType":{"TAKE_PROFIT_LIMIT"},
                            "belowType":{"STOP_LOSS_LIMIT"}, "pendingSide":{"SELL"},
                            "pendingAboveType":{"TAKE_PROFIT_LIMIT"}, "pendingBelowType":{"STOP_LOSS_LIMIT"},
-                           "workingSide":{"BUY"}, "workingType":{"LIMIT"}}
+                           "workingSide":{"BUY"}, "workingType":{"LIMIT"}, "newOrderRespType":{"FULL"}}
         for field, values in expected_values.items():
             if field not in expected: continue
             enum = properties[field].get("enum")
