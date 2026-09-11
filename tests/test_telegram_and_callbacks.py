@@ -32,16 +32,24 @@ class TelegramAndCallbackTests(unittest.TestCase):
             service = SpotGuard(settings)
             candidate = service.scan(symbols=["BTCUSDT"], synthetic=True)["results"][0]["candidate"]
             _, candidate_buttons = candidate_message(candidate)
-            self.assertEqual(
-                candidate_buttons[0]["command"],
-                f"/binance_spotguard review {candidate['id']}",
-            )
-            self.assertLessEqual(
-                len(("tgcmd:" + candidate_buttons[0]["command"]).encode()),
-                64,
-            )
-
-            self.assertNotIn("value", candidate_buttons[0])
+            self.assertEqual(candidate_buttons[0]["value"], f"riskpilot-review:{candidate['id']}")
+            self.assertLessEqual(len(candidate_buttons[0]["value"].encode()), 64)
+            self.assertNotIn("command", candidate_buttons[0])
+            value = candidate_buttons[0]["value"]
+            checksum = 2166136261
+            for char in value:
+                checksum ^= ord(char)
+                checksum = (checksum * 16777619) & 0xffffffff
+            digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+            base36 = "0" if checksum == 0 else ""
+            while checksum:
+                checksum, remainder = divmod(checksum, 36)
+                base36 = digits[remainder] + base36
+            encoded = f"tgcb1:{base36[:5].rjust(5, '0')}:{value}"
+            # OpenClaw 2026.8.1 wraps presentation callbacks with its opaque
+            # callback codec before Telegram receives callback_data.
+            self.assertLessEqual(len(encoded.encode()), 64)
+            self.assertTrue(encoded.startswith("tgcb1:"))
             result = service.create_proposal(
                 candidate["id"],
                 Decimal(str(candidate["price"])) * Decimal("0.999"),

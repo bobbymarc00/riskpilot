@@ -384,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_os_review.add_argument("--candidate", required=True, dest="candidate_id")
     agent_os_review.add_argument("--notify", action="store_true")
     agent_os_review.add_argument("--dry-run", action="store_true")
+    agent_os_review.add_argument("--dispatch-source", choices=("cli", "telegram_direct"), default="cli", help=argparse.SUPPRESS)
     agent_os_demo = agent_os_sub.add_parser(
         "demo", help="seed a paper candidate from a verified live Agent OS read"
     )
@@ -835,6 +836,7 @@ def _run(args: argparse.Namespace) -> Any:
                 args.candidate_id,
                 notify=args.notify,
                 dry_run=args.dry_run,
+                dispatch_source=args.dispatch_source,
             )
         if args.agent_os_command == "demo":
             return service.create_agent_os_demo_candidate(

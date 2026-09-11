@@ -2095,6 +2095,7 @@ class SpotGuard:
         candidate_id: str,
         notify: bool = False,
         dry_run: bool = False,
+        dispatch_source: str = "cli",
     ) -> dict[str, Any]:
         candidate = self.ledger.get_candidate(candidate_id)
         if candidate["status"] != "ACTIVE":
@@ -2157,6 +2158,7 @@ class SpotGuard:
             self.ledger.add_event("agent_os.ai_review", candidate_id, {
                 "symbol": candidate["symbol"], "decision": review["decision"],
                 "fresh_data_verified": True, "retry_used": retry_used,
+                "dispatch_source": dispatch_source, "reviewer_mode": "isolated",
                 "failure_category": None, "token_usage": review.get("token_usage"),
                 "input_tokens": (review.get("token_usage") or {}).get("input_tokens"),
                 "cached_input_tokens": (review.get("token_usage") or {}).get("cached_input_tokens"),
@@ -2173,6 +2175,7 @@ class SpotGuard:
             self.ledger.add_event("agent_os.ai_review", candidate_id, {
                 "symbol": candidate["symbol"], "decision": None,
                 "fresh_data_verified": False, "retry_used": retry_used,
+                "dispatch_source": dispatch_source, "reviewer_mode": "isolated",
                 "failure_category": category, "token_usage": None, "agent_latency_ms": None,
                 "input_prompt_tokens_estimate": None, "output_tokens": None,
                 "total_tokens": None, "tool_latency_ms": None,

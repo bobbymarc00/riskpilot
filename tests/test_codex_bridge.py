@@ -485,7 +485,9 @@ class CodexBridgeTests(unittest.TestCase):
                 "token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 "elapsed_ms": 10,
             })
-            reviewed = service.review_candidate_with_agent_os(candidate["id"], dry_run=True)
+            reviewed = service.review_candidate_with_agent_os(
+                candidate["id"], dry_run=True, dispatch_source="telegram_direct"
+            )
             self.assertEqual(reviewed["proposal"]["mode"], "paper")
             self.assertEqual(
                 reviewed["market_review"]["mcp_tool_calls"], ["tool_execute"]
@@ -495,6 +497,12 @@ class CodexBridgeTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM events WHERE kind IN ('agent_os.market_read', 'agent_os.ai_review')"
                 ).fetchone()[0]
             self.assertEqual(event_count, 2)
+            with service.ledger.connect() as connection:
+                event = connection.execute(
+                    "SELECT payload_json FROM events WHERE kind = 'agent_os.ai_review' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertIn('"dispatch_source":"telegram_direct"', event[0])
+            self.assertIn('"reviewer_mode":"isolated"', event[0])
 
     def test_ai_review_stale_mismatch_and_failure_remain_typed_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

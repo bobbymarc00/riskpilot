@@ -52,6 +52,8 @@ def candidate_message(candidate: dict[str, Any], locale: str = "en") -> tuple[st
                      identifier=candidate["id"])
     return text, [{
     "label": translate("button.review", locale),
+    # Presentation callbacks are dispatched by OpenClaw's native interactive
+    # handler.  Keep the candidate id as the only callback payload.
     "command": _command(f"/binance_spotguard review {candidate['id']}"),
     "style": "primary",
 }]
