@@ -50,8 +50,8 @@ Every 5 minutes
            hand only that candidate to the existing SpotGuard.scan() flow
                -> normal RiskPilot candidate notification
                -> native /binance_spotguard review CANDIDATE_ID button
-               -> fresh Agent OS review
-               -> approval-gated proposal in the configured scheduled mode
+               -> isolated AI REVIEW with a minimal candidate payload and fresh Agent OS spot.klines read
+               -> approval-gated proposal only after structured APPROVE
                -> PAPER remains simulated; LIVE remains disarmed and fail-closed
                   until its existing readiness/arm checks pass
 ```
@@ -85,6 +85,21 @@ the execution allowlist, or bypasses RiskPilot's fresh-price, approval,
 TP/SL, or risk validation. A candidate may also be withheld by the existing
 per-symbol cooldown/deduplication guard even when it has a qualifying scanner
 score.
+
+AI REVIEW is stateless and never reuses Telegram, Bob Agent, or a general
+assistant session. Its subprocess is ephemeral, uses the dedicated Agent OS
+profile, receives only candidate indicators/reasons/provenance and required
+risk facts, and has one read-only `spot.klines` tool available. Invalid/empty
+output, timeout, tool failure, stale or mismatched candles, and `REJECT`/
+`NO_TRADE` all fail closed. An empty final response may be retried once in a
+new ephemeral process; there is no full-session fallback. Review telemetry is
+stored as redacted local events (token estimates, latency, decision, failure
+category, and retry flag); secrets and raw prompts are excluded.
+
+The logged `operator.read`/system-presence warning is not part of the review
+contract. It belongs to an unrelated operator/dashboard capability check;
+`spot.klines` remains the sole required Agent OS read for this flow, so review
+does not broaden permissions to satisfy that warning.
 
 `scheduled_proposal_mode` controls whether a successfully reviewed scheduled
 candidate becomes a PAPER or LIVE proposal. It does not arm LIVE and it never

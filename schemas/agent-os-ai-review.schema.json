@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "decision": {"type": "string", "enum": ["APPROVE", "REJECT", "NO_TRADE"]},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+    "fresh_data_verified": {"type": "boolean"},
+    "symbol": {"type": "string", "pattern": "^[A-Z0-9]{5,20}$"},
+    "candidate_id": {"type": "string", "pattern": "^c-[A-Za-z0-9_-]{4,80}$"},
+    "interval": {"type": "string", "minLength": 2, "maxLength": 10},
+    "candles": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "open_time": {"type": "integer"}, "open": {"type": "string"},
+          "high": {"type": "string"}, "low": {"type": "string"},
+          "close": {"type": "string"}, "volume": {"type": "string"},
+          "close_time": {"type": "integer"}
+        },
+        "required": ["open_time", "open", "high", "low", "close", "volume", "close_time"]
+      }
+    }
+  },
+  "required": ["decision", "reason", "fresh_data_verified", "symbol", "candidate_id", "interval", "candles"]
+}

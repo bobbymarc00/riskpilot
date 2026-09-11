@@ -13,7 +13,7 @@ from pathlib import Path
 from spotguard.codex_bridge import CodexAgentOSBridge, CodexBridgeError, _safe_environment
 from spotguard.config import load_settings
 from spotguard.service import SpotGuard
-from spotguard.market import synthetic_bullish_klines
+from spotguard.market import Kline, synthetic_bullish_klines
 from spotguard.util import isoformat, utcnow
 
 from tests.helpers import config_dict
@@ -281,6 +281,62 @@ class CodexBridgeTests(unittest.TestCase):
             with self.assertRaises(CodexBridgeError):
                 bridge._verify_confirmation_events(stream, "BTCUSDT")
 
+    def test_confirmation_one_logical_call_allows_lifecycle_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed", "result": {"content": []}}
+            started = dict(item); started["status"] = "in_progress"
+            stream = "\n".join((json.dumps({"type": "item.started", "item": started}),
+                                  json.dumps({"type": "item.completed", "item": item}),
+                                  json.dumps({"type": "turn.completed"})))
+            evidence, _ = bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(evidence["arguments"]["limit"], 3)
+
+    def test_confirmation_duplicate_lifecycle_completion_same_id_is_deduped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed", "result": {"content": []}}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": item}),
+                                  json.dumps({"type": "item.completed", "item": dict(item)}),
+                                  json.dumps({"type": "turn.completed"})))
+            bridge._verify_confirmation_events(stream, "BTCUSDT")
+
+    def test_confirmation_two_distinct_calls_fail_with_cardinality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            def item(call_id: str) -> dict:
+                return {"id": call_id, "type": "mcp_tool_call", "server": "binance-marketdata",
+                        "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                        "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                        "status": "completed", "result": {}}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": item("call-1")}),
+                                  json.dumps({"type": "item.completed", "item": item("call-2")}),
+                                  json.dumps({"type": "turn.completed"})))
+            with self.assertRaisesRegex(CodexBridgeError, "logical MCP call") as raised:
+                bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(raised.exception.reason, "mcp_call_cardinality")
+
+    def test_confirmation_unrelated_mcp_call_fails_with_cardinality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            expected = {"toolName": "spot.klines", "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}}
+            first = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                     "tool": "tool_execute", "arguments": expected, "status": "completed"}
+            second = {"id": "call-2", "type": "mcp_tool_call", "server": "other-server",
+                      "tool": "tool_execute", "arguments": expected, "status": "completed"}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": first}),
+                                  json.dumps({"type": "item.completed", "item": second}),
+                                  json.dumps({"type": "turn.completed"})))
+            with self.assertRaises(CodexBridgeError) as raised:
+                bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(raised.exception.reason, "mcp_call_cardinality")
+
     def test_confirmation_payload_symbol_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bridge = CodexAgentOSBridge(self._settings(Path(directory)))
@@ -354,18 +410,57 @@ class CodexBridgeTests(unittest.TestCase):
             settings = self._settings(Path(directory))
             service = SpotGuard(settings)
             demo = service.create_agent_os_demo_candidate("BTCUSDT", dry_run=True)
-            reviewed = service.review_candidate_with_agent_os(
-                demo["candidate"]["id"], dry_run=True
-            )
+            candidate = demo["candidate"]
+            close = float(candidate["price"])
+            latest = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                            close - 1, close, 1, candidate["candle_close_time"])
+            previous = Kline(latest.open_time - 900000, close - 1, close, close - 2,
+                             close - 1, 1, latest.open_time - 1)
+            oldest = Kline(previous.open_time - 900000, close - 2, close - 1,
+                           close - 3, close - 2, 1, previous.open_time - 1)
+            service.agent_os.review_candidate = Mock(return_value={
+                "decision": "APPROVE", "reason": "fresh candidate data verified",
+                "fresh_data_verified": True, "symbol": "BTCUSDT", "candidate_id": candidate["id"],
+                "interval": "15m", "candle": latest, "candles": [oldest, previous, latest],
+                "mcp_tool_calls": ["tool_execute"],
+                "token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                "elapsed_ms": 10,
+            })
+            reviewed = service.review_candidate_with_agent_os(candidate["id"], dry_run=True)
             self.assertEqual(reviewed["proposal"]["mode"], "paper")
             self.assertEqual(
                 reviewed["market_review"]["mcp_tool_calls"], ["tool_execute"]
             )
             with service.ledger.connect() as connection:
                 event_count = connection.execute(
-                    "SELECT COUNT(*) FROM events WHERE kind='agent_os.market_read'"
+                    "SELECT COUNT(*) FROM events WHERE kind IN ('agent_os.market_read', 'agent_os.ai_review')"
                 ).fetchone()[0]
             self.assertEqual(event_count, 2)
+
+    def test_ai_review_stale_mismatch_and_failure_remain_typed_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SpotGuard(self._settings(Path(directory)))
+            candidate = service.create_demo_candidate("BTCUSDT", 60000)["candidate"]
+            close = float(candidate["price"])
+            valid = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                           close - 1, close, 1, candidate["candle_close_time"])
+            stale = Kline(valid.open_time - 900000, valid.open, valid.high, valid.low,
+                          valid.close, valid.volume, valid.close_time - 900000)
+            review = {"decision": "APPROVE", "reason": "fresh", "fresh_data_verified": True,
+                      "symbol": "BTCUSDT", "candidate_id": candidate["id"], "interval": "15m",
+                      "candle": stale, "token_usage": {}, "elapsed_ms": 1}
+            service.agent_os.review_candidate = Mock(return_value=review)
+            with self.assertRaises(CodexBridgeError) as stale:
+                service.review_candidate_with_agent_os(candidate["id"])
+            self.assertEqual(stale.exception.reason, "mismatched_candle")
+            self.assertNotIsInstance(stale.exception, NameError)
+            self.assertEqual(service.ledger.active_proposal_count_read_only(), 0)
+
+            service.agent_os.review_candidate = Mock(side_effect=CodexBridgeError("stale", "stale_market_data"))
+            with self.assertRaises(CodexBridgeError) as failed:
+                service.review_candidate_with_agent_os(candidate["id"])
+            self.assertEqual(failed.exception.reason, "stale_market_data")
+            self.assertNotIsInstance(failed.exception, NameError)
 
     def test_three_raw_candles_discards_forming_candle_and_uses_two_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

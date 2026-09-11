@@ -31,3 +31,15 @@ Manual analysis does not call proposal creation, reserve funds, expire proposals
 `tests/fixtures/scheduled_score_golden.json` records pre-refactor UP, DOWN, FLAT, exact-threshold, below-threshold, and tie expectations. `tests/test_score_engine_unification.py` proves those native scores, contributions, threshold results, classifications, and candidate decisions remain unchanged and that scheduler/analyze results match for the same candles.
 
 The unused `market.lookback` setting is a pre-existing configuration defect/ambiguity. It is documented but intentionally not corrected in this change because making it authoritative would alter scheduled scores.
+
+## Field provenance audit
+
+`market_signal_classification` is a separate direction label, derived only from
+the newest closed-candle close versus the immediately previous closed-candle
+close in `score_snapshot` (`UP`, `DOWN`, or `FLAT`). It is not a translation of
+the numeric score and does not participate in `candidate_eligibility`.
+Therefore `DOWN` alongside a high score and `candidate_eligible=true` is
+possible when the latest close is lower than the prior close while the
+EMA/RSI/momentum/volume components still pass. The scheduled score remains
+sourced from `score_engine.py`; scanner presentation must retain that
+provenance.

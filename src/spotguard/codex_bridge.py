@@ -25,6 +25,7 @@ class CodexBridgeError(RuntimeError):
 
 MAX_EVENT_BYTES = 2_000_000
 MAX_RESULT_BYTES = 32_000
+MAX_REVIEW_PROMPT_BYTES = 16_000
 PROBE_USABLE_TTL_SECONDS = 300
 FORBIDDEN_ITEM_TYPES = {"command_execution", "file_change", "web_search"}
 FORBIDDEN_TOOL_TERMS = {"account", "borrow", "cancel", "convert", "create", "futures",
@@ -490,6 +491,106 @@ class CodexAgentOSBridge:
             "token_usage": token_usage,
             "execution_mode": "paper"}
 
+    def review_candidate(self, review_input: dict[str, Any]) -> dict[str, Any]:
+        """Run the AI REVIEW in a new, stateless, read-only Codex process.
+
+        The caller supplies a deliberately small JSON object.  The subprocess
+        receives no Telegram/session transcript and its only permitted tool is
+        the single Binance ``spot.klines`` read.  A missing final message is a
+        distinct failure so the service can retry once with another ephemeral
+        process.
+        """
+        if not isinstance(review_input, dict):
+            raise CodexBridgeError("AI review input is malformed", "malformed_response")
+        prompt_data = json.dumps(review_input, ensure_ascii=True, separators=(",", ":"))
+        if len(prompt_data.encode("utf-8")) > MAX_REVIEW_PROMPT_BYTES:
+            raise CodexBridgeError("AI review input exceeded the safety limit", "malformed_response")
+        symbol = str(review_input.get("symbol", ""))
+        candidate_id = str(review_input.get("candidate_id", ""))
+        self._normalize_symbol(symbol)
+        if not candidate_id:
+            raise CodexBridgeError("AI review candidate id is missing", "malformed_response")
+        schema_path = _project_root() / "schemas" / "agent-os-ai-review.schema.json"
+        if (not self.settings.codex.read_only or not codex_available(self.settings)
+                or self.settings.codex.agent_os_home is None
+                or self.settings.codex.agent_os_workspace is None
+                or not schema_path.is_file()):
+            raise CodexBridgeError("isolated AI review is unavailable", "unavailable")
+        prompt = (
+            "You are an isolated RiskPilot AI REVIEW. No conversation history exists. "
+            "Review only the JSON candidate below. Use no memory, shell, files, web, or general tools. "
+            f"Use only {self.settings.codex.mcp_server}; call tool_execute exactly once with "
+            f"toolName spot.klines, symbol {symbol}, interval {self.settings.market.interval}, limit 3. "
+            "This is read-only. Never call account, order, trade, Futures, Margin, Convert, transfer, "
+            "wallet, payment, or withdrawal tools. Return only the schema. Verify the fresh closed candle "
+            "against the candidate's reference data. APPROVE only when the candidate data and fresh data "
+            "are coherent; otherwise REJECT or NO_TRADE. Do not create or suggest an order. Candidate JSON: "
+            + prompt_data
+        )
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="codex-review-", dir=self.settings.state_dir) as directory:
+            output_path = Path(directory) / "ai-review.json"
+            command = [self.settings.codex.command, *self._read_only_tool_approval_override(), "exec",
+                       "--ephemeral", "--skip-git-repo-check", "--json", "--sandbox", "read-only",
+                       "--output-schema", str(schema_path), "--output-last-message", str(output_path)]
+            if self.settings.codex.model:
+                command.extend(["--model", self.settings.codex.model])
+            command.append("-")
+            try:
+                result = subprocess.run(command, input=prompt, text=True, capture_output=True,
+                    timeout=self.settings.codex.timeout_seconds, check=False,
+                    cwd=str(self.settings.codex.agent_os_workspace), env=_safe_environment(self.settings))
+            except subprocess.TimeoutExpired as exc:
+                self._record_probe("timeout", "AI review timed out", reason="timeout",
+                                   **self._probe_execution(command, directory))
+                raise CodexBridgeError("AI review timed out", "timeout") from exc
+            except OSError as exc:
+                raise CodexBridgeError("AI review subprocess unavailable", "subprocess_error") from exc
+            if result.returncode != 0:
+                reason = self._classify_subprocess_error(result.stderr)
+                raise CodexBridgeError(f"AI review failed: {reason}", reason)
+            if len(result.stdout.encode("utf-8")) > MAX_EVENT_BYTES:
+                raise CodexBridgeError("AI review event stream exceeded the safety limit", "malformed_response")
+            tool_evidence, token_usage = self._verify_confirmation_events(result.stdout, symbol)
+            try:
+                result_size = output_path.stat().st_size
+            except FileNotFoundError as exc:
+                raise CodexBridgeError("AI review returned an empty final response", "empty_final") from exc
+            if result_size == 0:
+                raise CodexBridgeError("AI review returned an empty final response", "empty_final")
+            if result_size > MAX_RESULT_BYTES:
+                raise CodexBridgeError("AI review result exceeded the safety limit", "malformed_response")
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise CodexBridgeError("AI review result was not valid JSON", "invalid_json") from exc
+        required = {"decision", "reason", "fresh_data_verified", "symbol", "candidate_id", "interval", "candles"}
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise CodexBridgeError("AI review result has an invalid schema", "invalid_json")
+        if (payload["symbol"] != symbol or payload["candidate_id"] != candidate_id
+                or payload["interval"] != self.settings.market.interval
+                or payload["decision"] not in {"APPROVE", "REJECT", "NO_TRADE"}
+                or not isinstance(payload["fresh_data_verified"], bool)):
+            raise CodexBridgeError("AI review result does not match the request", "malformed_response")
+        if not payload["reason"] or len(str(payload["reason"])) > 300:
+            raise CodexBridgeError("AI review reason is invalid", "malformed_response")
+        observed_at_ms = int(time.time() * 1000)
+        candles, candle_meta = self._validate_confirmation_payload(
+            {"symbol": symbol, "interval": payload["interval"], "candles": payload["candles"]},
+            symbol, observed_at_ms)
+        usage = token_usage if token_usage is not None else 0
+        return {
+            "decision": payload["decision"], "reason": str(payload["reason"]),
+            "fresh_data_verified": payload["fresh_data_verified"], "symbol": symbol,
+            "candidate_id": candidate_id, "interval": payload["interval"],
+            "candle": candles[-1], "candles": candles, **candle_meta,
+            "mcp_server": self.settings.codex.mcp_server, "mcp_tool_call": tool_evidence,
+            "mcp_tool_calls": ["tool_execute"],
+            "token_usage": {"input_tokens": max(0, len(prompt.encode("utf-8")) // 4),
+                             "output_tokens": max(0, result_size // 4), "total_tokens": usage},
+            "elapsed_ms": int((time.monotonic() - started) * 1000), "execution_mode": "paper",
+        }
+
     def _validate_confirmation_payload(self, payload: Any, symbol: str,
                                        observed_at_ms: int | None = None) -> tuple[list[Kline], dict[str, Any]]:
         observed_at_ms = observed_at_ms if observed_at_ms is not None else int(time.time() * 1000)
@@ -535,8 +636,12 @@ class CodexAgentOSBridge:
         }
 
     def _verify_confirmation_events(self, stream: str, symbol: str) -> tuple[dict[str, Any], int | None]:
-        calls: list[dict[str, Any]] = []
-        seen_call_ids: set[str] = set()
+        # Codex emits multiple lifecycle records for one logical MCP call
+        # (for example item.started/item.completed).  Cardinality must be
+        # measured by stable invocation id, while duplicate lifecycle records
+        # must not hide a second distinct invocation.
+        logical_calls: dict[str, dict[str, Any]] = {}
+        completed_calls: dict[str, dict[str, Any]] = {}
         token_usage: int | None = None
         completed_turn = False
         for line in stream.splitlines():
@@ -563,14 +668,41 @@ class CodexAgentOSBridge:
             call_id = item.get("id")
             if not isinstance(call_id, str) or not call_id:
                 raise CodexBridgeError("Codex MCP call lacks an id", "malformed_response")
-            seen_call_ids.add(call_id)
+            prior = logical_calls.setdefault(call_id, {})
+            for field in ("server", "tool", "arguments"):
+                if field in item:
+                    if field in prior and prior[field] != item[field]:
+                        raise CodexBridgeError(
+                            "Agent OS MCP lifecycle records conflict for one call",
+                            "mcp_call_cardinality")
+                    prior[field] = item[field]
             if event.get("type") == "item.completed":
-                calls.append(item)
+                # A repeated identical completion is a lifecycle duplicate.
+                # A different completion for the same id is not a harmless
+                # duplicate and is rejected fail-closed.
+                completion_identity = {
+                    field: item.get(field)
+                    for field in ("server", "tool", "arguments", "status", "error")
+                }
+                previous = completed_calls.get(call_id)
+                if previous is not None:
+                    previous_identity = {
+                        field: previous.get(field)
+                        for field in ("server", "tool", "arguments", "status", "error")
+                    }
+                    if previous_identity != completion_identity:
+                        raise CodexBridgeError(
+                            "Agent OS MCP call has conflicting completion events",
+                            "mcp_call_cardinality")
+                else:
+                    completed_calls[call_id] = item
         if not completed_turn:
             raise CodexBridgeError("Agent OS confirmation has no completed turn", "malformed_response")
-        if len(seen_call_ids) != 1 or len(calls) != 1:
-            raise CodexBridgeError("Agent OS confirmation must complete exactly one MCP call")
-        item = calls[0]
+        if len(logical_calls) != 1 or len(completed_calls) != 1:
+            raise CodexBridgeError(
+                "Agent OS confirmation must complete exactly one logical MCP call",
+                "mcp_call_cardinality")
+        item = next(iter(completed_calls.values()))
         expected = {"toolName": "spot.klines",
             "arguments": {"symbol": symbol, "interval": self.settings.market.interval, "limit": 3}}
         if item.get("server") != self.settings.codex.mcp_server or item.get("tool") != "tool_execute":

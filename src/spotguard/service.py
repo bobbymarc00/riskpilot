@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from . import __version__
 from .presentation import detect_locale, error_text, localized, number, render, translate
-from .codex_bridge import CodexAgentOSBridge
+from .codex_bridge import CodexAgentOSBridge, CodexBridgeError
 from .config import Settings, openclaw_available
 from .db import Ledger, LedgerError
 from .indicators import analyze
@@ -828,7 +828,8 @@ class SpotGuard:
                 else:
                     selected = replace(selected, metrics={**selected.metrics,
                         "agent_os_confirmed": True,
-                        "agent_os_confirmation_open_time": klines[-1].open_time})
+                        "agent_os_confirmation_open_time": klines[-1].open_time,
+                        "prefilter_candle": klines[-1].to_dict()})
             else:
                 selected = replace(selected, metrics={**selected.metrics,
                     "paper_demo": True, "explicit_test_source": selected_record["source"]})
@@ -2098,18 +2099,96 @@ class SpotGuard:
         candidate = self.ledger.get_candidate(candidate_id)
         if candidate["status"] != "ACTIVE":
             raise SpotGuardError(f"candidate must be ACTIVE, not {candidate['status']}")
-        market_review = self.agent_os.review_market(candidate["symbol"])
-        self._record_agent_os_read(candidate_id, "candidate-review", market_review)
+        metrics = candidate.get("metrics") or {}
+        review_input = {
+            "candidate_id": candidate["id"], "symbol": candidate["symbol"],
+            "interval": candidate["interval"], "side": candidate["side"],
+            "scanner_score": candidate["score"], "scanner_reasons": candidate["reasons"],
+            "close_reference": str(candidate["price"]),
+            "ema_fast": str(metrics.get("ema_fast", "")),
+            "ema_slow": str(metrics.get("ema_slow", "")),
+            "rsi": str(metrics.get("rsi_14", "")), "atr": str(metrics.get("atr_14", "")),
+            "atr_pct": str(metrics.get("atr_pct", "")),
+            "momentum": str(metrics.get("momentum_3_pct", "")),
+            "volume_ratio": str(metrics.get("volume_ratio_20", "")),
+            "breakout": bool(metrics.get("breakout_20", False)),
+            "candidate_candle_close_time": candidate["candle_close_time"],
+            "reference_candle": metrics.get("prefilter_candle"),
+            "score_engine_version": metrics.get("score_engine_version", SCORE_ENGINE_VERSION),
+            "score_provenance": "Binance closed-candle prefilter",
+            "risk_policy_facts": {"mode": self.settings.scheduled_proposal_mode,
+                                   "min_reward_risk": str(self.settings.risk.min_reward_risk),
+                                   "max_stop_distance_pct": str(self.settings.risk.max_stop_distance_pct)},
+        }
+        review: dict[str, Any] | None = None
+        retry_used = False
+        try:
+            for attempt in range(2):
+                try:
+                    review = self.agent_os.review_candidate(review_input)
+                    break
+                except Exception as exc:
+                    if getattr(exc, "reason", None) == "empty_final" and attempt == 0:
+                        retry_used = True
+                        continue
+                    raise
+            if review is None:
+                raise SpotGuardError("AI review returned no decision")
+            actual = review["candle"]
+            if actual.close_time != candidate["candle_close_time"]:
+                raise CodexBridgeError("AI review fresh candle is stale or mismatched", "mismatched_candle")
+            expected_close = Decimal(str(candidate["price"]))
+            if Decimal(str(actual.close)) != expected_close:
+                raise CodexBridgeError("AI review fresh candle close mismatches candidate", "mismatched_candle")
+            reference = metrics.get("prefilter_candle")
+            if isinstance(reference, dict):
+                for field in ("open_time", "open", "high", "low", "close", "volume", "close_time"):
+                    if field not in reference:
+                        raise CodexBridgeError("AI review reference candle is incomplete", "mismatched_candle")
+                if actual.open_time != int(reference["open_time"]) or actual.close_time != int(reference["close_time"]):
+                    raise CodexBridgeError("AI review fresh candle timestamp mismatches scanner", "mismatched_candle")
+                for field, actual_value in (("open", actual.open), ("high", actual.high),
+                                            ("low", actual.low), ("close", actual.close),
+                                            ("volume", actual.volume)):
+                    if Decimal(str(actual_value)) != Decimal(str(reference[field])):
+                        raise CodexBridgeError("AI review fresh candle OHLCV mismatches scanner", "mismatched_candle")
+            if not review["fresh_data_verified"]:
+                raise CodexBridgeError("AI review did not verify fresh data", "stale_market_data")
+            self.ledger.add_event("agent_os.ai_review", candidate_id, {
+                "symbol": candidate["symbol"], "decision": review["decision"],
+                "fresh_data_verified": True, "retry_used": retry_used,
+                "failure_category": None, "token_usage": review.get("token_usage"),
+                "input_prompt_tokens_estimate": (review.get("token_usage") or {}).get("input_tokens"),
+                "output_tokens": (review.get("token_usage") or {}).get("output_tokens"),
+                "total_tokens": (review.get("token_usage") or {}).get("total_tokens"),
+                "agent_latency_ms": review.get("elapsed_ms"), "tool_latency_ms": review.get("elapsed_ms"),
+            })
+        except Exception as exc:
+            category = getattr(exc, "reason", None) or (
+                "timeout" if "timed out" in str(exc).lower() else
+                "mismatched_candle" if "mismatch" in str(exc).lower() else "review_failure")
+            self.ledger.add_event("agent_os.ai_review", candidate_id, {
+                "symbol": candidate["symbol"], "decision": None,
+                "fresh_data_verified": False, "retry_used": retry_used,
+                "failure_category": category, "token_usage": None, "agent_latency_ms": None,
+                "input_prompt_tokens_estimate": None, "output_tokens": None,
+                "total_tokens": None, "tool_latency_ms": None,
+            })
+            raise
+        assert review is not None
+        if review["decision"] != "APPROVE":
+            return {"market_review": review, "proposal": None,
+                    "review_decision": review["decision"], "retry_used": retry_used}
         proposal = self.create_proposal(
             candidate_id,
-            Decimal(market_review["best_bid"]),
-            Decimal(market_review["best_ask"]),
+            Decimal(str(actual.close)), Decimal(str(actual.close)),
             None,
-            market_review["review"],
+            review["reason"],
             notify=notify,
             dry_run=dry_run,
         )
-        return {"market_review": market_review, **proposal}
+        return {"market_review": review, "review_decision": review["decision"],
+                "retry_used": retry_used, **proposal}
 
     def _record_agent_os_read(
         self, entity_id: str, stage: str, market_review: dict[str, Any]
