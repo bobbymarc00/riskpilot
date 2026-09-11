@@ -1,7 +1,5 @@
 # Changelog
 
-# Changelog
-
 ## 1.0.4 — 2026-09-11
 
 - Added marketable LIMIT LIVE entries with a deterministic hard slippage cap.
