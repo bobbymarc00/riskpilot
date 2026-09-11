@@ -1,6 +1,6 @@
 # RiskPilot
 
-> **Binance Agent OS-powered Spot trading copilot with deterministic market scoring, deterministic risk controls, and human-approved live execution.**
+> **Binance Agent OS-powered Spot trading copilot with deterministic market scoring, deterministic risk controls, Smart Scanner discovery, and human-approved LIVE execution.**
 
 **Analyze → Rank → Risk-check → Propose → Approve → Execute → Protect → Exit**
 
@@ -10,6 +10,21 @@
 [Public LIVE evidence bridge](docs/LIVE_EVIDENCE.md)
 
 **Binance Agent OS Mini Hackathon — Track A**
+
+**Current repository release:** `v1.0.4`  
+**Hackathon submission snapshot:** `v1.0.1`
+
+### Hackathon submission snapshot
+
+The final pre-deadline release was **v1.0.1**, published on
+2026-09-08 at 22:37 UTC, before the official 23:59 UTC submission deadline.
+
+Later releases preserve the original tagged submission history while adding
+post-submission hardening, testing, and LIVE execution validation.
+
+The tagged submission snapshot remains separate from the current `main`
+branch. Post-deadline releases do not rewrite the original tagged submission
+history.
 
 ---
 
@@ -557,20 +572,34 @@ Natural-language intent alone cannot arm LIVE execution.
 
 ---
 
-## Scanner Status
+## Smart Scanner
 
-The Smart Scanner implementation is present in the repository and has
-offline/synthetic evaluation coverage. Its live timer/deployment state is not
-asserted here because it cannot be verified from the repository alone.
+RiskPilot v1.0.1 added a rate-limit-aware **Smart Scanner** for broader Binance
+Spot market discovery without expanding execution authority.
 
-When enabled, the intended workflow is:
+The default example scanner configuration uses:
 
 ```text
-Public Binance Spot data
+Pulse interval:           5 minutes
+Watchlist capacity:       64 symbols
+Minimum active set:       24 symbols
+Target active set:        36 symbols
+Maximum active set:       48 symbols
+Core slots:               8
+Momentum slots:           16
+Hype slots:               12
+```
+
+Its role is discovery and ranking:
+
+```text
+Binance public Spot data
         ↓
-Deterministic prefilter
+Smart Scanner
         ↓
-Top candidate
+Deterministic prefilter / ranking
+        ↓
+Configured-symbol boundary
         ↓
 Agent OS read-only confirmation
         ↓
@@ -579,8 +608,36 @@ Risk engine
 Proposal
 ```
 
-Manual analysis remains available separately.
+A wider scanner universe does **not** create wider LIVE authority.
 
+The public example execution allowlist remains:
+
+```text
+BTCUSDT
+ETHUSDT
+BNBUSDT
+SOLUSDT
+XRPUSDT
+```
+
+Symbols outside the configured execution set may appear in radar/discovery
+results, but they cannot automatically become LIVE orders.
+
+The scanner:
+
+* does not independently place trades;
+* does not arm LIVE;
+* does not bypass deterministic risk policy;
+* does not expand the execution allowlist;
+* does not bypass owner approval;
+* includes rate-pressure safety behavior;
+* keeps passive radar observations separate from financial execution.
+
+The repository includes the Smart Scanner implementation and offline/synthetic
+coverage. Whether its systemd timer is actually enabled on a deployment is a
+runtime property and is not asserted merely because the code exists in GitHub.
+
+Manual analysis remains available separately.
 ---
 
 ## Fail-Closed Design
@@ -771,24 +828,69 @@ LIVE execution remains gated by approval and local arm state.
 
 ## Quick Start
 
-### Requirements
+There are two recommended evaluation paths.
 
-* Linux / macOS environment
-* Bash
-* Python 3.10+
-* SQLite
-* OpenClaw for Telegram integration
-* Codex CLI for optional Agent OS integration
-* Binance Agent OS / MCP access for Agent OS workflows
+### A. Fast judge evaluation — no real funds required
 
-### Clone
+This is the safest way to inspect RiskPilot's deterministic behavior.
 
 ```bash
 git clone https://github.com/bobbymarc00/riskpilot.git
 cd riskpilot
+
+cp config.example.json config.json
+chmod 600 config.json
+
+./riskpilot --config config.json --json check
+./scripts/demo-track-a.sh
+./scripts/verify.sh
 ```
 
-### Create local configuration
+The offline demo and verification path do not require Binance financial-write
+permissions and do not place a real trade.
+
+See:
+
+* `docs/EVALUATION.md`
+* `docs/ARCHITECTURE.md`
+* `docs/SECURITY.md`
+* `docs/LIVE_EVIDENCE.md`
+
+---
+
+### B. Full OpenClaw + Telegram installation
+
+For the complete OpenClaw, Telegram, Smart Scanner, and LIVE workflow, clone the
+repository into the path expected by the Smart Scanner deployment scripts:
+
+```bash
+mkdir -p ~/.openclaw/workspace/tools
+
+git clone https://github.com/bobbymarc00/riskpilot.git \
+  ~/.openclaw/workspace/tools/spotguard-agent-os
+
+cd ~/.openclaw/workspace/tools/spotguard-agent-os
+```
+
+The persistent Smart Scanner installer intentionally expects:
+
+```text
+~/.openclaw/workspace/tools/spotguard-agent-os
+```
+
+### Requirements
+
+* Linux or macOS
+* Bash
+* Python 3.10+
+* SQLite
+* Git
+* OpenClaw for Telegram integration
+* Codex CLI for Agent OS integration
+* Binance Agent OS / MCP access for authenticated Agent OS workflows
+* systemd user services for the optional persistent Smart Scanner timer
+
+### 1. Create local configuration
 
 ```bash
 cp config.example.json config.json
@@ -797,20 +899,284 @@ chmod 600 config.json
 
 Do not commit `config.json`.
 
-### Validate configuration
+For Telegram use, configure the operator's own trusted identifiers in
+`config.json`, including:
+
+```json
+{
+  "telegram": {
+    "enabled": true,
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID"
+  },
+  "openclaw": {
+    "command": "openclaw",
+    "telegram_owner_id": "YOUR_TELEGRAM_OWNER_ID"
+  }
+}
+```
+
+Never commit Telegram bot tokens, OAuth credentials, Binance credentials, or
+private account data.
+
+Validate:
 
 ```bash
 ./riskpilot --config config.json --json check
 ```
 
-### Run the offline Track A demo
+### 2. Install the RiskPilot OpenClaw skill
 
 ```bash
-./scripts/demo-track-a.sh
+./scripts/install.sh
 ```
 
-The local demo uses isolated temporary state and does not require LIVE Binance execution.
+The installer:
 
+* validates the local RiskPilot configuration;
+* installs the reviewed `binance-spotguard` skill into OpenClaw;
+* preserves an existing `config.json`;
+* creates local `riskpilot` / `spotguard` command links when safe.
+
+Verify:
+
+```bash
+openclaw skills info binance-spotguard --json
+```
+
+### 3. Configure the read-only Agent OS market path
+
+```bash
+./scripts/configure-codex-agent-os.sh
+```
+
+Verify:
+
+```bash
+riskpilot --json agent-os status
+riskpilot --json agent-os market --symbol BTCUSDT
+```
+
+### 4. Telegram interaction
+
+Examples:
+
+```text
+check my balance and open position
+
+analyze XRP BNB SOL
+
+/spot radar
+
+paper buy 10 usd of XRP
+
+buy 10 usd of XRP
+
+sell XRP 47%
+
+sell all XRP
+
+restore TP SL XRP
+```
+
+A natural LIVE intent creates a protected **LIVE proposal**.
+
+It does **not** immediately place an order.
+
+LIVE execution still requires:
+
+```text
+local LIVE readiness
+        +
+time-limited local arm
+        +
+immutable proposal
+        +
+owner-bound APPROVE LIVE
+```
+
+Telegram cannot independently enable or arm LIVE mode.
+
+### 5. Install Smart Scanner
+
+Disable the legacy timer:
+
+```bash
+systemctl --user disable --now spotguard-monitor.timer 2>/dev/null || true
+```
+
+Create config:
+
+```bash
+cp -n smart-scanner.example.json smart-scanner.json
+chmod 600 smart-scanner.json
+```
+
+Test one cycle:
+
+```bash
+python3 scripts/riskpilot-smart-scanner.py \
+  --smart-config smart-scanner.json \
+  --json
+```
+
+Install timer:
+
+```bash
+chmod +x scripts/install-smart-scanner.sh
+./scripts/install-smart-scanner.sh
+```
+
+Verify:
+
+```bash
+systemctl --user status riskpilot-smart-scanner.timer --no-pager
+systemctl --user list-timers --all | grep -E 'riskpilot|spotguard'
+```
+
+Logs:
+
+```bash
+journalctl --user \
+  -u riskpilot-smart-scanner.service \
+  -n 80 \
+  --no-pager
+```
+
+The intended timer is:
+
+```text
+riskpilot-smart-scanner.timer
+```
+
+Do not run it simultaneously with:
+
+```text
+spotguard-monitor.timer
+```
+
+### 6. Prepare LIVE execution profile
+
+```bash
+./scripts/prepare-execution-profile.sh
+```
+
+This prepares:
+
+```text
+~/.codex-riskpilot-execution
+```
+
+Review:
+
+```text
+docs/LIVE_EXECUTION_SETUP.md
+docs/SECURITY.md
+docs/RISKPILOT_POLICY.md
+```
+
+### 7. Local LIVE activation
+
+```bash
+OWNER_ID="$(python3 -c 'import json; print(json.load(open("config.json"))["openclaw"]["telegram_owner_id"])')"
+```
+
+Set scheduled LIVE proposals:
+
+```bash
+./riskpilot --config config.json --json \
+  scheduled-mode set live \
+  --owner-id "$OWNER_ID"
+```
+
+Confirmation:
+
+```text
+SET SCHEDULED PROPOSAL MODE LIVE
+```
+
+Enable LIVE:
+
+```bash
+./riskpilot --config config.json --json \
+  live enable \
+  --owner-id "$OWNER_ID"
+```
+
+Confirmation:
+
+```text
+ENABLE RISK PILOT LIVE
+```
+
+Prepare fresh LIVE session:
+
+```bash
+./riskpilot --config config.json --json \
+  prepare-live-session \
+  --symbol SOLUSDT \
+  --owner-id "$OWNER_ID"
+```
+
+Confirmation:
+
+```text
+PREPARE RISKPILOT LIVE SESSION
+```
+
+Arm temporarily:
+
+```bash
+./riskpilot --config config.json --json \
+  live arm \
+  --minutes 60 \
+  --owner-id "$OWNER_ID"
+```
+
+Confirmation:
+
+```text
+ARM SPOT LIVE
+```
+
+Verify:
+
+```bash
+./riskpilot --config config.json --json live status
+```
+
+After arm expiry, RiskPilot fails closed until a fresh prepared session is
+validated and LIVE is armed again.
+
+### 8. Smart Scanner → LIVE proposal
+
+```text
+Smart Scanner
+    ↓
+Potential candidate
+    ↓
+Configured execution-symbol check
+    ↓
+AI REVIEW
+    ↓
+Agent OS confirmation
+    ↓
+Deterministic risk engine
+    ↓
+LIVE proposal
+    ↓
+Human APPROVE LIVE
+    ↓
+Protected execution
+```
+
+The scanner cannot bypass:
+
+* configured symbols;
+* deterministic risk limits;
+* LIVE readiness;
+* local arm;
+* immutable proposal state;
+* owner-bound approval.
 ---
 
 ## Reproducible Evaluation
@@ -1060,6 +1426,63 @@ https://x.com/bobbymarc00/status/2097039814482878806
 * fail-closed reconciliation behavior
 * automated test coverage
 
+---
+
+## Release History
+
+### v1.0.4 — 2026-09-11
+
+Post-submission LIVE execution validation and hardening.
+
+* Added marketable LIMIT LIVE entries with a deterministic hard slippage cap.
+* Added FULL Binance order-response handling for immediate fill and commission evidence.
+* Verified real-funds protected Spot entry and OTOCO lifecycle.
+* Verified LIVE partial exits at 20% and 45% of remaining protected quantity.
+* Verified automatic TP / SL re-arming after partial exits.
+* Verified protected full exit with no orphan Spot orders.
+* Fixed LIVE/PAPER approval presentation labels and full-exit presentation.
+* Preserved fail-closed readiness, risk, exposure, decimal transport, and human-approval controls.
+
+### v1.0.3 — 2026-09-10
+
+Post-submission test/runtime hardening.
+
+* Stabilized the Risk Policy v2 offline demo.
+* Stabilized exchange-info test fixtures.
+* Closed SQLite connections created by the ledger while preserving transactions.
+* Synchronized package/runtime version metadata.
+
+### v1.0.2 — 2026-09-10
+
+Post-submission LIVE lifecycle hardening.
+
+* Hardened fail-closed asynchronous execution handling.
+* Added execution reconciliation.
+* Added capability discovery.
+* Added `EXIT_ONLY` recovery safeguards.
+* Added durable execution evidence.
+* Prevented fabricated fills, fees, and realized PnL when fill provenance is unavailable.
+
+### v1.0.1 — 2026-09-08
+
+**Final pre-deadline hackathon release.**
+
+* Added Smart Scanner for broader Binance Spot market discovery and ranking.
+* Preserved the configured-symbol execution boundary.
+* Preserved human-approved LIVE workflow.
+* Added scanner safety controls.
+* Added scanner audit support.
+* Added offline scanner test coverage.
+
+### v1.0.0 — 2026-09-04
+
+* Established RiskPilot public branding while retaining required SpotGuard compatibility identifiers.
+* Added PAPER scale-in and aggregate partial-close controls.
+* Restored durable Telegram callback actions.
+* Tightened verified Agent OS market confirmation.
+* Kept the LIVE adapter dormant and fail-closed at that stage.
+
+For the complete release record, see [CHANGELOG.md](CHANGELOG.md).
 ---
 
 ## Disclaimer

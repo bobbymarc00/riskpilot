@@ -14,7 +14,17 @@ Codex CLI / Telegram
   -> EXECUTED or RECONCILE
 ```
 
-The scanner has no LIVE-order authority. It is currently disabled during public-REST rate-limit/IP-ban optimization; do not enable it as part of LIVE setup.
+The Smart Scanner has no LIVE-order authority and is not part of the LIVE
+readiness boundary. Current releases may deploy it separately through
+`scripts/install-smart-scanner.sh` after a safe manual test cycle.
+
+The Smart Scanner must not be treated as permission to trade: it cannot arm
+LIVE, bypass the configured-symbol boundary, bypass deterministic risk policy,
+or bypass owner approval.
+
+Do not run the current `riskpilot-smart-scanner.timer` simultaneously with the
+legacy `spotguard-monitor.timer`, because overlapping scheduled market requests
+would defeat the scanner's request-pressure controls.
 
 ## 1. Prepare the dedicated profile
 
