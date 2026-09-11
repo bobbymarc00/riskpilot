@@ -2158,8 +2158,11 @@ class SpotGuard:
                 "symbol": candidate["symbol"], "decision": review["decision"],
                 "fresh_data_verified": True, "retry_used": retry_used,
                 "failure_category": None, "token_usage": review.get("token_usage"),
-                "input_prompt_tokens_estimate": (review.get("token_usage") or {}).get("input_tokens"),
+                "input_tokens": (review.get("token_usage") or {}).get("input_tokens"),
+                "cached_input_tokens": (review.get("token_usage") or {}).get("cached_input_tokens"),
+                "input_prompt_tokens_estimate": (review.get("token_usage") or {}).get("prompt_tokens_estimate"),
                 "output_tokens": (review.get("token_usage") or {}).get("output_tokens"),
+                "output_tokens_estimate": (review.get("token_usage") or {}).get("output_tokens_estimate"),
                 "total_tokens": (review.get("token_usage") or {}).get("total_tokens"),
                 "agent_latency_ms": review.get("elapsed_ms"), "tool_latency_ms": review.get("elapsed_ms"),
             })

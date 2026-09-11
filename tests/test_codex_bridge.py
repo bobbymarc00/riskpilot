@@ -307,6 +307,65 @@ class CodexBridgeTests(unittest.TestCase):
                                   json.dumps({"type": "turn.completed"})))
             bridge._verify_confirmation_events(stream, "BTCUSDT")
 
+    def test_usage_is_provider_turn_total_and_not_lifecycle_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed", "result": {"content": []}}
+            usage = {"input_tokens": 47550, "cached_input_tokens": 30848, "output_tokens": 492}
+            stream = "\n".join((
+                json.dumps({"type": "item.started", "item": {**item, "status": "in_progress"}}),
+                json.dumps({"type": "item.completed", "item": item}),
+                json.dumps({"type": "turn.completed", "usage": usage}),
+            ))
+            _, parsed = bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(parsed["input_tokens"], 47550)
+            self.assertEqual(parsed["cached_input_tokens"], 30848)
+            self.assertEqual(parsed["output_tokens"], 492)
+            self.assertEqual(parsed["total_tokens"], 48042)
+            self.assertEqual(parsed["usage_source"], "codex.turn.completed")
+            self.assertIn("not summed", parsed["usage_semantics"])
+
+    def test_repeated_cumulative_usage_is_not_double_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed"}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": item}),
+                                  json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}}),
+                                  json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}})))
+            _, parsed = bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(parsed["total_tokens"], 110)
+
+    def test_missing_usage_is_explicitly_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed"}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": item}),
+                                  json.dumps({"type": "turn.completed"})))
+            _, parsed = bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertIsNone(parsed)
+
+    def test_malformed_usage_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = CodexAgentOSBridge(self._settings(Path(directory)))
+            item = {"id": "call-1", "type": "mcp_tool_call", "server": "binance-marketdata",
+                    "tool": "tool_execute", "arguments": {"toolName": "spot.klines",
+                    "arguments": {"symbol": "BTCUSDT", "interval": "15m", "limit": 3}},
+                    "status": "completed"}
+            stream = "\n".join((json.dumps({"type": "item.completed", "item": item}),
+                                  json.dumps({"type": "turn.completed", "usage": {"input_tokens": "100", "output_tokens": 10}})))
+            with self.assertRaisesRegex(CodexBridgeError, "usage fields") as raised:
+                bridge._verify_confirmation_events(stream, "BTCUSDT")
+            self.assertEqual(raised.exception.reason, "malformed_response")
+
     def test_confirmation_two_distinct_calls_fail_with_cardinality(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bridge = CodexAgentOSBridge(self._settings(Path(directory)))

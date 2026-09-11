@@ -488,7 +488,8 @@ class CodexAgentOSBridge:
             "observed_at": isoformat(),
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "mcp_server": self.settings.codex.mcp_server, "mcp_tool_call": tool_evidence,
-            "token_usage": token_usage,
+            "token_usage": token_usage["total_tokens"] if token_usage else None,
+            "provider_usage": token_usage,
             "execution_mode": "paper"}
 
     def review_candidate(self, review_input: dict[str, Any]) -> dict[str, Any]:
@@ -578,7 +579,7 @@ class CodexAgentOSBridge:
         candles, candle_meta = self._validate_confirmation_payload(
             {"symbol": symbol, "interval": payload["interval"], "candles": payload["candles"]},
             symbol, observed_at_ms)
-        usage = token_usage if token_usage is not None else 0
+        provider_usage = token_usage or {}
         return {
             "decision": payload["decision"], "reason": str(payload["reason"]),
             "fresh_data_verified": payload["fresh_data_verified"], "symbol": symbol,
@@ -586,8 +587,17 @@ class CodexAgentOSBridge:
             "candle": candles[-1], "candles": candles, **candle_meta,
             "mcp_server": self.settings.codex.mcp_server, "mcp_tool_call": tool_evidence,
             "mcp_tool_calls": ["tool_execute"],
-            "token_usage": {"input_tokens": max(0, len(prompt.encode("utf-8")) // 4),
-                             "output_tokens": max(0, result_size // 4), "total_tokens": usage},
+            "token_usage": {
+                "input_tokens": provider_usage.get("input_tokens"),
+                "cached_input_tokens": provider_usage.get("cached_input_tokens"),
+                "output_tokens": provider_usage.get("output_tokens"),
+                "total_tokens": provider_usage.get("total_tokens"),
+                "prompt_tokens_estimate": max(0, len(prompt.encode("utf-8")) // 4),
+                "output_tokens_estimate": max(0, result_size // 4),
+                "usage_source": provider_usage.get("usage_source", "codex.turn.completed"),
+                "usage_semantics": provider_usage.get(
+                    "usage_semantics", "single turn cumulative provider usage; lifecycle events are not summed"),
+            },
             "elapsed_ms": int((time.monotonic() - started) * 1000), "execution_mode": "paper",
         }
 
@@ -635,14 +645,14 @@ class CodexAgentOSBridge:
             "latest_closed_at": isoformat(datetime.fromtimestamp(candles[-1].close_time / 1000, timezone.utc)),
         }
 
-    def _verify_confirmation_events(self, stream: str, symbol: str) -> tuple[dict[str, Any], int | None]:
+    def _verify_confirmation_events(self, stream: str, symbol: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         # Codex emits multiple lifecycle records for one logical MCP call
         # (for example item.started/item.completed).  Cardinality must be
         # measured by stable invocation id, while duplicate lifecycle records
         # must not hide a second distinct invocation.
         logical_calls: dict[str, dict[str, Any]] = {}
         completed_calls: dict[str, dict[str, Any]] = {}
-        token_usage: int | None = None
+        token_usage: dict[str, Any] | None = None
         completed_turn = False
         for line in stream.splitlines():
             if not line.strip():
@@ -657,7 +667,24 @@ class CodexAgentOSBridge:
                 completed_turn = True
                 usage = event.get("usage")
                 if isinstance(usage, dict):
-                    token_usage = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                    input_tokens = usage.get("input_tokens")
+                    output_tokens = usage.get("output_tokens")
+                    cached_input_tokens = usage.get("cached_input_tokens", 0)
+                    if (not isinstance(input_tokens, int) or input_tokens < 0
+                            or not isinstance(output_tokens, int) or output_tokens < 0
+                            or not isinstance(cached_input_tokens, int) or cached_input_tokens < 0):
+                        raise CodexBridgeError("Codex usage fields were malformed", "malformed_response")
+                    reported_total = usage.get("total_tokens")
+                    if reported_total is not None and (not isinstance(reported_total, int) or reported_total < 0):
+                        raise CodexBridgeError("Codex total token usage was malformed", "malformed_response")
+                    token_usage = {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": reported_total if reported_total is not None else input_tokens + output_tokens,
+                        "usage_source": "codex.turn.completed",
+                        "usage_semantics": "last turn cumulative provider usage; lifecycle events are not summed",
+                    }
             item = event.get("item")
             if not isinstance(item, dict):
                 continue
