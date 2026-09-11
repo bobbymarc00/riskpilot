@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "riskpilot-agent-os"
-version = "1.0.3"
+version = "1.0.4"
 description = "Fail-closed Binance Agent OS Spot trading copilot with human-approved paper execution"
 readme = "README.md"
 requires-python = ">=3.10"
