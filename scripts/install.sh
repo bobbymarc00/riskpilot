@@ -5,6 +5,8 @@ spotguard_project_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 spotguard_workspace="${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}"
 spotguard_config="$spotguard_project_dir/config.json"
 spotguard_skill_source="$spotguard_project_dir/skills/binance-spotguard"
+spotguard_extension_source="$spotguard_project_dir/extensions/riskpilot-direct-review"
+spotguard_extension_target="$spotguard_workspace/.openclaw/extensions/riskpilot-direct-review"
 spotguard_bin_target="$HOME/.local/bin/spotguard"
 riskpilot_bin_target="$HOME/.local/bin/riskpilot"
 
@@ -36,6 +38,14 @@ fi
 (cd "$spotguard_workspace" && openclaw skills install --force "$spotguard_skill_source")
 openclaw skills info binance-spotguard --json >/dev/null
 
+# The deterministic Telegram extension is canonical in this repository.  Copy
+# only its reviewed runtime entrypoint and manifests; it has no dependencies,
+# state, credentials, or OpenClaw global configuration to install.
+mkdir -p "$spotguard_extension_target"
+install -m 0644 "$spotguard_extension_source/index.js" "$spotguard_extension_target/index.js"
+install -m 0644 "$spotguard_extension_source/openclaw.plugin.json" "$spotguard_extension_target/openclaw.plugin.json"
+install -m 0644 "$spotguard_extension_source/package.json" "$spotguard_extension_target/package.json"
+
 if [ -L "$riskpilot_bin_target" ]; then
   riskpilot_existing_bin="$(readlink -f "$riskpilot_bin_target")"
   if [ "$riskpilot_existing_bin" != "$spotguard_project_dir/riskpilot" ]; then
@@ -65,4 +75,5 @@ fi
 echo "RiskPilot installed in PAPER mode."
 echo "Config: $spotguard_config"
 echo "Skill:  $spotguard_workspace/skills/binance-spotguard (OpenClaw-managed local install)"
+echo "Extension: $spotguard_extension_target (restart or reload OpenClaw to activate)"
 echo "Next:   $spotguard_project_dir/scripts/configure-codex-agent-os.sh"

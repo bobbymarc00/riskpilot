@@ -214,7 +214,9 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
                 t(ANALYSIS_SCENARIO_KEYS[selected["signal"]], **scenario))
     if "close_proposal" in result:
         return t("proposal.close.created", identifier=result["close_proposal"]["id"])
-    summary = result.get("execution_summary") or result.get("proposal", {}).get("execution_summary")
+    proposal = result.get("proposal")
+    proposal = proposal if isinstance(proposal, dict) else {}
+    summary = result.get("execution_summary") or proposal.get("execution_summary")
     if isinstance(summary, dict) and summary.get("simulated"):
         return t("approval.paper.filled", symbol=summary["symbol"],
                  quantity=compact_number(summary["net_base_quantity"], locale, 8),
@@ -245,8 +247,18 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
             key = "position.close.full" if Decimal(str(close.get("requested_percentage", "100"))) == 100 else "position.close.partial"
             return t(key)
         return t("approval.paper.success")
-    if "proposal" in result:
-        proposal = result["proposal"]
+    if (result.get("proposal_status") == "SKIPPED_NOT_EXECUTION_READY"
+            and isinstance(result.get("market_review"), dict)):
+        review = result["market_review"]
+        blockers = result.get("proposal_blockers")
+        blocker_text = ", ".join(
+            str(item) for item in blockers if isinstance(item, str)
+        )[:300] if isinstance(blockers, list) else t("analysis.none")
+        return t("review.live_proposal_skipped",
+                 decision=result.get("review_decision", review.get("decision", "")),
+                 reason=analysis_reason(review.get("reason"), locale),
+                 blockers=blocker_text or t("analysis.none"))
+    if "proposal" in result and isinstance(proposal, dict):
         key = "proposal.live_buy.created" if proposal.get("mode") == "live" else "proposal.paper_buy.created"
         return t(key, identifier=proposal.get("id", ""))
     if "positions" in result or "free_usdt" in result or "balance" in result:

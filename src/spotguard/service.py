@@ -2182,19 +2182,75 @@ class SpotGuard:
             })
             raise
         assert review is not None
+        review_output = self._serialize_agent_os_review(review)
         if review["decision"] != "APPROVE":
-            return {"market_review": review, "proposal": None,
+            return {"market_review": review_output, "proposal": None,
                     "review_decision": review["decision"], "retry_used": retry_used}
-        proposal = self.create_proposal(
-            candidate_id,
-            Decimal(str(actual.close)), Decimal(str(actual.close)),
-            None,
-            review["reason"],
-            notify=notify,
-            dry_run=dry_run,
-        )
-        return {"market_review": review, "review_decision": review["decision"],
+        # A completed AI REVIEW is a read-only result.  LIVE proposal
+        # eligibility is deliberately a later, optional stage: an exchange
+        # capability change for this symbol must not discard the verified
+        # review or make the deterministic Telegram command appear to fail.
+        proposal_mode = self.settings.scheduled_proposal_mode
+        if proposal_mode == "live":
+            readiness = self.live_status(
+                check_symbols=True, symbols=[candidate["symbol"]]
+            )
+            if not readiness["execution_ready"]:
+                return self._skipped_live_proposal_result(review_output, retry_used, readiness)
+        try:
+            proposal = self.create_proposal(
+                candidate_id,
+                Decimal(str(actual.close)), Decimal(str(actual.close)),
+                None,
+                review["reason"],
+                notify=notify,
+                dry_run=dry_run,
+            )
+        except SecurityError as exc:
+            # Readiness may change between the preflight and proposal build.
+            # Only that known proposal-eligibility failure is non-fatal to a
+            # successfully completed read-only review.
+            if (proposal_mode == "live"
+                    and str(exc) == "scheduled LIVE proposal mode is not execution-ready"):
+                readiness = self.live_status(
+                    check_symbols=True, symbols=[candidate["symbol"]]
+                )
+                return self._skipped_live_proposal_result(review_output, retry_used, readiness)
+            raise
+        return {"market_review": review_output, "review_decision": review["decision"],
                 "retry_used": retry_used, **proposal}
+
+    @staticmethod
+    def _serialize_agent_os_review(review: dict[str, Any]) -> dict[str, Any]:
+        """Expose only JSON primitives from the Agent OS review boundary."""
+        def value(item: Any) -> Any:
+            if isinstance(item, Kline):
+                return item.to_dict()
+            if isinstance(item, list):
+                return [value(child) for child in item]
+            if isinstance(item, dict):
+                return {key: value(child) for key, child in item.items()}
+            return item
+        return value(review)
+
+    @staticmethod
+    def _skipped_live_proposal_result(
+        review: dict[str, Any], retry_used: bool, readiness: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return a successful review without weakening the LIVE gate."""
+        blockers = list(dict.fromkeys(
+            [str(item) for item in readiness.get("blockers", [])]
+            + [str(item) for item in readiness.get("readiness_reasons", [])]
+        ))
+        return {
+            "market_review": review,
+            "proposal": None,
+            "proposal_mode": "live",
+            "proposal_status": "SKIPPED_NOT_EXECUTION_READY",
+            "proposal_blockers": blockers or ["live_execution_not_ready"],
+            "review_decision": review["decision"],
+            "retry_used": retry_used,
+        }
 
     def _record_agent_os_read(
         self, entity_id: str, stage: str, market_review: dict[str, Any]

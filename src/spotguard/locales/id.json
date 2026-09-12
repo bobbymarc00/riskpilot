@@ -99,6 +99,7 @@
   "position.empty": "Tidak ada posisi PAPER terbuka.",
   "position.row": "{symbol} · TERBUKA\nJumlah bersih: {quantity}\nHarga masuk rata-rata tertimbang: {entry} USDT\nEksposur terkunci: {exposure} USDT\nBagian aktif: {tranches}\nBatas rugi: {stop} USDT\nTarget: {target} USDT\nRisiko terburuk pada batas rugi: {risk} USDT",
   "result.complete": "RiskPilot · Permintaan selesai.",
+  "review.live_proposal_skipped": "AI REVIEW RiskPilot selesai: {decision}.\n{reason}\nProposal LIVE tidak dibuat karena persyaratan kesiapan eksekusi belum terpenuhi. Pemblokir: {blockers}",
   "button.approve_paper": "SETUJUI PAPER",
   "button.reject_paper": "TOLAK PAPER",
   "button.approve_live": "SETUJUI LIVE",

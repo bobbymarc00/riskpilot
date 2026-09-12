@@ -32,24 +32,11 @@ class TelegramAndCallbackTests(unittest.TestCase):
             service = SpotGuard(settings)
             candidate = service.scan(symbols=["BTCUSDT"], synthetic=True)["results"][0]["candidate"]
             _, candidate_buttons = candidate_message(candidate)
-            self.assertEqual(candidate_buttons[0]["value"], f"riskpilot-review:{candidate['id']}")
-            self.assertLessEqual(len(candidate_buttons[0]["value"].encode()), 64)
-            self.assertNotIn("command", candidate_buttons[0])
-            value = candidate_buttons[0]["value"]
-            checksum = 2166136261
-            for char in value:
-                checksum ^= ord(char)
-                checksum = (checksum * 16777619) & 0xffffffff
-            digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-            base36 = "0" if checksum == 0 else ""
-            while checksum:
-                checksum, remainder = divmod(checksum, 36)
-                base36 = digits[remainder] + base36
-            encoded = f"tgcb1:{base36[:5].rjust(5, '0')}:{value}"
-            # OpenClaw 2026.8.1 wraps presentation callbacks with its opaque
-            # callback codec before Telegram receives callback_data.
-            self.assertLessEqual(len(encoded.encode()), 64)
-            self.assertTrue(encoded.startswith("tgcb1:"))
+            self.assertEqual(
+                candidate_buttons[0]["command"],
+                f"/binance_spotguard review {candidate['id']}",
+            )
+            self.assertLessEqual(len(("tgcmd:" + candidate_buttons[0]["command"]).encode()), 64)
             result = service.create_proposal(
                 candidate["id"],
                 Decimal(str(candidate["price"])) * Decimal("0.999"),
@@ -65,6 +52,19 @@ class TelegramAndCallbackTests(unittest.TestCase):
                 self.assertLessEqual(len(("tgcmd:" + button["command"]).encode()), 64)
             self.assertEqual(proposal_buttons[0]["command"],
                              f"/binance_spotguard paper-approve {proposal['id']} {code}")
+
+    def test_live_proposal_controls_are_exact_native_commands(self) -> None:
+        # Presentation construction only: no service approval or Binance write.
+        proposal = {
+            "id": "p-0123456789ab", "symbol": "BTCUSDT", "mode": "live", "expires_at": "2999-01-01T00:00:00Z",
+            "quote_amount": "10", "entry_reference": "100", "stop_reference": "95",
+            "take_profit_reference": "110", "reward_risk": "2",
+            "canonical": {"source": "manual-live-buy", "quote_amount": "10", "entry_reference": "100",
+                          "stop_reference": "95", "take_profit_reference": "110", "quote_asset": "USDT"},
+        }
+        _, buttons = proposal_message(proposal, "unused")
+        self.assertEqual(buttons[0]["command"], "/binance_spotguard live-approve p-0123456789ab")
+        self.assertEqual(buttons[1]["command"], "/binance_spotguard live-reject p-0123456789ab")
 
     def test_malformed_callback_is_rejected(self) -> None:
         with self.assertRaises(SecurityError):

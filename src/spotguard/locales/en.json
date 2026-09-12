@@ -99,6 +99,7 @@
   "position.empty": "No open PAPER positions.",
   "position.row": "{symbol} · OPEN\nNet quantity: {quantity}\nWeighted average entry: {entry} USDT\nLocked exposure: {exposure} USDT\nActive tranches: {tranches}\nStop loss: {stop} USDT\nTarget: {target} USDT\nWorst-case risk at stop: {risk} USDT",
   "result.complete": "RiskPilot · Request completed.",
+  "review.live_proposal_skipped": "RiskPilot AI REVIEW completed: {decision}.\n{reason}\nLIVE proposal was not created because execution readiness requirements were not met. Blockers: {blockers}",
   "button.approve_paper": "APPROVE PAPER",
   "button.reject_paper": "REJECT PAPER",
   "button.approve_live": "APPROVE LIVE",

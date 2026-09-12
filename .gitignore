@@ -134,3 +134,4 @@ release-export*/
 Thumbs.db
 .Spotlight-V100
 .Trashes
+.backups/

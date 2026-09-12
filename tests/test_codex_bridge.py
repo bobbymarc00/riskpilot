@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import timedelta
@@ -503,6 +505,80 @@ class CodexBridgeTests(unittest.TestCase):
                 ).fetchone()
             self.assertIn('"dispatch_source":"telegram_direct"', event[0])
             self.assertIn('"reviewer_mode":"isolated"', event[0])
+
+    def test_live_review_skips_proposal_when_symbol_is_not_execution_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(self._settings(Path(directory)), scheduled_proposal_mode="live")
+            service = SpotGuard(settings)
+            candidate = service.create_demo_candidate("BTCUSDT", 60000)["candidate"]
+            close = float(candidate["price"])
+            latest = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                            close - 1, close, 1, candidate["candle_close_time"])
+            service.agent_os.review_candidate = Mock(return_value={
+                "decision": "APPROVE", "reason": "fresh", "fresh_data_verified": True,
+                "symbol": "BTCUSDT", "candidate_id": candidate["id"], "interval": "15m",
+                "candle": latest, "candles": [latest], "token_usage": {}, "elapsed_ms": 1,
+            })
+            readiness = {"execution_ready": False,
+                         "blockers": ["symbol_protected_live_unsupported"],
+                         "readiness_reasons": ["symbol_protected_live_unsupported"]}
+            with patch.object(service, "live_status", return_value=readiness), patch.object(
+                service, "create_proposal", side_effect=AssertionError("must not create proposal")
+            ):
+                result = service.review_candidate_with_agent_os(candidate["id"])
+            self.assertEqual(result["proposal_status"], "SKIPPED_NOT_EXECUTION_READY")
+            self.assertEqual(result["proposal_mode"], "live")
+            self.assertIsNone(result["proposal"])
+            self.assertEqual(result["proposal_blockers"], ["symbol_protected_live_unsupported"])
+            self.assertEqual(service.ledger.active_proposal_count_read_only(), 0)
+
+    def test_live_review_creates_proposal_only_after_ready_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(self._settings(Path(directory)), scheduled_proposal_mode="live")
+            service = SpotGuard(settings)
+            candidate = service.create_demo_candidate("BTCUSDT", 60000)["candidate"]
+            close = float(candidate["price"])
+            latest = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                            close - 1, close, 1, candidate["candle_close_time"])
+            service.agent_os.review_candidate = Mock(return_value={
+                "decision": "APPROVE", "reason": "fresh", "fresh_data_verified": True,
+                "symbol": "BTCUSDT", "candidate_id": candidate["id"], "interval": "15m",
+                "candle": latest, "candles": [latest], "token_usage": {}, "elapsed_ms": 1,
+            })
+            proposal = {"id": "p-ready", "mode": "live", "status": "PENDING"}
+            with patch.object(service, "live_status", return_value={"execution_ready": True}), patch.object(
+                service, "create_proposal", return_value={"proposal": proposal, "notification": None}
+            ) as create:
+                result = service.review_candidate_with_agent_os(candidate["id"])
+            self.assertEqual(result["proposal"], proposal)
+            create.assert_called_once()
+
+    def test_ai_review_timeout_terminates_only_its_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = replace(self._settings(root), codex=replace(self._settings(root).codex, timeout_seconds=1))
+            bridge = CodexAgentOSBridge(settings)
+            marker = root / "orphan-marker"
+            launcher = root / "launcher.py"
+            launcher.write_text(
+                "import pathlib, subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', \"import pathlib,time; time.sleep(2); pathlib.Path(sys.argv[1]).write_text('orphan')\", sys.argv[1]])\n"
+                "time.sleep(30)\n", encoding="utf-8"
+            )
+            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    bridge._run_ai_review([sys.executable, str(launcher), str(marker)], "")
+                time.sleep(2.2)
+                self.assertFalse(marker.exists())
+                self.assertIsNone(unrelated.poll())
+                next_review = bridge._run_ai_review(
+                    [sys.executable, "-c", "print('next-review')"], ""
+                )
+                self.assertEqual(next_review.stdout.strip(), "next-review")
+            finally:
+                unrelated.terminate()
+                unrelated.wait(timeout=5)
 
     def test_ai_review_stale_mismatch_and_failure_remain_typed_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

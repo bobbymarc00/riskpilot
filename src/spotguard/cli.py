@@ -646,7 +646,7 @@ def _run(args: argparse.Namespace) -> Any:
     if args.command in {"paper-intent", "trade-intent"}:
         service._validate_owner(args.sender_id)
         if args.chat_id != service.settings.telegram.chat_id:
-            raise SecurityError("paper intent chat does not match")
+            raise SecurityError("trusted intent chat does not match the configured Telegram chat")
         args._locale = service.select_locale(args.text, args.locale)
         intent = (normalize_trade_intent if args.command == "trade-intent" else normalize_paper_intent)(
             args.text, service.settings.market.symbols, service.locale)

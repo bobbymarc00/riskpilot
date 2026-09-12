@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -27,6 +28,7 @@ MAX_EVENT_BYTES = 2_000_000
 MAX_RESULT_BYTES = 32_000
 MAX_REVIEW_PROMPT_BYTES = 16_000
 PROBE_USABLE_TTL_SECONDS = 300
+REVIEW_TERMINATION_GRACE_SECONDS = 3
 FORBIDDEN_ITEM_TYPES = {"command_execution", "file_change", "web_search"}
 FORBIDDEN_TOOL_TERMS = {"account", "borrow", "cancel", "convert", "create", "futures",
     "margin", "order", "payment", "place", "repay", "trade", "transfer", "wallet", "withdraw"}
@@ -232,6 +234,45 @@ class CodexAgentOSBridge:
             )
         except (OSError, subprocess.TimeoutExpired):
             return subprocess.CompletedProcess(arguments, 127, "", "")
+
+    def _run_ai_review(self, command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        """Run the isolated review in its own session and reap its whole tree.
+
+        ``subprocess.run(..., timeout=...)`` only terminates the direct Codex
+        wrapper.  Codex may have spawned its native child, so use a dedicated
+        process group that belongs to this review invocation alone.
+        """
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(self.settings.codex.agent_os_workspace),
+            env=_safe_environment(self.settings),
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(
+                input=prompt, timeout=self.settings.codex.timeout_seconds
+            )
+        except subprocess.TimeoutExpired as exc:
+            # This PID is the isolated session leader created above.  Never
+            # search for or signal other Codex instances.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=REVIEW_TERMINATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise exc
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def review_market(self, symbol: str) -> dict[str, Any]:
         # The generic ticker route is intentionally derived from the exact
@@ -538,9 +579,7 @@ class CodexAgentOSBridge:
                 command.extend(["--model", self.settings.codex.model])
             command.append("-")
             try:
-                result = subprocess.run(command, input=prompt, text=True, capture_output=True,
-                    timeout=self.settings.codex.timeout_seconds, check=False,
-                    cwd=str(self.settings.codex.agent_os_workspace), env=_safe_environment(self.settings))
+                result = self._run_ai_review(command, prompt)
             except subprocess.TimeoutExpired as exc:
                 self._record_probe("timeout", "AI review timed out", reason="timeout",
                                    **self._probe_execution(command, directory))

@@ -934,6 +934,7 @@ The installer:
 
 * validates the local RiskPilot configuration;
 * installs the reviewed `binance-spotguard` skill into OpenClaw;
+* installs the canonical `extensions/riskpilot-direct-review` deterministic Telegram extension into the local OpenClaw runtime extension directory;
 * preserves an existing `config.json`;
 * creates local `riskpilot` / `spotguard` command links when safe.
 
@@ -942,6 +943,11 @@ Verify:
 ```bash
 openclaw skills info binance-spotguard --json
 ```
+
+The extension source is versioned in this repository. To re-install it after
+updating a checkout, run `./scripts/install.sh`; then reload or restart the
+OpenClaw gateway using the operator's normal procedure. The installer copies
+only `index.js` and its two manifests—never credentials, state, or logs.
 
 ### 3. Configure the read-only Agent OS market path
 
