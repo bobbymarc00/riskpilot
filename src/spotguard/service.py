@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import re
 import secrets
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -2217,6 +2218,13 @@ class SpotGuard:
                 )
                 return self._skipped_live_proposal_result(review_output, retry_used, readiness)
             raise
+        except PolicyError as exc:
+            # The read-only review has already succeeded.  A proposal-stage
+            # policy rejection must remain fail-closed for entry creation,
+            # without relabelling the verified review itself as a failure.
+            return self._skipped_live_proposal_policy_result(
+                review_output, retry_used, exc
+            )
         return {"market_review": review_output, "review_decision": review["decision"],
                 "retry_used": retry_used, **proposal}
 
@@ -2238,9 +2246,15 @@ class SpotGuard:
         review: dict[str, Any], retry_used: bool, readiness: dict[str, Any]
     ) -> dict[str, Any]:
         """Return a successful review without weakening the LIVE gate."""
+        # `blockers` is the execution gate's authoritative, boolean-derived
+        # result. Probe reasons provide useful operator diagnostics, but must
+        # not be relabelled as failures that prevented a proposal.
         blockers = list(dict.fromkeys(
-            [str(item) for item in readiness.get("blockers", [])]
-            + [str(item) for item in readiness.get("readiness_reasons", [])]
+            str(item) for item in readiness.get("blockers", [])
+        ))
+        diagnostics = list(dict.fromkeys(
+            str(item) for item in readiness.get("readiness_reasons", [])
+            if str(item) not in blockers
         ))
         return {
             "market_review": review,
@@ -2248,6 +2262,26 @@ class SpotGuard:
             "proposal_mode": "live",
             "proposal_status": "SKIPPED_NOT_EXECUTION_READY",
             "proposal_blockers": blockers or ["live_execution_not_ready"],
+            "proposal_diagnostics": diagnostics,
+            "review_decision": review["decision"],
+            "retry_used": retry_used,
+        }
+
+    @staticmethod
+    def _skipped_live_proposal_policy_result(
+        review: dict[str, Any], retry_used: bool, error: PolicyError
+    ) -> dict[str, Any]:
+        """Preserve a completed AI review when entry policy rejects its proposal."""
+        detail = str(error)
+        code = detail.split(":", 1)[0].strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,79}", code):
+            code = "ENTRY_POLICY_REJECTED"
+        return {
+            "market_review": review,
+            "proposal": None,
+            "proposal_mode": "live",
+            "proposal_status": "SKIPPED_POLICY_REJECTED",
+            "proposal_policy_rejection": {"code": code},
             "review_decision": review["decision"],
             "retry_used": retry_used,
         }
@@ -2301,7 +2335,9 @@ class SpotGuard:
                 candidate_preview["symbol"],
                 initial_amount,
             )
-        elif not self.live_status()["execution_ready"]:
+        elif not self.live_status(
+            check_symbols=True, symbols=[candidate_preview["symbol"]]
+        )["execution_ready"]:
             raise SecurityError("scheduled LIVE proposal mode is not execution-ready")
         if self.ledger.active_proposal_count() >= self._active_proposal_limit(
             proposal_mode
@@ -3520,8 +3556,6 @@ class SpotGuard:
             "decimal_transport_attestation_present", proofs["decimal_transport_verified"])
         result["decimal_transport_remote_refresh_available"] = proofs.get(
             "decimal_transport_remote_refresh_available", True)
-        result["blockers"].extend(reason for reason in result["readiness_reasons"]
-                                   if reason not in result["blockers"])
         minimum_profile_balance = (
             None
             if self.settings.sizing_policy.percentage_based

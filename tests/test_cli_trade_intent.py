@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from spotguard.cli import main
 from spotguard.config import load_settings
 from spotguard.intent import normalize_trade_intent
+from spotguard.policy import PolicyError
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
 from spotguard.telegram import TelegramError
@@ -23,12 +24,12 @@ OWNER = "123456789"
 
 
 class CliTradeIntentTests(unittest.TestCase):
-    def _invoke(self, config: Path, *, sender: str = OWNER, chat: str = OWNER) -> tuple[int, dict]:
+    def _invoke(self, config: Path, *, text: str = "sell all BTC", sender: str = OWNER, chat: str = OWNER) -> tuple[int, dict]:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = main([
                 "--config", str(config), "--json", "trade-intent",
-                "--text", "sell all BTC", "--sender-id", sender, "--chat-id", chat,
+                "--text", text, "--sender-id", sender, "--chat-id", chat,
             ])
         return code, json.loads(output.getvalue())
 
@@ -87,6 +88,17 @@ class CliTradeIntentTests(unittest.TestCase):
                 code, payload = self._invoke(config)
         self.assertEqual(code, 2)
         self.assertEqual(payload["type"], "TelegramError")
+
+    def test_direct_natural_buy_policy_rejection_remains_a_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_config(Path(directory))
+            with patch.object(SpotGuard, "create_manual_buy_proposal", side_effect=PolicyError(
+                "WEEKLY_LOSS_LIMIT_REACHED: weekly realized loss exhausted effective limit"
+            )):
+                code, payload = self._invoke(config, text="buy BTC 6")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["type"], "PolicyError")
+        self.assertIn("WEEKLY_LOSS_LIMIT_REACHED", payload["error"])
 
 
 if __name__ == "__main__":

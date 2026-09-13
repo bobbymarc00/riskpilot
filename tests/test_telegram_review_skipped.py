@@ -24,11 +24,15 @@ class TelegramReviewSkippedTests(unittest.TestCase):
 const owner=process.env.RP_OWNER;
 const context={{senderId:owner,channel:"telegram",channelId:"telegram",to:`telegram:${{process.env.RP_CHAT}}`,isAuthorizedSender:true}};
 const skipped=createRiskPilotReviewHandler(async()=>({{review_decision:"APPROVE",proposal:null,proposal_status:"SKIPPED_NOT_EXECUTION_READY",presentation:{{text:"RiskPilot AI REVIEW completed. LIVE proposal was not created."}}}}));
+const policySkipped=createRiskPilotReviewHandler(async()=>({{review_decision:"APPROVE",proposal:null,proposal_status:"SKIPPED_POLICY_REJECTED",presentation:{{text:"RiskPilot AI REVIEW completed: APPROVE. Policy: WEEKLY_LOSS_LIMIT_REACHED."}}}}));
 const failed=createRiskPilotReviewHandler(async()=>({{review_decision:"APPROVE",proposal:null}}));
-console.log(JSON.stringify({{skipped:await skipped({{...context,args:"review c-0123456789ab"}}),failed:await failed({{...context,args:"review c-0123456789ab"}})}}));'''
+console.log(JSON.stringify({{skipped:await skipped({{...context,args:"review c-0123456789ab"}}),policySkipped:await policySkipped({{...context,args:"review c-0123456789ab"}}),failed:await failed({{...context,args:"review c-0123456789ab"}})}}));'''
             done = subprocess.run(["node", "--experimental-loader", str(loader), "--input-type=module", "-e", script], text=True, capture_output=True, check=True, env={**os.environ, "RP_OWNER": owner, "RP_CHAT": chat})
         result = json.loads(done.stdout)
         self.assertIn("AI REVIEW completed", result["skipped"]["text"])
         self.assertNotIn("FAILED", result["skipped"]["text"])
         self.assertFalse(result["skipped"]["continueAgent"])
+        self.assertIn("WEEKLY_LOSS_LIMIT_REACHED", result["policySkipped"]["text"])
+        self.assertNotIn("FAILED", result["policySkipped"]["text"])
+        self.assertFalse(result["policySkipped"]["continueAgent"])
         self.assertIn("FAILED", result["failed"]["text"])

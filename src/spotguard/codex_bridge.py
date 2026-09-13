@@ -252,17 +252,35 @@ class CodexAgentOSBridge:
             env=_safe_environment(self.settings),
             start_new_session=True,
         )
-        try:
-            stdout, stderr = process.communicate(
-                input=prompt, timeout=self.settings.codex.timeout_seconds
-            )
-        except subprocess.TimeoutExpired as exc:
-            # This PID is the isolated session leader created above.  Never
-            # search for or signal other Codex instances.
+
+        def group_exists() -> bool:
+            try:
+                os.killpg(process.pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+
+        def terminate_owned_group() -> None:
+            """Stop only descendants of this review's dedicated session."""
+            if not group_exists():
+                return
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                return
+            deadline = time.monotonic() + REVIEW_TERMINATION_GRACE_SECONDS
+            while group_exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if group_exists():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        def cleanup_after_abnormal_exit() -> None:
+            terminate_owned_group()
+            # Always communicate once more, even if SIGTERM already reaped
+            # the wrapper, so its owned pipe handles are closed as well.
             try:
                 process.communicate(timeout=REVIEW_TERMINATION_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -271,7 +289,23 @@ class CodexAgentOSBridge:
                 except ProcessLookupError:
                     pass
                 process.communicate()
+
+        try:
+            stdout, stderr = process.communicate(
+                input=prompt, timeout=self.settings.codex.timeout_seconds
+            )
+        except subprocess.TimeoutExpired as exc:
+            cleanup_after_abnormal_exit()
             raise exc
+        except BaseException:
+            # Parsing, cancellation, and caller-side errors must not strand
+            # the native Codex child after its wrapper has been abandoned.
+            cleanup_after_abnormal_exit()
+            raise
+        # A wrapper can exit successfully while a native child remains in its
+        # session.  The review result has been fully collected at this point,
+        # so terminate only that leftover owned group before returning.
+        terminate_owned_group()
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def review_market(self, symbol: str) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from spotguard.codex_bridge import CodexAgentOSBridge, CodexBridgeError, _safe_environment
 from spotguard.config import load_settings
+from spotguard.policy import PolicyError
 from spotguard.service import SpotGuard
 from spotguard.market import Kline, synthetic_bullish_klines
 from spotguard.util import isoformat, utcnow
@@ -521,7 +522,11 @@ class CodexBridgeTests(unittest.TestCase):
             })
             readiness = {"execution_ready": False,
                          "blockers": ["symbol_protected_live_unsupported"],
-                         "readiness_reasons": ["symbol_protected_live_unsupported"]}
+                         "readiness_reasons": [
+                             "symbol_protected_live_unsupported",
+                             "api_restrictions_equivalent_missing",
+                             "test_order_permission_attestation_available_but_not_run",
+                         ]}
             with patch.object(service, "live_status", return_value=readiness), patch.object(
                 service, "create_proposal", side_effect=AssertionError("must not create proposal")
             ):
@@ -530,6 +535,10 @@ class CodexBridgeTests(unittest.TestCase):
             self.assertEqual(result["proposal_mode"], "live")
             self.assertIsNone(result["proposal"])
             self.assertEqual(result["proposal_blockers"], ["symbol_protected_live_unsupported"])
+            self.assertEqual(result["proposal_diagnostics"], [
+                "api_restrictions_equivalent_missing",
+                "test_order_permission_attestation_available_but_not_run",
+            ])
             self.assertEqual(service.ledger.active_proposal_count_read_only(), 0)
 
     def test_live_review_creates_proposal_only_after_ready_preflight(self) -> None:
@@ -546,12 +555,47 @@ class CodexBridgeTests(unittest.TestCase):
                 "candle": latest, "candles": [latest], "token_usage": {}, "elapsed_ms": 1,
             })
             proposal = {"id": "p-ready", "mode": "live", "status": "PENDING"}
-            with patch.object(service, "live_status", return_value={"execution_ready": True}), patch.object(
+            readiness = {"execution_ready": True, "blockers": [],
+                         "readiness_reasons": [
+                             "api_restrictions_equivalent_missing",
+                             "test_order_permission_attestation_available_but_not_run",
+                         ]}
+            with patch.object(service, "live_status", return_value=readiness), patch.object(
                 service, "create_proposal", return_value={"proposal": proposal, "notification": None}
             ) as create:
                 result = service.review_candidate_with_agent_os(candidate["id"])
             self.assertEqual(result["proposal"], proposal)
+            self.assertNotIn("proposal_status", result)
             create.assert_called_once()
+
+    def test_live_review_keeps_approved_review_when_proposal_policy_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(self._settings(Path(directory)), scheduled_proposal_mode="live")
+            service = SpotGuard(settings)
+            candidate = service.create_demo_candidate("BTCUSDT", 60000)["candidate"]
+            close = float(candidate["price"])
+            latest = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                           close - 1, close, 1, candidate["candle_close_time"])
+            service.agent_os.review_candidate = Mock(return_value={
+                "decision": "APPROVE", "reason": "fresh", "fresh_data_verified": True,
+                "symbol": "BTCUSDT", "candidate_id": candidate["id"], "interval": "15m",
+                "candle": latest, "candles": [latest], "token_usage": {}, "elapsed_ms": 1,
+            })
+            readiness = {"execution_ready": True, "blockers": [], "readiness_reasons": []}
+            for error, expected_code in (
+                ("WEEKLY_LOSS_LIMIT_REACHED: weekly realized loss exhausted effective limit", "WEEKLY_LOSS_LIMIT_REACHED"),
+                ("LIVE active tranche limit reached (1)", "ENTRY_POLICY_REJECTED"),
+            ):
+                with self.subTest(error=error), patch.object(service, "live_status", return_value=readiness), patch.object(
+                    service, "create_proposal", side_effect=PolicyError(error)
+                ) as create:
+                    result = service.review_candidate_with_agent_os(candidate["id"])
+                self.assertEqual(result["review_decision"], "APPROVE")
+                self.assertIsNone(result["proposal"])
+                self.assertEqual(result["proposal_status"], "SKIPPED_POLICY_REJECTED")
+                self.assertEqual(result["proposal_policy_rejection"], {"code": expected_code})
+                create.assert_called_once()
+                self.assertEqual(service.ledger.active_proposal_count_read_only(), 0)
 
     def test_ai_review_timeout_terminates_only_its_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -576,6 +620,32 @@ class CodexBridgeTests(unittest.TestCase):
                     [sys.executable, "-c", "print('next-review')"], ""
                 )
                 self.assertEqual(next_review.stdout.strip(), "next-review")
+            finally:
+                unrelated.terminate()
+                unrelated.wait(timeout=5)
+
+    def test_ai_review_normal_completion_terminates_orphaned_owned_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bridge = CodexAgentOSBridge(self._settings(root))
+            marker = root / "orphan-marker"
+            launcher = root / "launcher.py"
+            launcher.write_text(
+                "import pathlib, subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', \"import pathlib,time,sys; time.sleep(2); pathlib.Path(sys.argv[1]).write_text('orphan')\", sys.argv[1]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "print('wrapper complete')\n", encoding="utf-8"
+            )
+            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                result = bridge._run_ai_review([sys.executable, str(launcher), str(marker)], "")
+                self.assertEqual(result.returncode, 0)
+                time.sleep(2.2)
+                self.assertFalse(marker.exists())
+                self.assertIsNone(unrelated.poll())
+                self.assertEqual(
+                    bridge._run_ai_review([sys.executable, "-c", "print('next-review')"], "").stdout.strip(),
+                    "next-review",
+                )
             finally:
                 unrelated.terminate()
                 unrelated.wait(timeout=5)

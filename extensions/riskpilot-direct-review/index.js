@@ -1,15 +1,19 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { promisify } from "node:util";
+import { readFile, readdir } from "node:fs/promises";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
-const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = "/home/ubuntu/.openclaw/workspace/tools/spotguard-agent-os";
 const RISK_PILOT = `${PROJECT_ROOT}/riskpilot`;
 const RISK_PILOT_CONFIG = `${PROJECT_ROOT}/config.json`;
 const EXTENSION_MARKER = "20260912-direct-dispatch-runtime-proof";
 const CANDIDATE_RE = /^c-[0-9a-f]{12}$/;
 const PROPOSAL_RE = /^p-[0-9a-f]{12}$/;
+// CodexBridge owns the actual review timeout and uses a three-second TERM to
+// KILL grace.  This watchdog margin is only for bridge cleanup plus bounded
+// CLI JSON/presentation work; it never extends Codex reasoning time.
+const REVIEW_TERMINATION_GRACE_SECONDS = 3;
+const REVIEW_CLI_OVERHEAD_SECONDS = 27;
+const REVIEW_OUTER_MARGIN_SECONDS = REVIEW_TERMINATION_GRACE_SECONDS + REVIEW_CLI_OVERHEAD_SECONDS;
 
 function configuredOwner(ctx) {
   const ownerAllowFrom = ctx.config?.commands?.ownerAllowFrom;
@@ -45,11 +49,23 @@ function failureText() {
   return "RiskPilot AI REVIEW FAILED. No proposal was created.";
 }
 
+export function reviewOuterTimeoutMilliseconds(codexTimeoutSeconds) {
+  if (!Number.isInteger(codexTimeoutSeconds) || codexTimeoutSeconds < 30 || codexTimeoutSeconds > 300) {
+    throw new Error("RiskPilot codex timeout is invalid");
+  }
+  return (codexTimeoutSeconds + REVIEW_OUTER_MARGIN_SECONDS) * 1000;
+}
+
+async function configuredReviewOuterTimeoutMilliseconds() {
+  const raw = JSON.parse(await readFile(RISK_PILOT_CONFIG, "utf8"));
+  return reviewOuterTimeoutMilliseconds(raw?.codex?.timeout_seconds);
+}
+
 async function executeReview(candidateId) {
   return runRiskPilot([
     "--config", RISK_PILOT_CONFIG, "--json", "agent-os", "review",
     "--candidate", candidateId, "--notify", "--dispatch-source", "telegram_direct",
-  ], 180000);
+  ], await configuredReviewOuterTimeoutMilliseconds());
 }
 
 function approvalArgs(args) {
@@ -173,11 +189,105 @@ function parseCliJson(stdout) {
   try { return JSON.parse(stdout); } catch { return null; }
 }
 
+async function processIdentity(pid) {
+  try {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    // /proc/<pid>/stat: fields after comm begin with state; PPID is index 1
+    // and starttime is index 19.  Starttime prevents a reused PID being hit.
+    return { pid, ppid: Number(fields[1]), starttime: fields[19] };
+  } catch { return null; }
+}
+
+async function ownedDescendants(rootPid) {
+  const identities = await Promise.all((await readdir("/proc"))
+    .filter((entry) => /^\d+$/.test(entry))
+    .map((entry) => processIdentity(Number(entry))));
+  const children = new Map();
+  for (const identity of identities) {
+    if (!identity) continue;
+    const list = children.get(identity.ppid) ?? [];
+    list.push(identity);
+    children.set(identity.ppid, list);
+  }
+  const owned = [];
+  const pending = [rootPid];
+  const seen = new Set();
+  while (pending.length) {
+    const parent = pending.pop();
+    if (seen.has(parent)) continue;
+    seen.add(parent);
+    for (const child of children.get(parent) ?? []) {
+      owned.push(child);
+      pending.push(child.pid);
+    }
+  }
+  const root = await processIdentity(rootPid);
+  return root ? [root, ...owned] : owned;
+}
+
+async function signalOwned(identities, signal) {
+  await Promise.all(identities.map(async ({ pid, starttime }) => {
+    const current = await processIdentity(pid);
+    if (!current || current.starttime !== starttime) return;
+    try { process.kill(pid, signal); } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  }));
+}
+
+// This is deliberately PID-tree based rather than process-name based.  A
+// Codex native child can be in a new session, so a process-group kill from the
+// extension alone is insufficient; only descendants of this CLI invocation
+// are ever signalled.
+export async function terminateOwnedRiskPilotInvocation(rootPid) {
+  const owned = await ownedDescendants(rootPid);
+  await signalOwned(owned, "SIGTERM");
+  await new Promise((resolve) => setTimeout(resolve, REVIEW_TERMINATION_GRACE_SECONDS * 1000));
+  await signalOwned(owned, "SIGKILL");
+}
+
+function execRiskPilotWithWatchdog(invocation) {
+  return new Promise((resolve, reject) => {
+    let watchdogFired = false;
+    let termination = Promise.resolve();
+    const { timeout, ...options } = invocation;
+    const child = execFile(invocation.file, invocation.args, { ...options, timeout: 0 }, (error, stdout, stderr) => {
+      clearTimeout(watchdog);
+      termination.then(() => {
+        if (watchdogFired) {
+          const timedOut = new Error("RiskPilot outer watchdog timed out");
+          timedOut.code = "ETIMEDOUT";
+          timedOut.stdout = stdout;
+          timedOut.stderr = stderr;
+          reject(timedOut);
+          return;
+        }
+        if (error) {
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+          return;
+        }
+        resolve({ stdout, stderr });
+      }, reject);
+    });
+    const watchdog = setTimeout(() => {
+      watchdogFired = true;
+      termination = terminateOwnedRiskPilotInvocation(child.pid).catch(() => {
+        // The command result remains a deterministic timeout even if /proc is
+        // transiently unavailable; never broaden cleanup beyond this PID tree.
+      });
+    }, timeout);
+  });
+}
+
 async function runRiskPilot(args, timeout, onDiagnostic = undefined) {
   const invocation = riskPilotInvocation(args, timeout);
   onDiagnostic?.({ phase: "spawn", reached: true });
   try {
-    const { stdout } = await execFileAsync(invocation.file, invocation.args, invocation);
+    const { stdout } = await execRiskPilotWithWatchdog(invocation);
     const parsed = parseCliJson(stdout);
     if (!parsed) {
       onDiagnostic?.({ phase: "exit", exitCode: 0, category: "invalid_cli_json" });
@@ -302,7 +412,7 @@ async function renderReviewResult(result, respond) {
         await respond("✅ AI REVIEW: APPROVE\n\nFresh market data verified.\n\nLIVE proposal was not created because LIVE is not execution-ready.\nCandidate remains ACTIVE. No LIVE order was submitted.");
         return;
       }
-      if (result.proposal === null && result.proposal_status === "SKIPPED_NOT_EXECUTION_READY") {
+      if (result.proposal === null && ["SKIPPED_NOT_EXECUTION_READY", "SKIPPED_POLICY_REJECTED"].includes(result.proposal_status)) {
         await respond(presentationText(result, "✅ AI REVIEW completed. LIVE proposal was skipped because execution readiness requirements were not met. No LIVE order was submitted."));
         return;
       }
@@ -347,7 +457,7 @@ export function createRiskPilotReviewHandler(runReview = executeReview, logger =
         if (result.proposal_deferred === true && result.deferred_reason === "LIVE_NOT_EXECUTION_READY") {
           return { text: "✅ AI REVIEW: APPROVE\n\nFresh market data verified.\n\nLIVE proposal was not created because LIVE is not execution-ready.\nCandidate remains ACTIVE. No LIVE order was submitted.", continueAgent: false };
         }
-        if (result.proposal === null && result.proposal_status === "SKIPPED_NOT_EXECUTION_READY") {
+        if (result.proposal === null && ["SKIPPED_NOT_EXECUTION_READY", "SKIPPED_POLICY_REJECTED"].includes(result.proposal_status)) {
           return { text: presentationText(result, "✅ AI REVIEW completed. LIVE proposal was skipped because execution readiness requirements were not met. No LIVE order was submitted."), continueAgent: false };
         }
         // The fixed command delivered the existing proposal controls through

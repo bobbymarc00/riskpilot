@@ -22,6 +22,7 @@ def skipped_review() -> dict:
         "proposal_mode": "live",
         "proposal_status": "SKIPPED_NOT_EXECUTION_READY",
         "proposal_blockers": ["decimal_transport_verified"],
+        "proposal_diagnostics": ["api_restrictions_equivalent_missing"],
     }
 
 
@@ -35,6 +36,15 @@ class ReviewPresentationTests(unittest.TestCase):
         self.assertIn("fresh candle verified", text)
         self.assertIn("LIVE proposal was not created", text)
         self.assertIn("decimal_transport_verified", text)
+        self.assertIn("Diagnostics: api_restrictions_equivalent_missing", text)
+
+    def test_policy_skipped_live_proposal_keeps_successful_review(self) -> None:
+        result = {**skipped_review(), "proposal_status": "SKIPPED_POLICY_REJECTED",
+                  "proposal_policy_rejection": {"code": "WEEKLY_LOSS_LIMIT_REACHED"}}
+        text = render(result, "en", "agent-os")
+        self.assertIn("AI REVIEW completed: APPROVE", text)
+        self.assertIn("WEEKLY_LOSS_LIMIT_REACHED", text)
+        self.assertNotIn("FAILED", text)
 
     def test_real_proposal_presentation_is_unchanged(self) -> None:
         self.assertEqual(

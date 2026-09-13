@@ -254,10 +254,24 @@ def render(result: dict[str, Any], locale: str, operation: str = "") -> str:
         blocker_text = ", ".join(
             str(item) for item in blockers if isinstance(item, str)
         )[:300] if isinstance(blockers, list) else t("analysis.none")
+        diagnostics = result.get("proposal_diagnostics")
+        diagnostic_text = ", ".join(
+            str(item) for item in diagnostics if isinstance(item, str)
+        )[:300] if isinstance(diagnostics, list) else ""
         return t("review.live_proposal_skipped",
                  decision=result.get("review_decision", review.get("decision", "")),
                  reason=analysis_reason(review.get("reason"), locale),
-                 blockers=blocker_text or t("analysis.none"))
+                 blockers=blocker_text or t("analysis.none"),
+                 diagnostics=("\nDiagnostics: " + diagnostic_text) if diagnostic_text else "")
+    if (result.get("proposal_status") == "SKIPPED_POLICY_REJECTED"
+            and isinstance(result.get("market_review"), dict)):
+        review = result["market_review"]
+        rejection = result.get("proposal_policy_rejection")
+        code = rejection.get("code") if isinstance(rejection, dict) else None
+        return t("review.live_proposal_policy_skipped",
+                 decision=result.get("review_decision", review.get("decision", "")),
+                 reason=analysis_reason(review.get("reason"), locale),
+                 policy=code if isinstance(code, str) else "ENTRY_POLICY_REJECTED")
     if "proposal" in result and isinstance(proposal, dict):
         key = "proposal.live_buy.created" if proposal.get("mode") == "live" else "proposal.paper_buy.created"
         return t(key, identifier=proposal.get("id", ""))
