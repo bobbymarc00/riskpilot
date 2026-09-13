@@ -3840,7 +3840,7 @@ class SpotGuard:
             return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
         # FIFO lots carry fee-inclusive unit cost; BUY fees are part of cost
         # basis, while SELL fees are charged directly to realized PnL.
-        lots: list[list[Decimal]] = []
+        lots_by_symbol: dict[str, list[list[Decimal]]] = {}
         daily_loss = Decimal("0")
         weekly_loss = Decimal("0")
         now = utcnow()
@@ -3857,8 +3857,11 @@ class SpotGuard:
                 when = parse_time(fill.get("executed_at"))
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
-            if qty <= 0 or price <= 0 or fee < 0 or not when:
+            symbol = fill.get("symbol")
+            if (qty <= 0 or price <= 0 or fee < 0 or not when
+                    or not isinstance(symbol, str) or not symbol):
                 return False, Decimal("0"), Decimal("0"), "RISKPILOT_SESSION_PNL_INCOMPLETE"
+            lots = lots_by_symbol.setdefault(symbol, [])
             if fill.get("side") == "BUY":
                 lots.append([qty, price + (fee / qty)])
                 continue

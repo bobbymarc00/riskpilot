@@ -961,14 +961,50 @@ class LiveSafetyTests(unittest.TestCase):
    profile=service.live_executor.execution_profile_fingerprint()
    service.ledger.add_event("live.risk_epoch",None,{"epoch_id":"le-fifo","status":"active","profile_fingerprint":profile})
    now=isoformat(utcnow())
-   service.ledger.add_event("live.risk_fill", "proposal-buy-1", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-1","order_id":"order-buy-1","side":"BUY","quantity":"1","price":"100","fee_quote":"0.10","executed_at":now})
-   service.ledger.add_event("live.risk_fill", "proposal-buy-2", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-2","order_id":"order-buy-2","side":"BUY","quantity":"1","price":"110","fee_quote":"0.10","executed_at":now})
-   service.ledger.add_event("live.risk_fill", "proposal-sell-1", {"epoch_id":"le-fifo","proposal_id":"proposal-sell-1","order_id":"order-sell-1","side":"SELL","quantity":"1.5","price":"90","fee_quote":"0.20","executed_at":now})
+   service.ledger.add_event("live.risk_fill", "proposal-buy-1", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-1","order_id":"order-buy-1","symbol":"SOLUSDT","side":"BUY","quantity":"1","price":"100","fee_quote":"0.10","executed_at":now})
+   service.ledger.add_event("live.risk_fill", "proposal-buy-2", {"epoch_id":"le-fifo","proposal_id":"proposal-buy-2","order_id":"order-buy-2","symbol":"SOLUSDT","side":"BUY","quantity":"1","price":"110","fee_quote":"0.10","executed_at":now})
+   service.ledger.add_event("live.risk_fill", "proposal-sell-1", {"epoch_id":"le-fifo","proposal_id":"proposal-sell-1","order_id":"order-sell-1","symbol":"SOLUSDT","side":"SELL","quantity":"1.5","price":"90","fee_quote":"0.20","executed_at":now})
    ok, daily, weekly, reason=service._live_session_accounting()
    self.assertTrue(ok)
    self.assertIsNone(reason)
    self.assertEqual(daily, Decimal("20.35"))
    self.assertEqual(weekly, Decimal("20.35"))
+
+ def test_live_session_accounting_isolates_interleaved_symbol_fifo_lots(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   epoch_id="le-symbol-fifo"; now=isoformat(utcnow())
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":epoch_id,"status":"active","profile_fingerprint":profile})
+   # The old global queue would price this PEOPLE sale against SOL and invent
+   # a 5.92491012458 USDT loss.  Both trades are otherwise about 6 USDT.
+   sol_price=Decimal("100.0063831152742616033755274")
+   people_price=Decimal("0.0079"); sold_people=Decimal("0.05925")
+   fills=[
+    ("sol-buy","SOLUSDT","BUY","0.06",str(sol_price),"0"),
+    ("people-buy","PEOPLEUSDT","BUY","759.5",str(people_price),"0"),
+    ("people-sell","PEOPLEUSDT","SELL",str(sold_people),str(people_price),"0"),
+    ("sol-sell","SOLUSDT","SELL","0.03",str(sol_price),"0.003"),
+   ]
+   for proposal_id,symbol,side,quantity,price,fee_quote in fills:
+    service.ledger.add_event("live.risk_fill",proposal_id,{"epoch_id":epoch_id,"proposal_id":proposal_id,"order_id":proposal_id,"symbol":symbol,"side":side,"quantity":quantity,"price":price,"fee_quote":fee_quote,"executed_at":now})
+   ok,daily,weekly,reason=service._live_session_accounting()
+   self.assertTrue(ok); self.assertIsNone(reason)
+   self.assertEqual((daily,weekly),(Decimal("0.003"),Decimal("0.003")))
+   self.assertEqual(sold_people*(sol_price-people_price),Decimal("5.924910124579999999999999998"))
+
+ def test_live_session_accounting_rejects_cross_symbol_inventory(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   profile=service.live_executor.execution_profile_fingerprint()
+   epoch_id="le-symbol-incomplete"; now=isoformat(utcnow())
+   service.ledger.add_event("live.risk_epoch",None,{"epoch_id":epoch_id,"status":"active","profile_fingerprint":profile})
+   service.ledger.add_event("live.risk_fill","sol-buy",{"epoch_id":epoch_id,"proposal_id":"sol-buy","order_id":"sol-buy","symbol":"SOLUSDT","side":"BUY","quantity":"0.06","price":"100","fee_quote":"0","executed_at":now})
+   service.ledger.add_event("live.risk_fill","people-sell",{"epoch_id":epoch_id,"proposal_id":"people-sell","order_id":"people-sell","symbol":"PEOPLEUSDT","side":"SELL","quantity":"0.06","price":"0.0079","fee_quote":"0","executed_at":now})
+   ok,daily,weekly,reason=service._live_session_accounting()
+   self.assertFalse(ok)
+   self.assertEqual(reason,"RISKPILOT_SESSION_PNL_INCOMPLETE")
+   self.assertEqual((daily,weekly),(Decimal("0"),Decimal("0")))
 
  def test_live_session_accounting_missing_fee_fails_closed(self):
   with tempfile.TemporaryDirectory() as d:
