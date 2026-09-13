@@ -117,8 +117,13 @@ def evaluate_entry(
             reject("REVALIDATION_FAILED", "requested notional must be finite and positive")
         if requested_notional > limits.max_entry_notional:
             reject(
-                "MAX_POSITION_EXCEEDED",
-                f"requested notional {requested_notional:f} exceeds effective single-position allowance {limits.max_entry_notional:f} {context.equity.quote_asset}",
+                (
+                    "PER_POSITION_HARD_CAP"
+                    if limits.max_entry_notional
+                    == context.hard_limits.max_entry_notional
+                    else "MAX_POSITION_EXCEEDED"
+                ),
+                f"requested/dynamic notional {requested_notional:f} exceeds maximum {limits.max_entry_notional:f} {context.equity.quote_asset}",
             )
         spend_with_fee = requested_notional + estimated_fee
         if spend_with_fee > context.equity.available_buying_power:

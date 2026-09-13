@@ -79,6 +79,7 @@
   "policy.max_order_exceeded": "Requested amount {amount} USDT exceeds the configured maximum of {maximum} USDT.",
   "policy.non_positive": "Requested amount must be greater than 0 USDT.",
   "policy.risk_limit": "Request refused: a risk, exposure, quota, balance, or exchange limit was reached.",
+  "policy.per_position_hard_cap": "Request refused: PER_POSITION_HARD_CAP — requested/dynamic: {requested} USDT; maximum: {maximum} USDT.",
   "approval.paper.success": "PAPER approval accepted; simulated fill completed.",
   "approval.live.success": "LIVE approval executed successfully.",
   "approval.live.partial_exit": "LIVE partial exit executed successfully.",

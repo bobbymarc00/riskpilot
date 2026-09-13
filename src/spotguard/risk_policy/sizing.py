@@ -154,9 +154,14 @@ def size_entry(
             )
         )
     elif selected > safe:
+        entry_cap_code = (
+            "PER_POSITION_HARD_CAP"
+            if limits.max_entry_notional == context.hard_limits.max_entry_notional
+            else "MAX_POSITION_EXCEEDED"
+        )
         candidates = (
             (risk_based, "MAX_POSITION_EXCEEDED", "risk-per-trade budget"),
-            (position_capacity, "MAX_POSITION_EXCEEDED", "single-position concentration capacity"),
+            (position_capacity, entry_cap_code, "single-position concentration capacity"),
             (exposure_capacity, "MAX_TOTAL_EXPOSURE_EXCEEDED", "total exposure capacity"),
             (
                 remaining_risk / stop_fraction,
@@ -174,7 +179,7 @@ def size_entry(
         details.append(
             PolicyReason(
                 limiting[1],
-                f"exact requested notional {selected:f} exceeds safe maximum {safe:f}; limiting gate is {limiting[2]}",
+                f"requested/dynamic notional {selected:f} exceeds maximum {safe:f}; limiting gate is {limiting[2]}",
             )
         )
         if selected > context.equity.free_quote:

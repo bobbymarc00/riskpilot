@@ -18,6 +18,14 @@ ${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}/tools/spotguard-agent-os/riskpi
 
 RiskPilot selects and persists the locale deterministically. Do not translate the utterance before routing, infer locale from the assistant's previous response, or call a model/tool to detect language. Display only the returned `presentation.text` verbatim; do not append an independently translated summary, raw developer errors, or JSON prose. Existing structured slash commands and callback actions retain their exact tokens and trusted metadata. Callback responses use the original proposal locale, even after a chat locale change. Scheduled proposals use the destination chat locale or the configured fallback. Multi-symbol comparisons rank the canonical scheduled-signal score, separately rank execution-eligible symbols, use deterministic symbol tie-breaking, and never create a proposal or claim a guaranteed best entry.
 
+For trusted direct Telegram, route these exact normalized LIVE wizard phrases through the persisted wizard (with the actual trusted IDs), then display `presentation.text` verbatim:
+
+```text
+riskpilot --config CONFIG --json telegram-live --text ORIGINAL_MESSAGE --sender-id ACTUAL_SENDER_ID --chat-id ACTUAL_CHAT_ID
+```
+
+Recognize `cek live readiness` / `live readiness` / `check live readiness` / `status live` as read-only; `aktifkan mode live` (and documented English variants) starts a challenge; only exact `READY TO LIVE TRADE` confirms it. `nonaktifkan mode live` starts the separate challenge; only exact `DISABLE LIVE TRADING` confirms it. The activation creates no order or proposal, authorization expires after seven days, and every LIVE trade still follows the existing native proposal-and-approval flow. Deactivation blocks new exposure but preserves TP/SL/OCO and protective exits for existing positions.
+
 After `/new`, a complete English or Indonesian balance, positions, or combined status phrase recognized by RiskPilot's intent vocabulary still routes directly through `trade-intent`; do not ask which platform. Explicitly named unrelated platforms remain outside this skill.
 
 Core boundaries:

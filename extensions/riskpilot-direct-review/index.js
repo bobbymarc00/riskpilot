@@ -108,6 +108,21 @@ function tradeIntentRoute(text) {
   return value;
 }
 
+// These five exact wizard intents are claimed before the generic agent.  The
+// CLI remains the authority for sender/chat binding, challenge replay, lease,
+// and preflight; this hook merely preserves the trusted ingress metadata.
+export function liveWizardRoute(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (trimmed === "READY TO LIVE TRADE") return "activate-confirm";
+  if (trimmed === "DISABLE LIVE TRADING") return "deactivate-confirm";
+  const normalized = trimmed.toLowerCase().replace(/\s+/g, " ");
+  if (["cek live readiness", "live readiness", "check live readiness", "status live", "cek readiness live"].includes(normalized)) return "readiness";
+  if (["aktifkan mode live", "enable live", "activate live mode", "arm live", "aktifkan live trading"].includes(normalized)) return "activate-request";
+  if (["nonaktifkan mode live", "disable live", "deactivate live", "disarm live", "matikan live trading"].includes(normalized)) return "deactivate-request";
+  return null;
+}
+
 function trustedCommandIdentity(ctx) {
   const senderId = normalizeTelegramId(ctx.senderId, false);
   const chatId = normalizeTelegramId(ctx.to, true);
@@ -146,6 +161,17 @@ async function executeReadOnly(route) {
   return runRiskPilot([
     "--config", RISK_PILOT_CONFIG, "--json", "live", route,
   ], 30_000);
+}
+
+export function telegramLiveArgs(text, identity) {
+  return [
+    "--config", RISK_PILOT_CONFIG, "--json", "telegram-live", "--text", text,
+    "--sender-id", identity.senderId, "--chat-id", identity.chatId,
+  ];
+}
+
+async function executeTelegramLive(text, identity) {
+  return runRiskPilot(telegramLiveArgs(text, identity), 180_000);
 }
 
 export function tradeIntentArgs(text, identity) {
@@ -506,28 +532,32 @@ async function readSettings() {
 }
 
 // Exported for fixture-only regression tests.  The runtime passes executeReadOnly.
-export function createRiskPilotReadOnlyHook(runReadOnly = executeReadOnly, runTradeIntent = executeTradeIntent, logger = undefined) {
+export function createRiskPilotReadOnlyHook(runReadOnly = executeReadOnly, runTradeIntent = executeTradeIntent,
+                                            logger = undefined, runTelegramLive = executeTelegramLive) {
   return async (event, context) => {
     const body = event.body ?? event.content;
-    const route = readOnlyRoute(body);
-    const sellIntent = route ? null : tradeIntentRoute(body);
-    logIngressHook(logger, event.channel === "telegram" ? (route ?? (sellIntent ? "trade-intent" : "none")) : "non-telegram");
+    const wizard = liveWizardRoute(body);
+    const route = wizard ? null : readOnlyRoute(body);
+    const sellIntent = (wizard || route) ? null : tradeIntentRoute(body);
+    logIngressHook(logger, event.channel === "telegram" ? (wizard ? `live-wizard:${wizard}` : (route ?? (sellIntent ? "trade-intent" : "none"))) : "non-telegram");
     if (event.channel !== "telegram") return undefined;
-    if (!route && !sellIntent) return undefined;
+    if (!wizard && !route && !sellIntent) return undefined;
     try {
-      const routeName = route ?? "trade-intent";
+      const routeName = wizard ? `live-wizard:${wizard}` : (route ?? "trade-intent");
       const trusted = extractBeforeDispatchIdentity(event, context, await readSettings());
       if (!trusted.identity) {
         logBeforeDispatchDiagnostic(logger, routeName, trusted.trace, trusted.reason);
         return { handled: true, text: "RiskPilot requires trusted Telegram sender and chat metadata for this action.", isError: true };
       }
-      const onDiagnostic = route ? undefined : (cli) =>
+      const onDiagnostic = (route || wizard) ? undefined : (cli) =>
         logBeforeDispatchDiagnostic(logger, routeName, trusted.trace, "accepted", cli);
-      const result = route ? await runReadOnly(route, trusted.identity) : await runTradeIntent(sellIntent, trusted.identity, onDiagnostic);
+      const result = wizard ? await runTelegramLive(body.trim(), trusted.identity)
+        : (route ? await runReadOnly(route, trusted.identity)
+          : await runTradeIntent(sellIntent, trusted.identity, onDiagnostic));
       logRoute(logger, routeName, trusted.identity, "handled");
       return { handled: true, text: presentationText(result, "RiskPilot returned no displayable result.") };
     } catch {
-      logRoute(logger, route ?? "trade-intent", null, "adapter_failure");
+      logRoute(logger, wizard ? `live-wizard:${wizard}` : (route ?? "trade-intent"), null, "adapter_failure");
       return { handled: true, text: "RiskPilot could not complete the read-only request safely.", isError: true };
     }
   };

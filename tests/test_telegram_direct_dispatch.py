@@ -25,7 +25,7 @@ class TelegramDirectDispatchTests(unittest.TestCase):
                 ' return n(s,c);\n}\n', encoding="utf-8"
             )
             script = f"""
-import plugin, {{ cliFailureCategory, createRiskPilotReviewHandler, createRiskPilotReadOnlyHook, extractBeforeDispatchIdentity, normalizeTelegramId, readOnlyRoute, riskPilotInvocation, tradeIntentArgs }} from {json.dumps(PLUGIN.as_uri())};
+import plugin, {{ cliFailureCategory, createRiskPilotReviewHandler, createRiskPilotReadOnlyHook, extractBeforeDispatchIdentity, liveWizardRoute, normalizeTelegramId, readOnlyRoute, riskPilotInvocation, telegramLiveArgs, tradeIntentArgs }} from {json.dumps(PLUGIN.as_uri())};
 const owner = {{ senderId: "6146464861", channel: "telegram", channelId: "telegram", to: "telegram:6146464861", isAuthorizedSender: true, senderIsOwner: true,
   config: {{ commands: {{ ownerAllowFrom: ["telegram:6146464861"] }}, channels: {{ telegram: {{ allowFrom: ["6146464861"] }} }} }} }};
 let registered;
@@ -45,6 +45,7 @@ const approvalHandler = createRiskPilotReviewHandler(fake, undefined, async (act
 }});
 const readCalls = [];
 const sellCalls = [];
+const wizardCalls = [];
 const routeLogs = [];
 const readHook = createRiskPilotReadOnlyHook(async (route, identity) => {{
   readCalls.push({{ route, identity }}); return {{ presentation: {{ text: `READ ${{route}}` }} }};
@@ -52,7 +53,9 @@ const readHook = createRiskPilotReadOnlyHook(async (route, identity) => {{
   onDiagnostic?.({{ phase: "spawn", reached: true }});
   onDiagnostic?.({{ phase: "exit", exitCode: 0, category: "ok" }});
   sellCalls.push({{ text, identity }}); return {{ presentation: {{ text: "SELL PROPOSAL ONLY" }} }};
-}}, {{ info: (line) => routeLogs.push(line) }});
+}}, {{ info: (line) => routeLogs.push(line) }}, async (text, identity) => {{
+  wizardCalls.push({{ text, identity }}); return {{ presentation: {{ text: `WIZARD ${{text}}` }} }};
+}});
 const replies = [];
 const interactiveHandler = interactiveRegistered.handler;
 const interactiveResult = await interactiveHandler({{
@@ -80,6 +83,11 @@ const cases = {{
   generic_approve: await approvalHandler({{...owner, isAuthorizedSender: true, args: "approve"}}),
   read_balance: await readHook({{ channel: "telegram", senderId: "6146464861", body: "check my live balance" }}, {{ conversationId: "6146464861" }}),
   read_positions: await readHook({{ channel: "telegram", senderId: "6146464861", body: "check all balance and open position" }}, {{ conversationId: "6146464861" }}),
+  wizard_readiness: await readHook({{ channel: "telegram", senderId: "6146464861", body: "cek live readiness" }}, {{ conversationId: "6146464861" }}),
+  wizard_activate: await readHook({{ channel: "telegram", senderId: "6146464861", body: "aktifkan mode live" }}, {{ conversationId: "6146464861" }}),
+  wizard_activate_confirm: await readHook({{ channel: "telegram", senderId: "6146464861", body: "READY TO LIVE TRADE" }}, {{ conversationId: "6146464861" }}),
+  wizard_disable: await readHook({{ channel: "telegram", senderId: "6146464861", body: "nonaktifkan mode live" }}, {{ conversationId: "6146464861" }}),
+  wizard_disable_confirm: await readHook({{ channel: "telegram", senderId: "6146464861", body: "DISABLE LIVE TRADING" }}, {{ conversationId: "6146464861" }}),
   sell: await readHook({{ channel: "telegram", senderId: "6146464861", body: "sell all XRP" }}, {{ conversationId: "6146464861" }}),
   sell_transport_target: await readHook({{ channel: "telegram", senderId: "6146464861", body: "sell all SOL" }}, {{ conversationId: "telegram:6146464861" }}),
   sell_sender_transport: await readHook({{ channel: "telegram", senderId: "telegram:6146464861", body: "sell all SOL" }}, {{ conversationId: "telegram:6146464861" }}),
@@ -91,10 +99,11 @@ const cases = {{
   candidate_notification: (await readHook({{ channel: "telegram", senderId: "6146464861", body: "Candidate BTCUSDT c-0123456789ab" }}, {{ conversationId: "telegram:6146464861" }})) ?? null,
   read_bad_sender: await readHook({{ channel: "telegram", senderId: "999", body: "check my live balance" }}, {{ conversationId: "6146464861" }}),
   approvalCalls,
-  readCalls, sellCalls, routeLogs,
+  readCalls, sellCalls, wizardCalls, routeLogs,
   before_dispatch_registered: typeof beforeDispatch === "function",
   invocation: riskPilotInvocation(["--json", "live", "balance"], 30000),
   trade_argv: tradeIntentArgs("sell all SOL", {{ senderId: "6146464861", chatId: "6146464861" }}),
+  wizard_argv: telegramLiveArgs("cek live readiness", {{ senderId: "6146464861", chatId: "6146464861" }}),
   identities: {{
     raw: extractBeforeDispatchIdentity({{ senderId: "6146464861" }}, {{ conversationId: "6146464861" }}, {{ owner: "6146464861", chat: "6146464861" }}),
     transport: extractBeforeDispatchIdentity({{ senderId: "telegram:6146464861" }}, {{ conversationId: "telegram:6146464861" }}, {{ owner: "6146464861", chat: "6146464861" }}),
@@ -107,6 +116,11 @@ const cases = {{
     exactBalance: readOnlyRoute("/spot live balance"),
     exactPositions: readOnlyRoute("/spot live positions"),
     genericApprove: readOnlyRoute("approve"),
+    wizardReadiness: liveWizardRoute("cek live readiness"),
+    wizardActivate: liveWizardRoute("aktifkan mode live"),
+    wizardActivateConfirm: liveWizardRoute("READY TO LIVE TRADE"),
+    wizardDisable: liveWizardRoute("nonaktifkan mode live"),
+    wizardDisableConfirm: liveWizardRoute("DISABLE LIVE TRADING"),
   }},
   failureCategories: {{
     security: cliFailureCategory({{ code: 2 }}, {{ type: "SecurityError" }}),
@@ -161,6 +175,9 @@ console.log(JSON.stringify(cases));
         self.assertEqual(result["routes"], {
             "balance": "balance", "positions": "positions", "exactBalance": "balance",
             "exactPositions": "positions", "genericApprove": None,
+            "wizardReadiness": "readiness", "wizardActivate": "activate-request",
+            "wizardActivateConfirm": "activate-confirm", "wizardDisable": "deactivate-request",
+            "wizardDisableConfirm": "deactivate-confirm",
         })
         self.assertEqual(result["failureCategories"], {
             "security": "riskpilot_security_error",
@@ -173,6 +190,9 @@ console.log(JSON.stringify(cases));
         self.assertEqual(result["read_positions"]["text"], "READ positions")
         self.assertTrue(result["read_balance"]["handled"])
         self.assertTrue(result["read_positions"]["handled"])
+        for key in ("wizard_readiness", "wizard_activate", "wizard_activate_confirm", "wizard_disable", "wizard_disable_confirm"):
+            self.assertTrue(result[key]["handled"], key)
+            self.assertTrue(result[key]["text"].startswith("WIZARD "), key)
         self.assertEqual(result["sell"]["text"], "SELL PROPOSAL ONLY")
         self.assertEqual(result["sell_transport_target"]["text"], "SELL PROPOSAL ONLY")
         self.assertEqual(result["sell_sender_transport"]["text"], "SELL PROPOSAL ONLY")
@@ -191,6 +211,10 @@ console.log(JSON.stringify(cases));
             {"text": "sell all SOL", "identity": {"senderId": "6146464861", "chatId": "6146464861"}},
             {"text": "sell all SOL", "identity": {"senderId": "6146464861", "chatId": "6146464861"}},
         ])
+        self.assertEqual([call["text"] for call in result["wizardCalls"]], [
+            "cek live readiness", "aktifkan mode live", "READY TO LIVE TRADE",
+            "nonaktifkan mode live", "DISABLE LIVE TRADING",
+        ])
         # The subprocess boundary is mocked above. This exact argv proves a
         # clear SELL only creates a deferred trade-intent proposal path; it
         # cannot submit a Binance order in this regression test.
@@ -198,6 +222,11 @@ console.log(JSON.stringify(cases));
             "--config", "/home/ubuntu/.openclaw/workspace/tools/spotguard-agent-os/config.json",
             "--json", "trade-intent", "--text", "sell all SOL",
             "--sender-id", "6146464861", "--chat-id", "6146464861", "--notify",
+        ])
+        self.assertEqual(result["wizard_argv"], [
+            "--config", "/home/ubuntu/.openclaw/workspace/tools/spotguard-agent-os/config.json",
+            "--json", "telegram-live", "--text", "cek live readiness",
+            "--sender-id", "6146464861", "--chat-id", "6146464861",
         ])
         self.assertEqual(result["normalize"], {
             "numeric": "6146464861", "prefixed": "6146464861",

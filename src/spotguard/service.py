@@ -14,7 +14,7 @@ from typing import Any, Mapping
 from . import __version__
 from .presentation import detect_locale, error_text, localized, number, render, translate
 from .codex_bridge import CodexAgentOSBridge, CodexBridgeError
-from .config import Settings, openclaw_available
+from .config import Settings, openclaw_available, load_settings
 from .db import Ledger, LedgerError
 from .indicators import analyze
 from .live_execution import LiveExecutionAdapter
@@ -36,7 +36,7 @@ from .security import ApprovalSigner, LiveArm, SecurityError
 from .strategy import Signal, evaluate
 from .score_engine import MarketScore, SCORE_ENGINE_VERSION, score_market, score_snapshot
 from .telegram import OpenClawMessenger, TelegramError, candidate_message, paper_close_message, proposal_message
-from .util import bounded_text, canonical_json, decimal_string, isoformat, parse_time, utcnow, validate_simple_id
+from .util import atomic_write_text, bounded_text, canonical_json, decimal_string, isoformat, parse_time, utcnow, validate_simple_id
 
 
 class SpotGuardError(RuntimeError):
@@ -60,6 +60,210 @@ class SpotGuard:
         self.live_executor = LiveExecutionAdapter(settings)
         self.paper_reconciliation = self.ledger.reconcile_paper_state()
         self.paper_migration = self._migrate_existing_paper_fills()
+        # A reboot never revives an elapsed authorization.
+        self._authorization_record()
+
+    # Telegram is a convenience surface, never the execution boundary.  The
+    # persisted authorization below is checked again at proposal and write
+    # time, while SELL/protection paths deliberately do not depend on it.
+    _LIVE_AUTH_SECONDS = 7 * 24 * 60 * 60
+    _LIVE_CHALLENGE_SECONDS = 10 * 60
+
+    @staticmethod
+    def _is_live_entry(proposal: Mapping[str, Any]) -> bool:
+        canonical = proposal.get("canonical", proposal)
+        return str(canonical.get("side", proposal.get("side", ""))).upper() == "BUY"
+
+    def _trusted_telegram(self, sender_id: str, chat_id: str) -> None:
+        self._validate_owner(sender_id)
+        if chat_id != self.settings.telegram.chat_id:
+            raise SecurityError("trusted Telegram chat does not match the configured Telegram chat")
+
+    def _enable_live_from_wizard(self) -> None:
+        """Apply only the existing local LIVE-enabled switch after challenge.
+
+        This deliberately cannot alter owner/chat, credentials, limits, or any
+        capability proof.  Validation happens before the atomic replacement.
+        """
+        if self.settings.live.enabled:
+            return
+        path = self.settings.config_path
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw.get("live"), dict):
+            raise SecurityError("LIVE configuration is malformed")
+        raw["live"]["enabled"] = True
+        candidate = path.with_name(path.name + ".live-wizard.tmp")
+        try:
+            atomic_write_text(candidate, json.dumps(raw, indent=2) + "\n", mode=0o600)
+            updated = load_settings(candidate, create_state=False)
+            atomic_write_text(path, candidate.read_text(encoding="utf-8"), mode=0o600)
+        finally:
+            candidate.unlink(missing_ok=True)
+        self.settings = updated
+        self.messenger.settings = updated
+        self.agent_os.settings = updated
+        self.live_executor.settings = updated
+        self.ledger.add_event("admin.live_enabled_by_wizard", None, {"config_key": "live.enabled"})
+
+    def request_live_activation(self, sender_id: str, chat_id: str) -> dict[str, Any]:
+        self._trusted_telegram(sender_id, chat_id)
+        challenge_id = secrets.token_urlsafe(16)
+        now = utcnow()
+        self.ledger.create_live_challenge(challenge_id, "ACTIVATE", sender_id, chat_id,
+                                          isoformat(now + timedelta(seconds=self._LIVE_CHALLENGE_SECONDS)))
+        self.ledger.add_event("LIVE_ACTIVATION_REQUESTED", None, {"sender_id": sender_id, "chat_id": chat_id})
+        return {"challenge": "ACTIVATE", "expires_at": isoformat(now + timedelta(seconds=self._LIVE_CHALLENGE_SECONDS)),
+                "presentation": {"text": "⚠️ RISKPILOT LIVE ACTIVATION\n\nLIVE trading will receive authorization for 7 days.\nNo order will be executed by this step. Every LIVE trade still requires a proposal and human approval.\n\nUntuk melanjutkan, ketik persis:\n\nREADY TO LIVE TRADE"}}
+
+    def request_live_deactivation(self, sender_id: str, chat_id: str) -> dict[str, Any]:
+        self._trusted_telegram(sender_id, chat_id)
+        challenge_id = secrets.token_urlsafe(16); now = utcnow()
+        self.ledger.create_live_challenge(challenge_id, "DEACTIVATE", sender_id, chat_id,
+                                          isoformat(now + timedelta(seconds=self._LIVE_CHALLENGE_SECONDS)))
+        self.ledger.add_event("LIVE_DEACTIVATION_REQUESTED", None, {"sender_id": sender_id, "chat_id": chat_id})
+        return {"challenge": "DEACTIVATE", "expires_at": isoformat(now + timedelta(seconds=self._LIVE_CHALLENGE_SECONDS)),
+                "presentation": {"text": "⚠️ DISABLE RISKPILOT LIVE\n\nThis will:\n• block new LIVE entries\n• disarm LIVE execution\n• revoke current LIVE authorization\n• invalidate pending LIVE entry proposals\n\nExisting protective exits will remain active.\n\nType exactly:\n\nDISABLE LIVE TRADING"}}
+
+    def _authorization_record(self) -> dict[str, Any] | None:
+        expired = self.ledger.expire_live_authorization_if_needed(isoformat())
+        if expired:
+            self.live_arm.disarm()
+            self.ledger.invalidate_pending_live_entries("LIVE_AUTHORIZATION_EXPIRED")
+            self.ledger.add_event("LIVE_AUTHORIZATION_EXPIRED", expired["authorization_id"], {"expires_at": expired["expires_at"]})
+        return self.ledger.active_live_authorization()
+
+    def live_entry_readiness(self, *, check_symbols: bool = True,
+                             symbols: list[str] | None = None,
+                             enforce_expiry: bool = False) -> dict[str, Any]:
+        """The single derived decision for opening/increasing LIVE exposure.
+
+        The lease is intentionally independent from transient Binance health:
+        an unavailable connector fails this decision but never revokes/renews
+        the persisted authorization.  `enforce_expiry` is reserved for the
+        execution boundary/startup, where elapsed leases are durably expired.
+        """
+        record = self._authorization_record() if enforce_expiry else self.ledger.active_live_authorization()
+        base = self.live_status(check_symbols=check_symbols, symbols=symbols)
+        arm = self.live_arm.status()
+        authorization_valid = bool(
+            record and record.get("status") == "ACTIVE"
+            and parse_time(str(record["expires_at"])) > utcnow()
+            and record.get("activated_by_sender_id") == self.settings.openclaw.telegram_owner_id
+            and record.get("activated_in_chat_id") == self.settings.telegram.chat_id
+        )
+        full_arm = bool(arm.armed and getattr(arm, "scope", "FULL") == "FULL")
+        blockers = list(base.get("blockers", []))
+        if not authorization_valid:
+            blockers.append("live_authorization")
+        if not full_arm and "live_armed" not in blockers:
+            blockers.append("live_armed")
+        # Do not trust a cached/display boolean here. Enumerating the adapter's
+        # critical predicates makes a missing/new false proof fail closed.
+        required = (
+            "binance_mcp_connected", "execution_profile_configured",
+            "codex_login_reported", "account_read_verified",
+            "open_orders_read_verified", "spot_trade_scope_verified",
+            "write_tool_discovered", "write_schema_verified",
+            "decimal_transport_verified", "protective_order_capability_verified",
+            "symbol_exchange_flags_verified", "live_limits_valid", "live_enabled",
+        )
+        missing = [name for name in required if base.get(name) is not True]
+        blockers.extend(missing)
+        ready = bool(authorization_valid and full_arm and not missing
+                     and base.get("execution_ready") is True)
+        return {**base, "authorization": record, "authorization_valid": authorization_valid,
+                "live_armed": full_arm, "execution_ready": ready,
+                "blockers": list(dict.fromkeys(blockers))}
+
+    def is_live_entry_authorized(self, *, check_readiness: bool = True) -> bool:
+        readiness = self.live_entry_readiness(
+            check_symbols=check_readiness, enforce_expiry=True
+        )
+        return bool(readiness["execution_ready"] if check_readiness
+                    else readiness["authorization_valid"] and readiness["live_armed"]
+                    and self.settings.live.enabled)
+
+    def confirm_live_activation(self, phrase: str, sender_id: str, chat_id: str) -> dict[str, Any]:
+        self._trusted_telegram(sender_id, chat_id)
+        if phrase.strip() != "READY TO LIVE TRADE":
+            raise SecurityError("LIVE activation confirmation phrase did not match")
+        if not self.ledger.consume_live_challenge("ACTIVATE", sender_id, chat_id, isoformat()):
+            raise SecurityError('No active LIVE activation challenge. Run "aktifkan mode live" first.')
+        self.ledger.add_event("LIVE_ACTIVATION_CONFIRMED", None, {"sender_id": sender_id, "chat_id": chat_id})
+        self.ledger.add_event("LIVE_PREFLIGHT_STARTED", None, {"sender_id": sender_id, "chat_id": chat_id})
+        if not self.settings.live.enabled:
+            try:
+                self._enable_live_from_wizard()
+            except Exception as exc:
+                self.ledger.add_event("LIVE_PREFLIGHT_BLOCKED", None, {"blockers": ["LIVE_NOT_ENABLED"]})
+                return {"ok": False, "blockers": ["LIVE_NOT_ENABLED"], "execution_ready": False, "reason": str(exc)}
+        symbol = self.settings.live.allowed_symbols[0] if self.settings.live.allowed_symbols else ""
+        if not symbol:
+            return {"ok": False, "blockers": ["NO_LIVE_ALLOWED_SYMBOL"], "execution_ready": False}
+        prepared = self.prepare_live_session(symbol, operator_confirmed=True)
+        blockers = [item for item in prepared.get("blockers", []) if item != "live_armed"]
+        if blockers:
+            self.ledger.add_event("LIVE_PREFLIGHT_BLOCKED", None, {"blockers": blockers})
+            return {"ok": False, "blockers": blockers, "execution_ready": False, "readiness": prepared}
+        # The seven-day authorization is explicit and persisted; it does not
+        # create a trade/proposal.  Existing LiveArm remains the local arm.
+        self.live_arm.arm(self._LIVE_AUTH_SECONDS // 60)
+        final = self.live_status(check_symbols=True)
+        if not final.get("execution_ready"):
+            self.live_arm.disarm()
+            self.ledger.add_event("LIVE_PREFLIGHT_BLOCKED", None, {"blockers": final.get("blockers", ["LIVE_NOT_READY"])})
+            return {"ok": False, "blockers": final.get("blockers", ["LIVE_NOT_READY"]), "execution_ready": False}
+        now = utcnow(); authorization_id = "la-" + secrets.token_hex(12)
+        record = self.ledger.grant_live_authorization(authorization_id, isoformat(now), isoformat(now + timedelta(seconds=self._LIVE_AUTH_SECONDS)), sender_id, chat_id)
+        self.ledger.add_event("LIVE_AUTHORIZATION_GRANTED", authorization_id, {"sender_id": sender_id, "chat_id": chat_id, "expires_at": record["expires_at"]})
+        return {"ok": True, "authorization": record, "execution_ready": True, "readiness": final,
+                "presentation": {"text": "🛡️ RISKPILOT LIVE READINESS\n\n✅ Telegram identity trusted\n✅ Binance connection\n✅ Agentic Spot account\n✅ Spot Trade permission\n✅ Write schema verified\n✅ Exchange filters loaded\n✅ Risk policy valid\n✅ Protected exit available\n✅ LIVE enabled\n✅ LIVE armed\n\nAuthorization:\nActivated: %s\nExpires: %s\n\nLIVE EXECUTION READY ✅\n\nHuman approval is still required for every LIVE trade." % (record["activated_at"], record["expires_at"])}}
+
+    def confirm_live_deactivation(self, phrase: str, sender_id: str, chat_id: str) -> dict[str, Any]:
+        self._trusted_telegram(sender_id, chat_id)
+        if phrase.strip() != "DISABLE LIVE TRADING":
+            raise SecurityError("LIVE deactivation confirmation phrase did not match")
+        if not self.ledger.consume_live_challenge("DEACTIVATE", sender_id, chat_id, isoformat()):
+            raise SecurityError('No active LIVE deactivation challenge. Run "nonaktifkan mode live" first.')
+        now = isoformat(); record = self.ledger.revoke_live_authorization("USER_REQUEST", now)
+        self.live_arm.disarm()
+        invalidated = self.ledger.invalidate_pending_live_entries("LIVE_AUTHORIZATION_REVOKED")
+        self.ledger.add_event("LIVE_AUTHORIZATION_REVOKED", record and record.get("authorization_id"), {"reason": "USER_REQUEST", "invalidated_entries": invalidated})
+        return {"ok": True, "invalidated_entries": invalidated, "execution_ready": False,
+                "presentation": {"text": "🔒 RISKPILOT LIVE DISABLED\n\n✅ New LIVE entries blocked\n✅ LIVE disarmed\n✅ Authorization revoked\n✅ Pending LIVE entry proposals invalidated\n✅ Existing position protection preserved\n\nExecution ready: NO"}}
+
+    def telegram_live_readiness(self, sender_id: str, chat_id: str) -> dict[str, Any]:
+        self._trusted_telegram(sender_id, chat_id)
+        # Read-only: it derives expiry/health but never mutates lease, arm, or
+        # proposals. The execution boundary invokes the same evaluator with
+        # durable expiry enforcement enabled.
+        status = self.live_entry_readiness(check_symbols=True, enforce_expiry=False)
+        # `live_entry_readiness` intentionally exposes only an ACTIVE lease:
+        # that is the fail-closed entry gate.  Presentation additionally needs
+        # a terminal lease to distinguish an explicit disable from expiry.
+        record = self.ledger.latest_live_authorization()
+        active = status["authorization_valid"]
+        execution_ready = status["execution_ready"]
+        if active:
+            authorization_label = "ACTIVE"
+        elif record is None or parse_time(record["expires_at"]) <= utcnow():
+            authorization_label = "EXPIRED"
+        else:
+            # A terminal, still-unexpired lease can only be explicitly revoked.
+            authorization_label = str(record["status"])
+        lines = ["🛡️ RISKPILOT LIVE STATUS", "", "Mode: LIVE", "Authorization: " + authorization_label]
+        if record: lines += ["Expires: " + record["expires_at"]]
+        checks = (("Binance connection", status.get("binance_mcp_connected")),
+                  ("Agentic Spot account", status.get("account_read_verified")),
+                  ("Spot Trade permission", status.get("spot_trade_scope_verified")),
+                  ("Write schema", status.get("write_schema_verified")),
+                  ("Exchange filters", status.get("symbol_exchange_flags_verified")),
+                  ("Risk policy", status.get("live_limits_valid")),
+                  ("Protection", status.get("protective_order_capability_verified")))
+        lines.extend(f"{name:23} {'✅' if passed else '❌'}" for name, passed in checks)
+        lines += ["LIVE enabled: " + ("✅" if self.settings.live.enabled else "❌"), "LIVE armed: " + ("✅" if self.live_arm.status().armed else "❌"), "", "Execution ready: " + ("YES ✅" if execution_ready else "NO")]
+        if not execution_ready: lines += ["", "Run:", "aktifkan mode live"]
+        return {"authorization": record, "execution_ready": execution_ready, "readiness": status, "presentation": {"text": "\n".join(lines)}}
 
     @staticmethod
     def _raise_policy_rejection(result: Any, *, phase: str) -> None:
@@ -1266,6 +1470,8 @@ class SpotGuard:
                 raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
             if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
                 raise SecurityError("LIVE recovery arm is EXIT_ONLY; new LIVE entries are forbidden")
+            if not self.is_live_entry_authorized():
+                raise SecurityError("LIVE_AUTHORIZATION_REQUIRED: activate LIVE through the Telegram readiness wizard")
             if quote_amount <= 0:
                 raise PolicyError("LIVE quote amount must be positive")
             ceiling = absolute_entry_ceiling(self.settings, "live")
@@ -1273,7 +1479,7 @@ class SpotGuard:
                 raise PolicyError(
                     f"requested amount {quote_amount} USDT exceeds configured maximum {decimal_string(ceiling)} USDT"
                 )
-            readiness = self.live_status(check_symbols=True)
+            readiness = self.live_entry_readiness(check_symbols=True, enforce_expiry=True)
             if not readiness["execution_ready"]:
                 raise SecurityError("live execution readiness checks have not all passed")
             proposal_mode, source, ttl = "live", "manual-live", self.settings.live.approval_ttl_seconds
@@ -1441,6 +1647,10 @@ class SpotGuard:
         if stop_price <= 0 or not stop_price < limit_price < target_price:
             raise PolicyError("LIVE tick-aligned bracket is invalid")
         if auto_size and self.settings.sizing_policy.percentage_based:
+            # This is an allocation preview only.  It establishes the upper
+            # risk-derived quote allowance before LOT_SIZE rounding; the
+            # exchange-aligned quantity and its actual spend are evaluated
+            # again below before anything is persisted.
             preview = self._validate_live_entry_limits(
                 symbol,
                 limit_price,
@@ -1462,6 +1672,27 @@ class SpotGuard:
             raise PolicyError(
                 "MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE: requested LIVE amount is below Binance minimum notional after rounding; amount will not be increased"
             )
+        # A LIMIT order can only spend quantity * limit price.  Persist that
+        # exact, downward-rounded amount, then run the same authoritative
+        # evaluator against those exact immutable terms.  In particular, do
+        # not retain the pre-rounding dynamic allowance as a proposal amount:
+        # approval/execution must see the identical policy action.
+        effective_quote_amount = live_quantity * limit_price
+        if effective_quote_amount <= 0:
+            raise PolicyError("REVALIDATION_FAILED: exchange-rounded LIVE amount is not positive")
+        # Natural-language manual BUY amounts are a maximum quote allowance,
+        # never an exact-fill demand.  Keep the original allowance immutable
+        # for auditability while `quote_amount` remains the exact executable
+        # spend used by the risk evaluator and execution boundary.
+        requested_quote_amount = Decimal(str(
+            canonical.get("requested_quote_amount", quote_amount)
+        ))
+        if effective_quote_amount > requested_quote_amount:
+            raise PolicyError("REVALIDATION_FAILED: downward LOT_SIZE rounding exceeded the requested LIVE maximum")
+        quote_amount = effective_quote_amount
+        values["quote_amount"] = str(quote_amount)
+        canonical["quote_amount"] = str(quote_amount)
+        canonical.setdefault("requested_quote_amount", str(requested_quote_amount))
         pending_quantity = floor_to_step(
             live_quantity * (Decimal("1") - self.settings.risk.paper_fee_pct / Decimal("100")), market.step_size,
         )
@@ -1471,7 +1702,9 @@ class SpotGuard:
         if (absolute_entry_ceiling(self.settings, "live") is not None
                 and risk_at_stop > self.settings.live.max_risk_per_position_usdt):
             raise PolicyError(f"LIVE risk at stop exceeds {self.settings.live.max_risk_per_position_usdt} USDT")
-        projection = self._validate_live_entry_limits(symbol, quote_amount, live_quantity, risk_at_stop, market.bid)
+        projection = self._validate_live_entry_limits(
+            symbol, quote_amount, live_quantity, risk_at_stop, market.bid
+        )
         values.update({"entry_reference": str(limit_price), "stop_reference": str(stop_price),
                        "take_profit_reference": str(target_price)})
         canonical.update({"entry_reference": str(limit_price), "entry_limit_price": str(limit_price),
@@ -2459,7 +2692,9 @@ class SpotGuard:
             # quote, exchange rounding, account snapshot, and OTOCO invariant
             # as a manually requested LIVE entry.
             market = fetch_spot_snapshot(self.settings, candidate["symbol"])
-            readiness = self.live_status(check_symbols=True, symbols=[candidate["symbol"]])
+            readiness = self.live_entry_readiness(
+                check_symbols=True, symbols=[candidate["symbol"]], enforce_expiry=True
+            )
             if not readiness["execution_ready"]:
                 raise SecurityError("scheduled LIVE proposal mode is not execution-ready")
             self._prepare_live_entry_proposal(
@@ -2644,14 +2879,16 @@ class SpotGuard:
             validate_claim(self.settings, proposal, daily)
             if proposal["mode"] == "paper":
                 self._revalidate_paper_entry_policy(proposal, phase="approval")
-            else:
+            elif self._is_live_entry(proposal):
+                if not self.is_live_entry_authorized():
+                    raise SecurityError("LIVE_AUTHORIZATION_REQUIRED: LIVE entry authorization is missing or expired")
                 arm = self.live_arm.status()
                 if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
                     self._validate_exit_only_approval(proposal, arm)
                 else:
                     # Re-check the exact pair at the normal LIVE entry gate.
-                    readiness = self.live_status(
-                        check_symbols=True, symbols=[proposal["symbol"]]
+                    readiness = self.live_entry_readiness(
+                        check_symbols=True, symbols=[proposal["symbol"]], enforce_expiry=True
                     )
                     if not readiness["execution_ready"]:
                         raise SecurityError(
@@ -2720,19 +2957,24 @@ class SpotGuard:
     @localized
     def execute_live(self, proposal_id: str, lease: str) -> dict[str, Any]:
         proposal, lease_hash = self._verify_execution_lease(proposal_id, lease)
-        if not self.settings.live.enabled:
+        is_entry = self._is_live_entry(proposal)
+        if is_entry and not self.is_live_entry_authorized():
+            self.ledger.fail_execution(proposal_id, lease_hash, "LIVE authorization is missing or expired")
+            raise SecurityError("LIVE_AUTHORIZATION_REQUIRED: LIVE entry authorization is missing or expired")
+        if is_entry and not self.settings.live.enabled:
             self.ledger.fail_execution(proposal_id, lease_hash, "live execution is disabled locally")
             raise SecurityError("LIVE_NOT_ENABLED: live executor is disabled locally")
         arm = self.live_arm.status()
-        if not arm.armed:
+        if is_entry and not arm.armed:
             self.ledger.fail_execution(proposal_id, lease_hash, "live arm expired before executor invocation")
             raise SecurityError("LIVE_NOT_ARMED: live trading is not armed on the VPS")
         if proposal["mode"] != "live":
             raise SecurityError("live executor cannot execute a paper proposal")
-        if getattr(arm, "scope", "FULL") == "EXIT_ONLY":
+        if is_entry and getattr(arm, "scope", "FULL") == "EXIT_ONLY":
             self._validate_exit_only_approval(proposal, arm)
         try:
-            self._revalidate_live_buy_entry(proposal)
+            if is_entry:
+                self._revalidate_live_buy_entry(proposal)
         except Exception as exc:
             # No write has started. A stale balance/equity/risk snapshot is a
             # normal policy rejection, never an ambiguous execution outcome.

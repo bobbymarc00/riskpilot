@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from spotguard.config import ConfigError, load_settings
@@ -33,6 +34,7 @@ MARKET = SpotMarketSnapshot(
 def sizing_config(
     root: Path, *, initial: Decimal = Decimal("1000"),
     live_enabled: bool = False, backstop: bool = False,
+    entry_cap: Decimal | None = None,
 ) -> Path:
     raw = config_dict(root)
     raw["version"] = 2
@@ -63,6 +65,12 @@ def sizing_config(
         "scaling_model": "equity_percentage_risk",
     }
     raw["absolute_safety_caps"] = {"enabled": backstop}
+    if entry_cap is not None:
+        # Deliberately configure, rather than mutate, the legacy absolute
+        # ceiling so this regression covers the production backstop semantics.
+        raw["risk"]["max_quote_per_trade"] = str(entry_cap)
+        raw["paper"]["max_quote_per_entry_usdt"] = str(entry_cap)
+        raw["live"]["max_quote_per_entry_usdt"] = str(entry_cap)
     path = root / "config.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
     return path
@@ -256,6 +264,80 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
             self.assertFalse(explicit_too_large.accepted)
             self.assertEqual(explicit_too_large.calculated_notional, Decimal("21"))
             self.assertIn("MAX_POSITION_EXCEEDED", explicit_too_large.reason_codes)
+
+    def test_dynamic_sizing_never_persists_above_enabled_hard_entry_cap(self) -> None:
+        """20% of 33.12345966 is 6.624691932, but the configured cap wins."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(sizing_config(
+                Path(directory), initial=Decimal("33.12345966"),
+                backstop=True, entry_cap=Decimal("6"),
+            ))
+            context = policy_context(settings, "33.12345966")
+            dynamic = Decimal("33.12345966") * Decimal("0.20")
+            self.assertEqual(dynamic, Decimal("6.6246919320"))
+
+            automatic = size_entry(
+                context, entry_price=Decimal("100"), stop_price=Decimal("99")
+            )
+            below = size_entry(
+                context, entry_price=Decimal("100"), stop_price=Decimal("99"),
+                requested_notional=Decimal("5.5"),
+            )
+            exact = size_entry(
+                context, entry_price=Decimal("100"), stop_price=Decimal("99"),
+                requested_notional=Decimal("6"),
+            )
+            above = size_entry(
+                context, entry_price=Decimal("100"), stop_price=Decimal("99"),
+                requested_notional=dynamic,
+            )
+
+            self.assertTrue(automatic.accepted)
+            self.assertEqual(automatic.calculated_notional, Decimal("6.00000000"))
+            self.assertTrue(below.accepted)
+            self.assertEqual(below.calculated_notional, Decimal("5.5"))
+            self.assertTrue(exact.accepted)
+            self.assertEqual(exact.calculated_notional, Decimal("6"))
+            self.assertFalse(above.accepted)
+            self.assertIn("PER_POSITION_HARD_CAP", above.reason_codes)
+            self.assertIn("requested/dynamic notional 6.6246919320 exceeds maximum 6.00000000", above.reasons[0])
+
+    def test_live_auto_size_rechecks_exchange_rounded_terms_before_persistence(self) -> None:
+        """The snapshot must describe the persisted quantity, never a preview 1."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(sizing_config(Path(directory), live_enabled=True))
+            service = SpotGuard(settings)
+            service.live_arm.status = Mock(return_value=SimpleNamespace(scope="FULL"))
+            calls: list[tuple[Decimal, Decimal, bool]] = []
+
+            def validate(symbol, quote, quantity, risk, bid, *, explain=False,
+                         proposal_equity=None, auto_size=False):
+                calls.append((quote, quantity, auto_size))
+                if auto_size:
+                    return {"calculated_notional": "6.624691932"}
+                return {"policy_snapshot": {"sizing": {
+                    "stop_distance_pct": "0.02", "risk_budget": "0.1",
+                }}}
+
+            service._validate_live_entry_limits = Mock(side_effect=validate)
+            market = SpotMarketSnapshot(
+                "BTCUSDT", Decimal("100"), Decimal("100"), Decimal("100"),
+                Decimal("5"), Decimal("0.001"), "TRADING", 1, Decimal("0.01"),
+            )
+            values = {"quote_amount": "5", "stop_reference": "98",
+                      "reward_risk": "2", "canonical": {
+                "proposal_id": "p-1234567890ab", "created_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2026-01-01T00:15:00Z", "symbol": "BTCUSDT",
+                "candidate_id": "c-1234567890ab", "source": "test",
+                "quote_amount": "5", "stop_reference": "98", "reward_risk": "2",
+            }}
+            service._prepare_live_entry_proposal(values, Decimal("5"), market, True,
+                                                 auto_size=True)
+
+            self.assertEqual(calls[0], (Decimal("100.20"), Decimal("1"), True))
+            self.assertEqual(calls[1], (Decimal("6.61320"), Decimal("0.066"), False))
+            self.assertEqual(Decimal(values["quote_amount"]), Decimal("6.61320"))
+            self.assertEqual(values["canonical"]["policy_snapshot"]["proposal_terms"]["calculated_quantity"], "0.066")
 
     def test_equity_drift_tolerance_only_auto_invalidates_large_decline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

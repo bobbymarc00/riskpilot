@@ -186,6 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
     trade_intent.add_argument("--notify", action="store_true")
     trade_intent.add_argument("--dry-run", action="store_true")
 
+    telegram_live = subparsers.add_parser("telegram-live", help="trusted Telegram LIVE readiness wizard")
+    telegram_live.add_argument("--text", required=True)
+    telegram_live.add_argument("--sender-id", required=True)
+    telegram_live.add_argument("--chat-id", required=True)
+
     paper_close = subparsers.add_parser("paper-close", help="create a manual paper-close proposal")
     paper_close.add_argument("position_id")
     paper_close.add_argument("--sender-id", required=True)
@@ -643,6 +648,20 @@ def _run(args: argparse.Namespace) -> Any:
         return service.finalize_live_risk_epoch(operator_confirmed=True, empty_only=True)
     if args.command == "paper":
         return service.paper_status() if args.paper_command == "positions" else service.paper_balance_status()
+    if args.command == "telegram-live":
+        text = args.text.strip()
+        normalized = " ".join(text.lower().split())
+        if normalized in {"cek live readiness", "live readiness", "check live readiness", "status live", "cek readiness live"}:
+            return service.telegram_live_readiness(args.sender_id, args.chat_id)
+        if normalized in {"aktifkan mode live", "enable live", "activate live mode", "arm live", "aktifkan live trading"}:
+            return service.request_live_activation(args.sender_id, args.chat_id)
+        if text == "READY TO LIVE TRADE":
+            return service.confirm_live_activation(text, args.sender_id, args.chat_id)
+        if normalized in {"nonaktifkan mode live", "disable live", "deactivate live", "disarm live", "matikan live trading"}:
+            return service.request_live_deactivation(args.sender_id, args.chat_id)
+        if text == "DISABLE LIVE TRADING":
+            return service.confirm_live_deactivation(text, args.sender_id, args.chat_id)
+        raise SecurityError("unrecognized LIVE readiness wizard command")
     if args.command in {"paper-intent", "trade-intent"}:
         service._validate_owner(args.sender_id)
         if args.chat_id != service.settings.telegram.chat_id:

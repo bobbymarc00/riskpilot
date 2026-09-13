@@ -196,6 +196,25 @@ class Ledger:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
+                CREATE TABLE IF NOT EXISTS live_authorizations (
+                    authorization_id TEXT PRIMARY KEY,
+                    activated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    activated_by_sender_id TEXT NOT NULL,
+                    activated_in_chat_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('ACTIVE','EXPIRED','REVOKED')),
+                    revoked_at TEXT,
+                    revoke_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_authorizations_status ON live_authorizations(status, expires_at DESC);
+                CREATE TABLE IF NOT EXISTS live_confirmation_challenges (
+                    id TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL CHECK(operation IN ('ACTIVATE','DEACTIVATE')),
+                    sender_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
                 """
             )
             now = isoformat()
@@ -213,6 +232,74 @@ class Ledger:
             self.path.chmod(0o600)
         except PermissionError:
             pass
+
+    def create_live_challenge(self, challenge_id: str, operation: str, sender_id: str,
+                              chat_id: str, expires_at: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM live_confirmation_challenges WHERE sender_id=? AND chat_id=? AND operation=?", (sender_id, chat_id, operation))
+            connection.execute("INSERT INTO live_confirmation_challenges VALUES(?,?,?,?,?,NULL)",
+                               (challenge_id, operation, sender_id, chat_id, expires_at))
+
+    def consume_live_challenge(self, operation: str, sender_id: str, chat_id: str,
+                               now: str) -> bool:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM live_confirmation_challenges WHERE operation=? AND sender_id=? AND chat_id=? ORDER BY rowid DESC LIMIT 1", (operation, sender_id, chat_id)).fetchone()
+            if row is None or row["consumed_at"] is not None or parse_time(row["expires_at"]) <= parse_time(now):
+                return False
+            connection.execute("UPDATE live_confirmation_challenges SET consumed_at=? WHERE id=? AND consumed_at IS NULL", (now, row["id"]))
+            return connection.execute("SELECT changes()").fetchone()[0] == 1
+
+    def active_live_authorization(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM live_authorizations WHERE status='ACTIVE' ORDER BY activated_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def latest_live_authorization(self) -> dict[str, Any] | None:
+        """Return the most recent lease, including an explicit revocation.
+
+        Entry authorization must continue to use ``active_live_authorization``.
+        Status presentation, on the other hand, needs the terminal state so a
+        user-initiated revoke is never misrepresented as natural expiry.
+        """
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM live_authorizations ORDER BY activated_at DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def grant_live_authorization(self, authorization_id: str, activated_at: str, expires_at: str,
+                                 sender_id: str, chat_id: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute("UPDATE live_authorizations SET status='REVOKED', revoked_at=?, revoke_reason='RENEWED' WHERE status='ACTIVE'", (activated_at,))
+            connection.execute("INSERT INTO live_authorizations VALUES(?,?,?,?,?,'ACTIVE',NULL,NULL)",
+                               (authorization_id, activated_at, expires_at, sender_id, chat_id))
+        return self.active_live_authorization() or {}
+
+    def expire_live_authorization_if_needed(self, now: str) -> dict[str, Any] | None:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM live_authorizations WHERE status='ACTIVE' ORDER BY activated_at DESC LIMIT 1").fetchone()
+            if row is not None and parse_time(row["expires_at"]) <= parse_time(now):
+                connection.execute("UPDATE live_authorizations SET status='EXPIRED' WHERE authorization_id=?", (row["authorization_id"],))
+                result = dict(row); result["status"] = "EXPIRED"
+                return result
+        return None
+
+    def revoke_live_authorization(self, reason: str, now: str) -> dict[str, Any] | None:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM live_authorizations WHERE status='ACTIVE' ORDER BY activated_at DESC LIMIT 1").fetchone()
+            if row is None:
+                return None
+            connection.execute("UPDATE live_authorizations SET status='REVOKED', revoked_at=?, revoke_reason=? WHERE authorization_id=?", (now, reason, row["authorization_id"]))
+            result = dict(row); result.update(status="REVOKED", revoked_at=now, revoke_reason=reason)
+            return result
+
+    def invalidate_pending_live_entries(self, reason: str) -> int:
+        with self.transaction() as connection:
+            rows = connection.execute("SELECT id, canonical_json FROM proposals WHERE mode='live' AND status='PENDING'").fetchall()
+            ids = [row["id"] for row in rows if json.loads(row["canonical_json"]).get("side") == "BUY"]
+            for proposal_id in ids:
+                connection.execute("UPDATE proposals SET status='EXPIRED', failure_reason=? WHERE id=? AND status='PENDING'", (reason, proposal_id))
+            return len(ids)
 
     @staticmethod
     def _decode_candidate(row: sqlite3.Row | None) -> dict[str, Any] | None:

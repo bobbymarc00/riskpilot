@@ -94,6 +94,17 @@ def price_display(value: Any, locale: str) -> str:
 
 def error_text(error: Exception, locale: str) -> str:
     detail = str(error).lower()
+    hard_cap = re.search(
+        r"per_position_hard_cap:\s*requested/dynamic notional ([0-9.]+) "
+        r"exceeds maximum ([0-9.]+)",
+        detail,
+    )
+    if hard_cap:
+        return translate(
+            "policy.per_position_hard_cap", locale,
+            requested=compact_number(hard_cap.group(1), locale, 4),
+            maximum=compact_number(hard_cap.group(2), locale, 4),
+        )
     maximum = re.search(r"requested amount ([0-9.]+) usdt exceeds configured maximum ([0-9.]+) usdt", detail)
     if maximum:
         return translate("policy.max_order_exceeded", locale, amount=compact_number(maximum.group(1), locale, 4), maximum=compact_number(maximum.group(2), locale, 4))

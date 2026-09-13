@@ -1496,6 +1496,12 @@ For the complete release record, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Disclaimer
 
+## Telegram LIVE readiness wizard
+
+From the trusted Telegram chat, send `cek live readiness` for a read-only report. To activate, send `aktifkan mode live` and then exactly `READY TO LIVE TRADE`. A successful authorization lasts seven days; activation does not execute a trade or create a proposal, and every LIVE trade still needs the existing proposal and human approval.
+
+To stop new exposure, send `nonaktifkan mode live` and then exactly `DISABLE LIVE TRADING`. Deactivation revokes authorization and disarms new LIVE entries, while protective exits (TP/SL/OCO), partial/full exits, and protection for existing positions remain available. Expiry likewise blocks new exposure without abandoning existing positions.
+
 RiskPilot is experimental hackathon software.
 
 It is not financial advice and does not guarantee profitability or trading performance.

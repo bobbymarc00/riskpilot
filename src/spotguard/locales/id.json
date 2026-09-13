@@ -79,6 +79,7 @@
   "policy.max_order_exceeded": "Nominal {amount} USDT melebihi batas maksimum yang dikonfigurasi sebesar {maximum} USDT.",
   "policy.non_positive": "Nominal yang diminta harus lebih dari 0 USDT.",
   "policy.risk_limit": "Permintaan ditolak: batas risiko, eksposur, kuota, saldo, atau bursa tercapai.",
+  "policy.per_position_hard_cap": "Permintaan ditolak: PER_POSITION_HARD_CAP — diminta/dinamis: {requested} USDT; maksimum: {maximum} USDT.",
   "approval.paper.success": "Persetujuan PAPER diterima; pengisian simulasi selesai.",
   "approval.live.success": "Persetujuan LIVE berhasil dieksekusi.",
   "approval.live.partial_exit": "Partial exit LIVE berhasil dieksekusi.",
