@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from functools import lru_cache, wraps
 from inspect import signature
 from pathlib import Path
@@ -66,6 +66,30 @@ def compact_number(value: Any, locale: str, maximum_places: int = 4, minimum_pla
         fraction += "0" * (minimum_places - len(fraction))
     result = whole + ("." + fraction if fraction else "")
     return result.translate(str.maketrans({",": ".", ".": ","})) if locale == "id" else result
+
+
+def price_display(value: Any, locale: str) -> str:
+    """Format a price for display without changing its stored value.
+
+    Prices of at least one unit retain the conventional two decimal places.
+    Positive prices below one use up to six significant digits in fixed-point
+    notation, retaining leading-zero precision without scientific notation or
+    unnecessary trailing zeroes.
+    """
+    amount = Decimal(str(value))
+    if not amount.is_finite():
+        raise ValueError("non-finite presentation number")
+    if amount == 0 or abs(amount) >= 1:
+        return compact_number(amount, locale, 2, 2)
+
+    # Quantizing relative to the adjusted exponent preserves useful precision
+    # for low-price assets while guaranteeing a non-zero fixed-point display.
+    with localcontext() as context:
+        context.prec = max(28, len(amount.as_tuple().digits) + 6)
+        precision = Decimal(1).scaleb(amount.adjusted() - 5)
+        rounded = amount.quantize(precision, rounding=ROUND_HALF_UP)
+    text = format(rounded, "f").rstrip("0").rstrip(".")
+    return text.replace(".", ",") if locale == "id" else text
 
 
 def error_text(error: Exception, locale: str) -> str:

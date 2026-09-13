@@ -11,11 +11,34 @@ from spotguard.config import load_settings
 from spotguard.security import SecurityError
 from spotguard.service import SpotGuard
 from spotguard.telegram import candidate_message, proposal_message
+from spotguard.presentation import price_display
 
 from tests.helpers import config_dict, write_config
 
 
 class TelegramAndCallbackTests(unittest.TestCase):
+    def test_candidate_price_display_adapts_without_scientific_notation(self) -> None:
+        self.assertEqual(price_display(Decimal("0.000697"), "en"), "0.000697")
+        self.assertEqual(price_display(Decimal("0.00791"), "en"), "0.00791")
+        self.assertEqual(price_display(Decimal("0.14"), "en"), "0.14")
+        self.assertEqual(price_display(Decimal("1.23"), "en"), "1.23")
+        self.assertEqual(price_display(Decimal("99.57"), "en"), "99.57")
+        self.assertEqual(price_display(Decimal("1139.61"), "en"), "1,139.61")
+        self.assertNotEqual(price_display(Decimal("0.000000000123"), "en"), "0.00")
+        self.assertNotIn("e", price_display(Decimal("0.000000000123"), "en").lower())
+        self.assertEqual(price_display(Decimal("0"), "en"), "0.00")
+
+    def test_candidate_message_uses_adaptive_price_display_and_keeps_review_route(self) -> None:
+        candidate = {"id": "c-0123456789ab", "symbol": "VTHOUSDT", "interval": "15m",
+                     "score": 80, "price": Decimal("0.000697")}
+        message, buttons = candidate_message(candidate)
+        self.assertIn("Reference: 0.000697", message)
+        self.assertEqual(buttons, [{
+            "label": "AI REVIEW",
+            "command": "/binance_spotguard review c-0123456789ab",
+            "style": "primary",
+        }])
+
     def test_agent_os_seeded_demo_is_paper_only_and_price_aligned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = load_settings(write_config(Path(directory)))

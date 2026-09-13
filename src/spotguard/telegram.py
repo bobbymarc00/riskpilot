@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from .config import Settings
-from .presentation import compact_number, translate, number
+from .presentation import compact_number, translate, number, price_display
 
 
 class TelegramError(RuntimeError):
@@ -48,7 +48,7 @@ def _command(value: str) -> str:
 
 def candidate_message(candidate: dict[str, Any], locale: str = "en") -> tuple[str, list[dict[str, str]]]:
     text = translate("candidate.body", locale, symbol=candidate["symbol"], interval=candidate["interval"],
-                     score=number(candidate["score"], locale, 0), price=number(candidate["price"], locale),
+                     score=number(candidate["score"], locale, 0), price=price_display(candidate["price"], locale),
                      identifier=candidate["id"])
     return text, [{
     "label": translate("button.review", locale),
