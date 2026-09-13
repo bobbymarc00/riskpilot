@@ -458,6 +458,25 @@ class SpotGuard:
         canonical["policy_snapshot"] = snapshot
         values["canonical_json"] = canonical_json(values["canonical"])
 
+    @staticmethod
+    def _same_finite_decimal(left: Any, right: Any) -> bool:
+        """Compare persisted numeric evidence by value, never by formatting.
+
+        Policy snapshots are immutable JSON evidence, so malformed, missing, or
+        non-finite numeric values must fail closed.  Decimal preserves trailing
+        zeroes in its textual form; equality deliberately does not.
+        """
+        try:
+            left_decimal = Decimal(str(left))
+            right_decimal = Decimal(str(right))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return (
+            left_decimal.is_finite()
+            and right_decimal.is_finite()
+            and left_decimal == right_decimal
+        )
+
     def _validate_stored_policy_snapshot(self, proposal: dict[str, Any]) -> None:
         stored = proposal["canonical"].get("policy_snapshot")
         if stored is None and not self.settings.sizing_policy.enabled:
@@ -469,48 +488,74 @@ class SpotGuard:
         except ValueError as exc:
             raise PolicyError(str(exc)) from exc
         evaluation = stored.get("evaluation", {})
-        if str(evaluation.get("requested_notional")) != str(
-            proposal["canonical"].get("quote_amount")
+        canonical = proposal["canonical"]
+        if not self._same_finite_decimal(
+            evaluation.get("requested_notional"), canonical.get("quote_amount")
         ):
             raise PolicyError("immutable policy snapshot notional does not match proposal")
         if self.settings.sizing_policy.percentage_based:
             sizing = stored.get("sizing")
             if (not isinstance(sizing, dict) or sizing.get("accepted") is not True
-                    or str(sizing.get("calculated_notional"))
-                    != str(proposal["canonical"].get("quote_amount"))):
+                    or not self._same_finite_decimal(
+                        sizing.get("calculated_notional"), canonical.get("quote_amount")
+                    )):
                 raise PolicyError(
                     "immutable policy sizing does not match exact proposal action"
                 )
             captured_quantity = stored.get("proposal_state", {}).get(
                 "calculated_quantity"
             )
-            canonical_quantity = proposal["canonical"].get(
+            canonical_quantity = canonical.get(
                 "quantity",
-                proposal["canonical"].get(
+                canonical.get(
                     "gross_reference_quantity",
-                    proposal["canonical"].get("reference_quantity"),
+                    canonical.get("reference_quantity"),
                 ),
             )
             if (captured_quantity is not None and canonical_quantity is not None
-                    and Decimal(str(captured_quantity))
-                    != Decimal(str(canonical_quantity))):
+                    and not self._same_finite_decimal(
+                        captured_quantity, canonical_quantity
+                    )):
                 raise PolicyError(
                     "immutable policy quantity does not match exact proposal action"
                 )
             terms = stored.get("proposal_terms")
-            expected_terms = {
+            identity_terms = {
                 "proposal_id": proposal["id"],
+                "created_at": canonical.get("created_at"),
+                "expires_at": canonical.get("expires_at"),
                 "symbol": proposal["symbol"],
-                "entry_price": proposal["canonical"].get("entry_reference"),
-                "stop_price": proposal["canonical"].get("stop_reference"),
-                "target_price": proposal["canonical"].get("take_profit_reference"),
-                "calculated_notional": proposal["canonical"].get("quote_amount"),
+                "side": canonical.get("side"),
+                "strategy_or_signal_reference": canonical.get("candidate_id"),
+                "source": canonical.get("source"),
             }
-            if (not isinstance(terms, dict)
-                    or any(str(terms.get(key)) != str(value)
-                           for key, value in expected_terms.items())):
+            numeric_terms = {
+                "entry_price": canonical.get("entry_reference"),
+                "stop_price": canonical.get("stop_reference"),
+                "target_price": canonical.get("take_profit_reference"),
+                "calculated_notional": canonical.get("quote_amount"),
+            }
+            if not isinstance(terms, dict):
                 raise PolicyError(
                     "APPROVAL_INVALID: immutable policy terms do not match proposal"
+                )
+            if any(terms.get(key) != value for key, value in identity_terms.items()):
+                raise PolicyError(
+                    "APPROVAL_INVALID: immutable policy terms do not match proposal"
+                )
+            if any(
+                not self._same_finite_decimal(terms.get(key), value)
+                for key, value in numeric_terms.items()
+            ):
+                raise PolicyError(
+                    "APPROVAL_INVALID: immutable policy terms do not match proposal"
+                )
+            terms_quantity = terms.get("calculated_quantity")
+            if terms_quantity is not None and canonical_quantity is not None and not self._same_finite_decimal(
+                terms_quantity, canonical_quantity
+            ):
+                raise PolicyError(
+                    "immutable policy quantity does not match exact proposal action"
                 )
 
     def _policy_reject(self, proposal: dict[str, Any], exc: Exception) -> None:

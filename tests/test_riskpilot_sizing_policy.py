@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,8 @@ from unittest.mock import Mock, patch
 
 from spotguard.config import ConfigError, load_settings
 from spotguard.market import SpotMarketSnapshot, synthetic_bullish_klines
+from spotguard.policy import PolicyError
+from spotguard.presentation import error_text, translate
 from spotguard.live_execution import LiveExecutionAdapter
 from spotguard.risk_policy.capital import (
     AssetValuation,
@@ -514,6 +517,81 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
                 policy["proposal_terms"]["calculated_notional"], "20"
             )
             self.assertEqual(policy["proposal_terms"]["proposal_id"], proposal["id"])
+
+    def test_immutable_snapshot_uses_finite_decimal_value_equality(self) -> None:
+        """Formatting-only changes in stored immutable Decimal evidence pass."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(sizing_config(Path(directory)))
+            service = SpotGuard(settings)
+            with patch("spotguard.service.fetch_spot_snapshot", return_value=MARKET), patch(
+                "spotguard.service.fetch_klines", return_value=synthetic_bullish_klines()
+            ):
+                base = service.create_manual_buy_proposal(
+                    "BTC", Decimal("6")
+                )["proposal"]
+
+            def with_notional(canonical_amount: str, snapshot_amount: str):
+                proposal = deepcopy(base)
+                canonical = proposal["canonical"]
+                snapshot = canonical["policy_snapshot"]
+                canonical["quote_amount"] = canonical_amount
+                snapshot["evaluation"]["requested_notional"] = snapshot_amount
+                snapshot["sizing"]["calculated_notional"] = snapshot_amount
+                snapshot["proposal_terms"]["calculated_notional"] = snapshot_amount
+                return proposal
+
+            # A / B / H: approval's immutable-snapshot gate accepts equivalent
+            # Decimal formatting rather than requiring lexical identity.
+            service._validate_stored_policy_snapshot(with_notional(
+                "1.9999200000000000", "1.99992"
+            ))
+            service._validate_stored_policy_snapshot(with_notional(
+                "5.9995380000000000", "5.999538"
+            ))
+
+            # C: numeric proposal terms (including price) receive the same
+            # semantic Decimal validation.
+            equivalent_price = with_notional("6", "6")
+            equivalent_price["canonical"]["entry_reference"] = "0.0078"
+            equivalent_price["canonical"]["policy_snapshot"]["proposal_terms"]["entry_price"] = "0.00780000"
+            equivalent_price["canonical"]["gross_reference_quantity"] = "0.066"
+            equivalent_price["canonical"]["policy_snapshot"]["proposal_state"]["calculated_quantity"] = "0.06600000"
+            equivalent_price["canonical"]["policy_snapshot"]["proposal_terms"]["calculated_quantity"] = "0.0660000000"
+            service._validate_stored_policy_snapshot(equivalent_price)
+
+            # D: a genuinely different notional remains fail-closed.
+            wrong_notional = with_notional("1.99992", "1.99992")
+            wrong_notional["canonical"]["policy_snapshot"]["evaluation"]["requested_notional"] = "1.99991"
+            with self.assertRaisesRegex(
+                PolicyError, "immutable policy snapshot notional does not match proposal"
+            ):
+                service._validate_stored_policy_snapshot(wrong_notional)
+
+            # E: quantity evidence is equally semantic when equivalent, but a
+            # different quantity is still rejected.
+            wrong_quantity = with_notional("6", "6")
+            wrong_quantity["canonical"]["gross_reference_quantity"] = "0.123"
+            wrong_quantity["canonical"]["policy_snapshot"]["proposal_state"]["calculated_quantity"] = "0.124"
+            wrong_quantity["canonical"]["policy_snapshot"]["proposal_terms"]["calculated_quantity"] = "0.12300000"
+            with self.assertRaisesRegex(PolicyError, "immutable policy quantity"):
+                service._validate_stored_policy_snapshot(wrong_quantity)
+
+    def test_immutable_snapshot_error_is_not_presented_as_minimum_order(self) -> None:
+        # F / G: only actual exchange minimum-notional rejections use the
+        # minimum-order presentation; internal approval evidence failures do not.
+        self.assertEqual(
+            error_text(
+                PolicyError("immutable policy snapshot notional does not match proposal"),
+                "en",
+            ),
+            translate("approval.validation", "en"),
+        )
+        self.assertEqual(
+            error_text(
+                PolicyError("MIN_NOTIONAL_EXCEEDS_RISK_DERIVED_SIZE"), "en"
+            ),
+            translate("policy.min_order", "en"),
+        )
 
     def test_conservative_equity_never_scales_old_proposal_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

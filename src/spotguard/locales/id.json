@@ -75,6 +75,7 @@
   "error.security": "Permintaan ditolak: pemeriksaan otorisasi atau keamanan gagal.",
   "approval.expired": "Persetujuan kedaluwarsa atau tidak lagi tertunda. Tidak ada eksekusi baru.",
   "approval.replay": "Tindakan PAPER ini sudah ditangani atau tidak dapat diulang. Tidak ada eksekusi baru.",
+  "approval.validation": "Permintaan ditolak: bukti persetujuan immutable gagal pada pemeriksaan konsistensi internal.",
   "policy.min_order": "Permintaan ditolak: jumlah di bawah minimum setelah pembulatan bursa. Jumlah tidak dinaikkan.",
   "policy.max_order_exceeded": "Nominal {amount} USDT melebihi batas maksimum yang dikonfigurasi sebesar {maximum} USDT.",
   "policy.non_positive": "Nominal yang diminta harus lebih dari 0 USDT.",

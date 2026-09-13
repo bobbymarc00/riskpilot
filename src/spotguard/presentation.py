@@ -111,11 +111,18 @@ def error_text(error: Exception, locale: str) -> str:
     if "quote amount must be positive" in detail:
         return translate("policy.non_positive", locale)
     key = "error.unavailable"
-    if "expired" in detail:
+    if "immutable policy" in detail:
+        key = "approval.validation"
+    elif "expired" in detail:
         key = "approval.expired"
     elif any(term in detail for term in ("not pending", "not claimable", "not executing", "replay", "already", "rejected from")):
         key = "approval.replay"
-    elif "minimum" in detail or "below" in detail or "notional" in detail:
+    elif (
+        "min_notional_exceeds_risk_derived_size" in detail
+        or "binance minimum notional" in detail
+        or "binance filters reject" in detail
+        or "minimum notional request" in detail
+    ):
         key = "policy.min_order"
     elif "maximum" in detail or "no more than" in detail:
         key = "policy.risk_limit"
