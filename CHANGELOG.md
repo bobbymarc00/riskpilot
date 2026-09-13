@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.5 — 2026-09-13
+
+- Bound LIVE permission attestations and readiness proofs to the active authorization lifecycle and expiry.
+- Added persisted readiness provenance and fail-closed permission diagnostics for LIVE execution.
+- Added controlled refresh and durable re-validation of stale permission and decimal-transport evidence.
+- Replaced lexical decimal matching with semantic finite-decimal equality for immutable LIVE approval validation.
+- Hardened LIVE session accounting with symbol-isolated FIFO inventory and explicit incomplete-PnL failure handling.
+- Expanded scalable equity-aware Risk Policy v2 documentation, sizing validation, and regression coverage.
+- Isolated and hardened Agent OS AI REVIEW execution, serialization, provider reporting, timeout handling, and owned-process cleanup.
+- Routed Telegram AI REVIEW through RiskPilot's native deterministic command boundary.
+- Added the versioned `riskpilot-direct-review` OpenClaw extension and installer integration.
+- Preserved successful AI REVIEW results when subsequent LIVE readiness or deterministic entry policy blocks proposal creation.
+- Improved LIVE readiness, permission, policy-rejection, and AI-review presentation in English and Indonesian.
+- Fixed low-price candidate reference formatting.
+- Added regression coverage for LIVE authorization lifecycle, readiness wizard behavior, permission diagnostics, LIVE entry integration, Telegram direct dispatch, natural-language trading intents, review timeout cleanup, extension packaging, and symbol-isolated risk accounting.
+- Preserved Spot-only execution, immutable proposals, fail-closed reconciliation, deterministic risk controls, and human-approved LIVE execution.
+
+
 ## 1.0.4 — 2026-09-11
 
 - Added marketable LIMIT LIVE entries with a deterministic hard slippage cap.

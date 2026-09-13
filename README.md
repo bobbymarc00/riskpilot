@@ -11,7 +11,7 @@
 
 **Binance Agent OS Mini Hackathon — Track A**
 
-**Current repository release:** `v1.0.4`  
+**Current repository release:** `v1.0.5`
 **Hackathon submission snapshot:** `v1.0.1`
 
 ### Hackathon submission snapshot
@@ -1438,6 +1438,20 @@ https://x.com/bobbymarc00/status/2097039814482878806
 ---
 
 ## Release History
+
+### v1.0.5 — 2026-09-13
+
+Post-submission authorization, AI review, and risk-accounting hardening.
+
+* Bound LIVE permission/readiness evidence to the active authorization lifecycle.
+* Added durable readiness provenance and safer permission-proof refresh.
+* Added semantic finite-decimal validation for immutable LIVE approval evidence.
+* Hardened symbol-isolated FIFO LIVE risk accounting.
+* Expanded scalable equity-aware Risk Policy v2 validation and documentation.
+* Hardened Agent OS AI REVIEW isolation, timeout cleanup, and Telegram routing.
+* Added the versioned `riskpilot-direct-review` OpenClaw extension.
+* Expanded LIVE authorization, readiness, Telegram, review, and execution regression coverage.
+* Preserved Spot-only, fail-closed, deterministic-risk, human-approved LIVE execution.
 
 ### v1.0.4 — 2026-09-11
 
