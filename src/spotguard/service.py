@@ -134,7 +134,8 @@ class SpotGuard:
 
     def live_entry_readiness(self, *, check_symbols: bool = True,
                              symbols: list[str] | None = None,
-                             enforce_expiry: bool = False) -> dict[str, Any]:
+                             enforce_expiry: bool = False,
+                             _allow_safe_refresh: bool = True) -> dict[str, Any]:
         """The single derived decision for opening/increasing LIVE exposure.
 
         The lease is intentionally independent from transient Binance health:
@@ -144,6 +145,22 @@ class SpotGuard:
         """
         record = self._authorization_record() if enforce_expiry else self.ledger.active_live_authorization()
         base = self.live_status(check_symbols=check_symbols, symbols=symbols)
+        # Every entry path (Telegram status, direct LIVE buy, and AI review)
+        # comes through here.  A stale decimal transport proof is refreshed by
+        # the existing non-submitting orderTest preflight, then re-read from
+        # SQLite; no in-memory success is ever an authorization decision.
+        permission = base.get("spot_trade_permission")
+        decimal = self.ledger.latest_event("live.decimal_transport_attestation")
+        decimal_stale = (isinstance(decimal, Mapping) and not self.live_executor._valid_decimal_transport_attestation(
+            decimal, base.get("test_order_schema_fingerprint")))
+        if (_allow_safe_refresh and isinstance(record, Mapping)
+                and isinstance(permission, Mapping) and permission.get("status") == "verified"
+                and decimal_stale and self.settings.live.allowed_symbols):
+            try:
+                self.prepare_live_session(self.settings.live.allowed_symbols[0], operator_confirmed=True)
+            except Exception:
+                pass
+            base = self.live_status(check_symbols=check_symbols, symbols=symbols)
         arm = self.live_arm.status()
         authorization_valid = bool(
             record and record.get("status") == "ACTIVE"
@@ -171,9 +188,23 @@ class SpotGuard:
         blockers.extend(missing)
         ready = bool(authorization_valid and full_arm and not missing
                      and base.get("execution_ready") is True)
+        if ready and not self._live_readiness_invariant(base):
+            ready = False
+            blockers.append("readiness_invariant")
         return {**base, "authorization": record, "authorization_valid": authorization_valid,
                 "live_armed": full_arm, "execution_ready": ready,
                 "blockers": list(dict.fromkeys(blockers))}
+
+    def _live_readiness_invariant(self, status: Mapping[str, Any]) -> bool:
+        """Never emit READY without re-reading the persisted permission proof."""
+        schema = status.get("test_order_schema_fingerprint")
+        permission = self.ledger.latest_event("live.trade_permission_attestation")
+        decimal = self.ledger.latest_event("live.decimal_transport_attestation")
+        authorization = self.ledger.active_live_authorization()
+        return bool(status.get("spot_trade_scope_verified") is True
+                    and status.get("decimal_transport_verified") is True
+                    and self.live_executor._valid_permission_attestation(permission, schema, authorization)
+                    and self.live_executor._valid_decimal_transport_attestation(decimal, schema))
 
     def is_live_entry_authorized(self, *, check_readiness: bool = True) -> bool:
         readiness = self.live_entry_readiness(
@@ -200,9 +231,16 @@ class SpotGuard:
         symbol = self.settings.live.allowed_symbols[0] if self.settings.live.allowed_symbols else ""
         if not symbol:
             return {"ok": False, "blockers": ["NO_LIVE_ALLOWED_SYMBOL"], "execution_ready": False}
+        # The permission proof is a child of this immutable lease.  Grant it
+        # first, then fail closed/revoke it if bounded preflight cannot prove
+        # the account capability.
+        now = utcnow(); authorization_id = "la-" + secrets.token_hex(12)
+        record = self.ledger.grant_live_authorization(authorization_id, isoformat(now), isoformat(now + timedelta(seconds=self._LIVE_AUTH_SECONDS)), sender_id, chat_id)
+        self.ledger.add_event("LIVE_AUTHORIZATION_GRANTED", authorization_id, {"sender_id": sender_id, "chat_id": chat_id, "expires_at": record["expires_at"]})
         prepared = self.prepare_live_session(symbol, operator_confirmed=True)
         blockers = [item for item in prepared.get("blockers", []) if item != "live_armed"]
         if blockers:
+            self.ledger.revoke_live_authorization("PREFLIGHT_FAILED", isoformat())
             self.ledger.add_event("LIVE_PREFLIGHT_BLOCKED", None, {"blockers": blockers})
             return {"ok": False, "blockers": blockers, "execution_ready": False, "readiness": prepared}
         # The seven-day authorization is explicit and persisted; it does not
@@ -213,9 +251,6 @@ class SpotGuard:
             self.live_arm.disarm()
             self.ledger.add_event("LIVE_PREFLIGHT_BLOCKED", None, {"blockers": final.get("blockers", ["LIVE_NOT_READY"])})
             return {"ok": False, "blockers": final.get("blockers", ["LIVE_NOT_READY"]), "execution_ready": False}
-        now = utcnow(); authorization_id = "la-" + secrets.token_hex(12)
-        record = self.ledger.grant_live_authorization(authorization_id, isoformat(now), isoformat(now + timedelta(seconds=self._LIVE_AUTH_SECONDS)), sender_id, chat_id)
-        self.ledger.add_event("LIVE_AUTHORIZATION_GRANTED", authorization_id, {"sender_id": sender_id, "chat_id": chat_id, "expires_at": record["expires_at"]})
         return {"ok": True, "authorization": record, "execution_ready": True, "readiness": final,
                 "presentation": {"text": "🛡️ RISKPILOT LIVE READINESS\n\n✅ Telegram identity trusted\n✅ Binance connection\n✅ Agentic Spot account\n✅ Spot Trade permission\n✅ Write schema verified\n✅ Exchange filters loaded\n✅ Risk policy valid\n✅ Protected exit available\n✅ LIVE enabled\n✅ LIVE armed\n\nAuthorization:\nActivated: %s\nExpires: %s\n\nLIVE EXECUTION READY ✅\n\nHuman approval is still required for every LIVE trade." % (record["activated_at"], record["expires_at"])}}
 
@@ -234,10 +269,29 @@ class SpotGuard:
 
     def telegram_live_readiness(self, sender_id: str, chat_id: str) -> dict[str, Any]:
         self._trusted_telegram(sender_id, chat_id)
-        # Read-only: it derives expiry/health but never mutates lease, arm, or
-        # proposals. The execution boundary invokes the same evaluator with
-        # durable expiry enforcement enabled.
+        evaluation_id = "lr-" + secrets.token_hex(8)
+        # A stale proof is not denial.  The only allowed refresh is the
+        # existing non-submitting spot.orderTest preflight.  It persists a new
+        # proof synchronously; we then evaluate again from SQLite rather than
+        # carrying an in-memory true value forward.
         status = self.live_entry_readiness(check_symbols=True, enforce_expiry=False)
+        refresh = None
+        permission = status.get("spot_trade_permission")
+        decimal_proof = self.ledger.latest_event("live.decimal_transport_attestation")
+        decimal_stale = (isinstance(decimal_proof, Mapping)
+                         and not self.live_executor._valid_decimal_transport_attestation(
+                             decimal_proof, status.get("test_order_schema_fingerprint")))
+        if (isinstance(permission, Mapping) and permission.get("status") == "stale") or (
+                permission and permission.get("status") == "verified" and decimal_stale):
+            symbol = self.settings.live.allowed_symbols[0] if self.settings.live.allowed_symbols else None
+            if symbol:
+                try:
+                    refresh = self.prepare_live_session(symbol, operator_confirmed=True)
+                except Exception as exc:
+                    refresh = {"status": "unknown", "reason": str(exc)[:240]}
+                # VERIFY → PERSIST → READ BACK → VALIDATE.  No readiness from
+                # prepare_live_session is trusted as an authorization result.
+                status = self.live_entry_readiness(check_symbols=True, enforce_expiry=False)
         # `live_entry_readiness` intentionally exposes only an ACTIVE lease:
         # that is the fail-closed entry gate.  Presentation additionally needs
         # a terminal lease to distinguish an explicit disable from expiry.
@@ -253,17 +307,35 @@ class SpotGuard:
             authorization_label = str(record["status"])
         lines = ["🛡️ RISKPILOT LIVE STATUS", "", "Mode: LIVE", "Authorization: " + authorization_label]
         if record: lines += ["Expires: " + record["expires_at"]]
+        permission = status.get("spot_trade_permission") if isinstance(status.get("spot_trade_permission"), Mapping) else {}
+        permission_status = permission.get("status", "unknown")
+        permission_mark = {"verified": "✅", "denied": "❌", "stale": "⏳", "unknown": "⚠️"}.get(permission_status, "⚠️")
         checks = (("Binance connection", status.get("binance_mcp_connected")),
                   ("Agentic Spot account", status.get("account_read_verified")),
-                  ("Spot Trade permission", status.get("spot_trade_scope_verified")),
                   ("Write schema", status.get("write_schema_verified")),
                   ("Exchange filters", status.get("symbol_exchange_flags_verified")),
                   ("Risk policy", status.get("live_limits_valid")),
                   ("Protection", status.get("protective_order_capability_verified")))
         lines.extend(f"{name:23} {'✅' if passed else '❌'}" for name, passed in checks)
+        lines.insert(6, f"{'Spot Trade permission':23} {permission_mark}")
         lines += ["LIVE enabled: " + ("✅" if self.settings.live.enabled else "❌"), "LIVE armed: " + ("✅" if self.live_arm.status().armed else "❌"), "", "Execution ready: " + ("YES ✅" if execution_ready else "NO")]
+        if not status.get("spot_trade_scope_verified") and permission.get("last_error"):
+            lines += ["Spot Trade reason: " + str(permission["last_error"])]
         if not execution_ready: lines += ["", "Run:", "aktifkan mode live"]
-        return {"authorization": record, "execution_ready": execution_ready, "readiness": status, "presentation": {"text": "\n".join(lines)}}
+        provenance = {"readiness_evaluation_id": evaluation_id,
+                      "timestamp_utc": isoformat(), "pid": __import__("os").getpid(),
+                      "database_path": str(self.settings.database_path),
+                      "permission_attestation_event_id": permission.get("permission_attestation_event_id"),
+                      "permission_verified_at": permission.get("checked_at"),
+                      "permission_expires_at": permission.get("expires_at"),
+                      "permission_status": permission.get("status", "unknown"),
+                      "spot_trade_scope_verified": status.get("spot_trade_scope_verified") is True,
+                      "execution_ready": execution_ready,
+                      "revalidation": refresh and {"execution_ready": refresh.get("execution_ready"),
+                                                       "permission_attestation": refresh.get("permission_attestation")}}
+        status["readiness_evaluation"] = provenance
+        return {"authorization": record, "execution_ready": execution_ready, "readiness": status,
+                "readiness_evaluation": provenance, "presentation": {"text": "\n".join(lines)}}
 
     @staticmethod
     def _raise_policy_rejection(result: Any, *, phase: str) -> None:
@@ -2471,7 +2543,7 @@ class SpotGuard:
         # review or make the deterministic Telegram command appear to fail.
         proposal_mode = self.settings.scheduled_proposal_mode
         if proposal_mode == "live":
-            readiness = self.live_status(
+            readiness = self.live_entry_readiness(
                 check_symbols=True, symbols=[candidate["symbol"]]
             )
             if not readiness["execution_ready"]:
@@ -2491,7 +2563,7 @@ class SpotGuard:
             # successfully completed read-only review.
             if (proposal_mode == "live"
                     and str(exc) == "scheduled LIVE proposal mode is not execution-ready"):
-                readiness = self.live_status(
+                readiness = self.live_entry_readiness(
                     check_symbols=True, symbols=[candidate["symbol"]]
                 )
                 return self._skipped_live_proposal_result(review_output, retry_used, readiness)
@@ -3826,7 +3898,8 @@ class SpotGuard:
         proofs = self.live_executor.verify_readiness(
             connected=connected, symbol_flags_verified=flags_ok,
             permission_attestation=self.ledger.latest_event("live.trade_permission_attestation"),
-            decimal_transport_attestation=self.ledger.latest_event("live.decimal_transport_attestation"))
+            decimal_transport_attestation=self.ledger.latest_event("live.decimal_transport_attestation"),
+            active_authorization=self.ledger.active_live_authorization())
         readiness = self.live_executor.readiness(
             connected=connected, armed=arm.armed, symbol_flags_verified=flags_ok,
             account_read_verified=proofs["account_read_verified"],
@@ -3837,6 +3910,13 @@ class SpotGuard:
             decimal_transport_verified=proofs["decimal_transport_verified"])
         result = readiness.to_dict()
         result["readiness_reasons"] = proofs.get("reasons", [])
+        result["test_order_schema_fingerprint"] = proofs.get("test_order_schema_fingerprint")
+        result["spot_trade_permission"] = proofs.get("spot_trade_permission", {
+            "status": "unknown", "verified": False, "source": "readiness",
+            "checked_at": None, "expires_at": None, "age_seconds": None,
+            "ttl_seconds": self.live_executor._PERMISSION_ATTESTATION_TTL_SECONDS,
+            "last_error": "permission diagnostics unavailable",
+        })
         result["decimal_transport_mode"] = proofs.get("decimal_transport_mode") or ("bounded" if proofs["decimal_transport_verified"] else "blocked")
         result["minimum_verified_fractional_number"] = proofs.get("minimum_verified_fractional_number")
         result["decimal_transport_attestation_present"] = proofs.get(
@@ -3893,6 +3973,7 @@ class SpotGuard:
             raise SecurityError("LIVE session symbol is not allowlisted")
         executor = self.live_executor
         permission_event = self.ledger.latest_event("live.trade_permission_attestation")
+        active_authorization = self.ledger.active_live_authorization()
         decimal_event = self.ledger.latest_event("live.decimal_transport_attestation")
         circuit = executor.rate_limit_status()
 
@@ -3936,7 +4017,8 @@ class SpotGuard:
         proofs = executor.verify_readiness(
             connected=True, symbol_flags_verified=flags_ok,
             permission_attestation=permission_event,
-            decimal_transport_attestation=decimal_event)
+            decimal_transport_attestation=decimal_event,
+            active_authorization=active_authorization)
         if executor.rate_limit_status()["status"] == "BLOCKED":
             circuit = executor.rate_limit_status()
             return blocked_result()
@@ -3962,8 +4044,11 @@ class SpotGuard:
             permission_result = executor.attest_spot_trade_permission(symbol, exchange, market, discovery=discovery)
             if permission_result.get("classification") == "SUCCESS":
                 now = utcnow()
+                if not isinstance(active_authorization, Mapping):
+                    raise SecurityError("LIVE authorization is required before permission attestation")
                 proof = {"result": "verified", "verified_at": isoformat(now),
-                         "expires_at": isoformat(now + timedelta(seconds=executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                         "expires_at": active_authorization["expires_at"],
+                         "authorization_id": active_authorization["authorization_id"],
                          "backend": self.settings.codex.mcp_server,
                          "profile_fingerprint": executor.execution_profile_fingerprint(),
                          "delegated_operation": "spot.orderTest",
@@ -4175,6 +4260,9 @@ class SpotGuard:
         symbols = tuple(self.settings.live.allowed_symbols)
         if not symbols:
             raise SecurityError("no LIVE Spot symbol is allowlisted")
+        authorization = self._authorization_record()
+        if not isinstance(authorization, Mapping):
+            raise SecurityError("LIVE authorization is required before permission attestation")
         account = self.live_executor.read_spot_account()
         if account.get("account_type") != "SPOT" or account.get("can_trade") is not True:
             raise SecurityError("authenticated Spot account metadata does not prove trade eligibility")
@@ -4185,7 +4273,8 @@ class SpotGuard:
         if result.get("classification") == "SUCCESS":
             verified_at = utcnow()
             proof = {"result": "verified", "verified_at": isoformat(verified_at),
-                     "expires_at": isoformat(verified_at + timedelta(seconds=self.live_executor._PERMISSION_ATTESTATION_TTL_SECONDS)),
+                     "expires_at": authorization["expires_at"],
+                     "authorization_id": authorization["authorization_id"],
                      "backend": self.settings.codex.mcp_server,
                      "profile_fingerprint": self.live_executor.execution_profile_fingerprint(),
                      "delegated_operation": "spot.orderTest",

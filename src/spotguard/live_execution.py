@@ -340,7 +340,8 @@ class LiveExecutionAdapter:
 
     def verify_readiness(self, *, connected: bool, symbol_flags_verified: bool,
                          permission_attestation: Mapping[str, Any] | None = None,
-                         decimal_transport_attestation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                         decimal_transport_attestation: Mapping[str, Any] | None = None,
+                         active_authorization: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Collect fresh read-only proofs; unavailable backend metadata fails closed."""
         account_ok = open_orders_ok = False
         account_scope_ok = False
@@ -386,12 +387,18 @@ class LiveExecutionAdapter:
         if isinstance(evidence_reasons, str): evidence_reasons = [evidence_reasons]
         if not isinstance(evidence_reasons, (list, tuple)): evidence_reasons = []
         attestation_ok = self._valid_permission_attestation(
-            permission_attestation, evidence.get("test_order_schema_fingerprint"))
+            permission_attestation, evidence.get("test_order_schema_fingerprint"), active_authorization)
         decimal_ok = self._valid_decimal_transport_attestation(
             decimal_transport_attestation, evidence.get("test_order_schema_fingerprint"))
         readiness_reasons = reasons + list(evidence_reasons)
         if not decimal_ok:
             readiness_reasons.append("REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER")
+        permission_status = self._permission_diagnostics(
+            permission_attestation, evidence.get("test_order_schema_fingerprint"),
+            account_type=account_type, can_trade=can_trade,
+            permission_metadata=evidence.get("permission_metadata"),
+            attestation_valid=attestation_ok,
+        )
         return {"account_read_verified": account_ok, "open_orders_read_verified": open_orders_ok,
                 "spot_trade_scope_verified": account_scope_ok and attestation_ok,
                 "write_tool_discovered": bool(evidence.get("write_tool_discovered")),
@@ -407,7 +414,8 @@ class LiveExecutionAdapter:
                 "decimal_transport_mode": "bounded" if decimal_ok else None,
                 "decimal_transport_remote_refresh_available": True,
                 "account_type": account_type, "can_trade": can_trade,
-                "account_balances": account_balances}
+                "account_balances": account_balances,
+                "spot_trade_permission": permission_status}
 
     def _decimal_attestation_present(self, proof: Mapping[str, Any] | None) -> bool:
         """Diagnostic visibility for a proof while remote refresh is blocked."""
@@ -850,7 +858,8 @@ class LiveExecutionAdapter:
         return __import__("hashlib").sha256(canonical_json(dict(schema)).encode()).hexdigest()
 
     def _valid_permission_attestation(self, proof: Mapping[str, Any] | None,
-                                      schema_fingerprint: str | None) -> bool:
+                                      schema_fingerprint: str | None,
+                                      active_authorization: Mapping[str, Any] | None = None) -> bool:
         if not isinstance(proof, Mapping) or proof.get("result") != "verified":
             return False
         if proof.get("delegated_operation") != self.permission_test_tool_name:
@@ -859,10 +868,69 @@ class LiveExecutionAdapter:
             return False
         if proof.get("profile_fingerprint") != self.execution_profile_fingerprint():
             return False
+        if active_authorization is not None:
+            if not isinstance(active_authorization, Mapping) or active_authorization.get("status") != "ACTIVE":
+                return False
+            if proof.get("authorization_id") != active_authorization.get("authorization_id"):
+                return False
         try:
-            return parse_time(proof.get("expires_at")) > utcnow()
+            proof_expiry = parse_time(proof.get("expires_at"))
+            if active_authorization is None:
+                return proof_expiry > utcnow()
+            authorization_expiry = parse_time(str(active_authorization["expires_at"]))
+            return proof_expiry <= authorization_expiry and proof_expiry > utcnow() and authorization_expiry > utcnow()
         except (TypeError, ValueError):
             return False
+
+    def _permission_diagnostics(self, proof: Mapping[str, Any] | None,
+                                schema_fingerprint: str | None, *,
+                                account_type: str | None, can_trade: bool | None,
+                                permission_metadata: Any,
+                                attestation_valid: bool) -> dict[str, Any]:
+        """Describe proof state separately from the fail-closed entry gate."""
+        now = utcnow()
+        checked_at = proof.get("verified_at") if isinstance(proof, Mapping) else None
+        expires_at = proof.get("expires_at") if isinstance(proof, Mapping) else None
+        age_seconds = None
+        if isinstance(checked_at, str):
+            try:
+                age_seconds = max(0, int((now - parse_time(checked_at)).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+        base = {"verified": False, "source": "spot.orderTest_attestation",
+                "permission_attestation_event_id": proof.get("event_id") if isinstance(proof, Mapping) else None,
+                "checked_at": checked_at if isinstance(checked_at, str) else None,
+                "expires_at": expires_at if isinstance(expires_at, str) else None,
+                "age_seconds": age_seconds,
+                "ttl_seconds": self._PERMISSION_ATTESTATION_TTL_SECONDS,
+                "last_error": None}
+        if attestation_valid and account_type == "SPOT" and can_trade is True:
+            return {**base, "status": "verified", "verified": True}
+        if account_type is not None and (account_type != "SPOT" or can_trade is False):
+            return {**base, "status": "denied", "source": "spot.getAccount",
+                    "last_error": "Binance account metadata did not permit Spot trading"}
+        if isinstance(permission_metadata, Mapping) and permission_metadata.get("verified") is False:
+            reasons = permission_metadata.get("reasons", [])
+            if "api_restrictions_spot_trade_not_enabled" in reasons:
+                return {**base, "status": "denied",
+                        "source": str(permission_metadata.get("tool") or "api_restrictions"),
+                        "last_error": "; ".join(str(item) for item in reasons)[:240]}
+        if isinstance(proof, Mapping) and proof.get("result") == "verified":
+            try:
+                stale = parse_time(str(proof.get("expires_at"))) <= now
+            except (TypeError, ValueError):
+                stale = True
+            if stale or proof.get("profile_fingerprint") != self.execution_profile_fingerprint() or (
+                    schema_fingerprint and proof.get("schema_fingerprint") != schema_fingerprint):
+                return {**base, "status": "stale",
+                        "last_error": "attestation expired or no longer matches the active execution profile/schema"}
+        if isinstance(permission_metadata, Mapping) and permission_metadata.get("verified") is False:
+            reasons = permission_metadata.get("reasons", [])
+            return {**base, "status": "unknown",
+                    "source": str(permission_metadata.get("tool") or "api_restrictions"),
+                    "last_error": "; ".join(str(item) for item in reasons)[:240] or None}
+        return {**base, "status": "unknown",
+                "last_error": "no fresh Spot order-test attestation is available"}
 
     def _valid_decimal_transport_attestation(self, proof: Mapping[str, Any] | None,
                                              schema_fingerprint: str | None) -> bool:

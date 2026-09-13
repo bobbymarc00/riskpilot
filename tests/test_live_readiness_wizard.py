@@ -121,6 +121,9 @@ class LiveReadinessWizardTests(TestCase):
         service = self.make_service(); now = utcnow()
         service.ledger.grant_live_authorization("la-active", isoformat(now), isoformat(now + timedelta(days=7)), "123456789", "123456789")
         service.live_arm.arm(60)
+        # This test isolates the shared connection decision; proof persistence
+        # is exercised separately by the readiness invariant tests.
+        service._live_readiness_invariant = Mock(return_value=True)
         service.live_status = Mock(return_value=self._healthy_readiness(connected=False))
         telegram = service.telegram_live_readiness("123456789", "123456789")
         self.assertFalse(telegram["execution_ready"])

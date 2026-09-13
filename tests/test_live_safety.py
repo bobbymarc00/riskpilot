@@ -2,6 +2,7 @@ from __future__ import annotations
 import json, tempfile, unittest
 from dataclasses import replace
 from decimal import Decimal
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -507,6 +508,7 @@ class LiveSafetyTests(unittest.TestCase):
  def test_successful_attestation_is_persisted_and_expiry_is_fail_closed(self):
   with tempfile.TemporaryDirectory() as d:
    service=SpotGuard(configured(Path(d),enabled=True))
+   now=utcnow(); service.ledger.grant_live_authorization("la-test",isoformat(now),isoformat(now+timedelta(days=7)),"123456789","123456789")
    service.live_executor.read_spot_account=Mock(return_value={"account_type":"SPOT","can_trade":True})
    service.live_executor.attest_spot_trade_permission=Mock(return_value={
     "classification":"SUCCESS","schema_fingerprint":"schema-fp","delegated_tool":"spot.orderTest"})

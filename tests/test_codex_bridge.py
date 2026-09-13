@@ -527,7 +527,7 @@ class CodexBridgeTests(unittest.TestCase):
                              "api_restrictions_equivalent_missing",
                              "test_order_permission_attestation_available_but_not_run",
                          ]}
-            with patch.object(service, "live_status", return_value=readiness), patch.object(
+            with patch.object(service, "live_entry_readiness", return_value=readiness), patch.object(
                 service, "create_proposal", side_effect=AssertionError("must not create proposal")
             ):
                 result = service.review_candidate_with_agent_os(candidate["id"])
@@ -560,13 +560,41 @@ class CodexBridgeTests(unittest.TestCase):
                              "api_restrictions_equivalent_missing",
                              "test_order_permission_attestation_available_but_not_run",
                          ]}
-            with patch.object(service, "live_status", return_value=readiness), patch.object(
+            with patch.object(service, "live_entry_readiness", return_value=readiness), patch.object(
                 service, "create_proposal", return_value={"proposal": proposal, "notification": None}
             ) as create:
                 result = service.review_candidate_with_agent_os(candidate["id"])
             self.assertEqual(result["proposal"], proposal)
             self.assertNotIn("proposal_status", result)
             create.assert_called_once()
+
+    def test_live_review_uses_canonical_entry_readiness_not_live_status(self) -> None:
+        """Regression: AI REVIEW must share stale-proof refresh with direct entry."""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(self._settings(Path(directory)), scheduled_proposal_mode="live")
+            service = SpotGuard(settings)
+            candidate = service.create_demo_candidate("BTCUSDT", 60000)["candidate"]
+            close = float(candidate["price"])
+            latest = Kline(candidate["candle_close_time"] - 899999, close, close + 1,
+                            close - 1, close, 1, candidate["candle_close_time"])
+            service.agent_os.review_candidate = Mock(return_value={
+                "decision": "APPROVE", "reason": "fresh", "fresh_data_verified": True,
+                "symbol": "BTCUSDT", "candidate_id": candidate["id"], "interval": "15m",
+                "candle": latest, "candles": [latest], "token_usage": {}, "elapsed_ms": 1,
+            })
+            readiness = {"execution_ready": True, "blockers": [], "readiness_reasons": [],
+                         "decimal_transport_verified": True, "spot_trade_scope_verified": True}
+            proposal = {"id": "p-ai-ready", "mode": "live", "status": "PENDING"}
+            # `live_status` must never be the review gate: only the canonical
+            # evaluator performs stale decimal refresh/read-back.
+            service.live_status = Mock(side_effect=AssertionError("AI REVIEW bypassed canonical readiness"))
+            service.live_entry_readiness = Mock(return_value=readiness)
+            service.live_executor.execute = Mock()
+            with patch.object(service, "create_proposal", return_value={"proposal": proposal, "notification": None}):
+                result = service.review_candidate_with_agent_os(candidate["id"])
+            service.live_entry_readiness.assert_called_once_with(check_symbols=True, symbols=["BTCUSDT"])
+            self.assertEqual(result["proposal"]["status"], "PENDING")
+            service.live_executor.execute.assert_not_called()
 
     def test_live_review_keeps_approved_review_when_proposal_policy_rejects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -586,7 +614,7 @@ class CodexBridgeTests(unittest.TestCase):
                 ("WEEKLY_LOSS_LIMIT_REACHED: weekly realized loss exhausted effective limit", "WEEKLY_LOSS_LIMIT_REACHED"),
                 ("LIVE active tranche limit reached (1)", "ENTRY_POLICY_REJECTED"),
             ):
-                with self.subTest(error=error), patch.object(service, "live_status", return_value=readiness), patch.object(
+                with self.subTest(error=error), patch.object(service, "live_entry_readiness", return_value=readiness), patch.object(
                     service, "create_proposal", side_effect=PolicyError(error)
                 ) as create:
                     result = service.review_candidate_with_agent_os(candidate["id"])

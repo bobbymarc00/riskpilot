@@ -342,7 +342,7 @@ class Ledger:
         """Return one audit payload; callers must store only redacted values."""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT payload_json, created_at FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+                "SELECT id, payload_json, created_at FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
                 (kind,),
             ).fetchone()
         if row is None:
@@ -355,6 +355,7 @@ class Ledger:
         # turn a stale successful probe into a fresh one after restart.
         payload.setdefault("observed_at", row["created_at"])
         payload["recorded_at"] = row["created_at"]
+        payload["event_id"] = row["id"]
         return payload
 
     def events_by_kind(self, kind: str) -> list[dict[str, Any]]:
