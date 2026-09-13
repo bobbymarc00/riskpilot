@@ -71,7 +71,11 @@ corresponding old value:
 effective maximum = min(equity × configured percentage, old absolute cap)
 ```
 
-The backstop is optional and disabled in the example configuration.
+The backstop is optional and disabled in the default configuration. Operators
+with regulatory or operational absolute-ceiling requirements can explicitly
+enable it and set the retained USD fields to their authorized emergency
+ceilings. Enabling it deliberately limits percentage scaling; it is not the
+normal schema-2 operating model.
 It clamps maximum allowances only; it does not activate the legacy 8 USDT
 reserve floor. Schema-2 reserve remains `effective equity × min_free_reserve_pct`.
 
@@ -118,7 +122,10 @@ With the default profile:
 | 30 | 6 | 18 | 0.15 | 0.45 | 0.60 | 1.50 | 6 |
 | 100 | 20 | 60 | 0.50 | 1.50 | 2 | 5 | 20 |
 | 1,000 | 200 | 600 | 5 | 15 | 20 | 50 | 200 |
-| 20,000 | 4,000 | 12,000 | 100 | 300 | 400 | 1,000 | 4,000 |
+| 10,000 | 2,000 | 6,000 | 50 | 150 | 200 | 500 | 2,000 |
+| 200,000 | 40,000 | 120,000 | 1,000 | 3,000 | 4,000 | 10,000 | 40,000 |
+| 1,000,000 | 200,000 | 600,000 | 5,000 | 15,000 | 20,000 | 50,000 | 200,000 |
+| 10,000,000 | 2,000,000 | 6,000,000 | 50,000 | 150,000 | 200,000 | 500,000 | 2,000,000 |
 
 `max_open_positions` is an integer operational limit and is not multiplied by
 equity.

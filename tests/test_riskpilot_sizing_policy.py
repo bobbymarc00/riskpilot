@@ -140,7 +140,10 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
                 "30": ("6", "18", "0.15", "0.45", "0.6", "1.5", "6"),
                 "100": ("20", "60", "0.5", "1.5", "2", "5", "20"),
                 "1000": ("200", "600", "5", "15", "20", "50", "200"),
-                "20000": ("4000", "12000", "100", "300", "400", "1000", "4000"),
+                "10000": ("2000", "6000", "50", "150", "200", "500", "2000"),
+                "200000": ("40000", "120000", "1000", "3000", "4000", "10000", "40000"),
+                "1000000": ("200000", "600000", "5000", "15000", "20000", "50000", "200000"),
+                "10000000": ("2000000", "6000000", "50000", "150000", "200000", "500000", "2000000"),
             }
             for equity, values in expected.items():
                 with self.subTest(equity=equity):
@@ -159,6 +162,17 @@ class RiskPilotSizingPolicyTests(unittest.TestCase):
                         )),
                         values,
                     )
+
+    def test_checked_in_default_config_scales_without_the_100_usdt_backstop(self) -> None:
+        settings = load_settings(Path(__file__).parents[1] / "config.json")
+        self.assertTrue(settings.sizing_policy.percentage_based)
+        self.assertFalse(settings.sizing_policy.absolute_usd_backstop_enabled)
+        for equity, expected_entry in (("30", Decimal("6")),
+                                       ("200000", Decimal("40000")),
+                                       ("1000000", Decimal("200000"))):
+            with self.subTest(equity=equity):
+                _, limits = limits_for(settings, "live", Decimal(equity))
+                self.assertEqual(limits.max_entry_notional, expected_entry)
 
     def test_optional_absolute_backstop_uses_existing_repo_caps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

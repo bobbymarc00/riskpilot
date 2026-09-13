@@ -361,7 +361,7 @@ The public example configuration currently uses:
 | Active minimum free reserve            | 20% of equity                    |
 | Active daily realized-loss cap         | 2% of equity                     |
 | Active weekly LIVE loss cap            | 5% of equity                     |
-| Optional legacy absolute safety caps   | Disabled in example              |
+| Optional emergency absolute safety caps| Disabled by default              |
 | Maximum economic positions             | 5                                |
 | Maximum active tranches                | 10                               |
 | Legacy/schema-1 LIVE free reserve      | 8 USDT                           |
@@ -387,10 +387,13 @@ The public example configuration currently uses:
 | Automatic ambiguous-write retry        | Disabled                         |
 
 For legacy configs these monetary values remain the existing absolute limits.
-The version-2 example instead derives entry, exposure, stop-risk, daily/weekly
-loss, and reserve limits as percentages of Spot mark-to-market equity, so it
-scales both down and up. The old USD values become a ceiling only when
-`absolute_safety_caps.enabled` is explicitly enabled. See
+The default version-2 configuration derives entry, exposure, stop-risk,
+daily/weekly loss, and reserve limits as percentages of Spot mark-to-market
+equity, so it scales both down and up. The old USD values are optional
+emergency/operator ceilings only: they apply when
+`absolute_safety_caps.enabled` is explicitly enabled. Operators that need
+absolute regulatory or operational ceilings may enable that setting and choose
+their own cap values; doing so deliberately limits percentage scaling. See
 [RiskPilot scalable equity-aware guardrails](docs/RISKPILOT_POLICY.md).
 
 For every new LIVE entry, the policy takes a fresh authenticated snapshot of

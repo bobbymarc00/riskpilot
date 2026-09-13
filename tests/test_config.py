@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,11 +10,45 @@ from pathlib import Path
 from decimal import Decimal
 
 from spotguard.config import ConfigError, load_settings
+from spotguard.cli import main
+from spotguard.risk_policy.limits import limits_for
 
 from tests.helpers import config_dict, write_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_production_init_creates_scalable_schema_v2_default_without_overwrite(self) -> None:
+        """Exercise the same CLI/template path used by the installer."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "new-install" / "config.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([
+                    "--config", str(destination), "--json", "init",
+                    "--workspace", str(root / "workspace"),
+                ]), 0)
+            raw = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(raw["sizing_policy"]["schema_version"], 2)
+            self.assertEqual(
+                raw["sizing_policy"]["scaling_model"], "equity_percentage_risk"
+            )
+            self.assertFalse(raw["absolute_safety_caps"]["enabled"])
+            settings = load_settings(destination, create_state=False)
+            for equity, expected_entry in (("30", Decimal("6")),
+                                           ("1000000", Decimal("200000"))):
+                with self.subTest(equity=equity):
+                    _, limits = limits_for(settings, "live", Decimal(equity))
+                    self.assertEqual(limits.max_entry_notional, expected_entry)
+            raw["absolute_safety_caps"]["enabled"] = True
+            destination.write_text(json.dumps(raw), encoding="utf-8")
+            capped = load_settings(destination, create_state=False)
+            hard, limits = limits_for(capped, "live", Decimal("1000000"))
+            self.assertEqual(limits.max_entry_notional, hard.max_entry_notional)
+            before_second_init = destination.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--config", str(destination), "init"]), 2)
+            self.assertEqual(destination.read_bytes(), before_second_init)
+
     def test_safe_config_loads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
