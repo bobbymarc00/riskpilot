@@ -351,8 +351,34 @@ class LiveSafetyTests(unittest.TestCase):
      result=service.live_status(check_symbols=True,symbols=["BTCUSDT"])
     self.assertEqual(result["execution_ready"],expected)
     self.assertFalse(result["decimal_transport_verified"])
-    self.assertIn("REMOTE_MCP_DECIMAL_CONTRACT_BLOCKER",result["blockers"])
+    self.assertIn("decimal_transport_verified",result["blockers"])
     if name == "invalid schema": self.assertIn("write_schema_verified",result["blockers"])
+
+ def test_live_status_keeps_non_gating_probe_reasons_out_of_blockers(self):
+  with tempfile.TemporaryDirectory() as d:
+   service=SpotGuard(configured(Path(d),enabled=True))
+   service.settings=replace(service.settings,
+     codex=replace(service.settings.codex,mcp_server="binance-execution"),
+     live=replace(service.settings.live,protective_orders_available=True))
+   service.live_executor.settings=service.settings
+   service.agent_os.status=Mock(return_value={"authenticated":True,"mcp_configured":True})
+   service.live_arm.status=Mock(return_value=Mock(armed=True,expires_at=None))
+   service.live_executor.verify_readiness=Mock(return_value={
+     "account_read_verified":True,"open_orders_read_verified":True,
+     "spot_trade_scope_verified":True,"write_tool_discovered":True,
+     "write_schema_verified":True,"decimal_transport_verified":True,
+     "reasons":["api_restrictions_equivalent_missing",
+                "test_order_permission_attestation_available_but_not_run"],
+   })
+   symbol_info={"symbol":"BTCUSDT","oto_allowed":True,"opo_allowed":True,"oco_allowed":True,
+                "price_tick_size":"0.01","percent_price_filter":True,"max_num_orders":5,
+                "max_num_algo_orders":5,"max_num_order_lists":5}
+   with patch("spotguard.service.validate_spot_symbol",return_value=symbol_info):
+    result=service.live_status(check_symbols=True,symbols=["BTCUSDT"])
+   self.assertTrue(result["execution_ready"])
+   self.assertEqual(result["blockers"],[])
+   self.assertEqual(result["readiness_reasons"],["api_restrictions_equivalent_missing",
+                                                  "test_order_permission_attestation_available_but_not_run"])
 
  def test_explicit_order_test_attestation_uses_only_fixed_target(self):
   with tempfile.TemporaryDirectory() as d:
